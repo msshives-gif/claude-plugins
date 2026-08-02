@@ -119,6 +119,13 @@ production; strictly worse than no number).
 
 ## Compatibility posture
 
+File locking uses a sidecar lock file (`O_CREAT|O_EXCL`) rather than
+`flock`/`fcntl`: one mechanism that behaves identically on Linux,
+macOS, and Windows, with bounded waits and stale-lock breaking, at the
+cost of being advisory-by-convention rather than kernel-enforced. Hook
+commands try `python3` then `python`, covering Windows installs where
+Python has no `python3` name.
+
 The transcript JSONL, `meta.json`, and the `subagents/` layout are
 undocumented internals. Everything parses defensively (per-line, typed
 checks) and every entry point fails open (`exit 0` always; errors to

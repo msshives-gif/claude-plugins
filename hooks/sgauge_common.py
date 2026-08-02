@@ -8,7 +8,7 @@ The subagent transcript JSONL is an UNDOCUMENTED Claude Code internal.
 Parsing is defensive; when the format is unrecognizable we record
 "unmeasurable" rather than guessing.
 """
-import fcntl
+import contextlib
 import json
 import os
 import sys
@@ -265,25 +265,44 @@ def read_meta(transcript_path):
 
 # ---------------------------------------------------------------- state IO
 
+@contextlib.contextmanager
 def _locked_open(path, mode, timeout=2.0):
-    """Open with a BOUNDED exclusive lock; raises TimeoutError if a
-    holder is stuck, so callers fail open instead of eating the hook
-    timeout on every tool call."""
-    fh = open(path, mode)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    """Open a file while holding a sidecar lock file (path + ".lock").
+
+    A lock file created with O_EXCL works the same on Linux, macOS, and
+    Windows, so there are no platform branches. The wait is BOUNDED
+    (TimeoutError -> callers fail open instead of eating the hook
+    timeout), and a lock older than 10s is treated as abandoned by a
+    killed process and broken.
+    """
+    lock = path + ".lock"
     deadline = time.monotonic() + timeout
     while True:
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fh
-        except OSError:
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock) > 10:
+                    os.remove(lock)
+                    continue
+            except OSError:
+                pass
             if time.monotonic() >= deadline:
-                fh.close()
                 raise TimeoutError(f"lock on {path}")
             time.sleep(0.05)
+    try:
+        with open(path, mode) as fh:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            yield fh
+    finally:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
 
 
 def _private_makedirs(path):
@@ -435,7 +454,7 @@ def prune_stale(cfg):
     cutoff = time.time() - cfg["state_ttl_days"] * 86400
 
     def expendable(name):
-        return name.endswith((".json", ".jsonl", ".tmp"))
+        return name.endswith((".json", ".jsonl", ".tmp", ".lock"))
 
     def old(path):
         st = os.lstat(path)

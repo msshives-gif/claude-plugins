@@ -32,9 +32,9 @@ Three small hooks, stdlib-Python only, all fail-open:
 2. **Drain** (`PostToolUse`, parent session) — injects queued reports
    into the orchestrator's context on its next tool call:
 
-   > `[subagent-gauge] w8d-builder (claude-opus-5): ~383k tokens — OVER
-   > THRESHOLD: prefer spawning a fresh agent over re-tasking this one;
-   > long-context agents degrade.`
+   > `[subagent-gauge] research-worker (claude-opus-5): ~383k tokens —
+   > OVER THRESHOLD: prefer spawning a fresh agent over re-tasking this
+   > one; long-context agents degrade.`
 
 3. **Guard** (`PreToolUse` on `SendMessage`) — if the orchestrator is
    about to message an agent whose last recorded context exceeds
@@ -50,9 +50,13 @@ final deliverable is never touched.
 Requirements: a Claude Code version whose SubagentStop hook payload
 carries `agent_id` / `agent_transcript_path` (present since the
 [#16424](https://github.com/anthropics/claude-code/issues/16424) work;
-verify with any subagent stop and `scripts/status.py`), and `python3`
-(3.9+) on PATH. macOS/Linux only — on Windows the hooks exit silently
-(the locking uses `fcntl`).
+verify with any subagent stop and `scripts/status.py`), and Python 3.9+
+on PATH as `python3` or `python`. Pure standard library, no platform
+branches. Developed and tested on Linux; macOS uses the same code
+paths; Windows is supported by construction (portable file locking,
+`python` fallback) but has not been tested on a real Windows machine —
+reports welcome. On Windows, install as a plugin (`install.sh` is a
+bash script).
 
 **As a plugin:**
 

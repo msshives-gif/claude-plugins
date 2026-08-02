@@ -38,7 +38,9 @@ if os.path.isfile(settings_path):
 hooks = settings.setdefault("hooks", {})
 for event, (matcher, script, timeout) in entries.items():
     script_path = os.path.join(repo, "hooks", script)
-    cmd = f"python3 {shlex.quote(script_path)}"
+    q = shlex.quote(script_path)
+    # "|| python" covers Windows, where Python usually isn't named python3.
+    cmd = f"python3 {q} || python {q}"
     groups = hooks.setdefault(event, [])
     # json.dumps escapes quotes/non-ASCII, so compare unescaped dumps.
     if any(script_path in json.dumps(g, ensure_ascii=False) for g in groups):
