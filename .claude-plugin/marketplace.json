@@ -1,5 +1,6 @@
 {
   "name": "subagent-gauge",
+  "description": "Marketplace for the subagent-gauge plugin: context-size reporting for Claude Code subagents.",
   "owner": {
     "name": "msshives-gif"
   },

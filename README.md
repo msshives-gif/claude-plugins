@@ -46,8 +46,12 @@ final deliverable is never touched.
 
 ## Install
 
-Requirements: Claude Code ≥ 2.x with subagents, `python3` (3.9+) on
-PATH. macOS/Linux; Windows untested.
+Requirements: a Claude Code version whose SubagentStop hook payload
+carries `agent_id` / `agent_transcript_path` (present since the
+[#16424](https://github.com/anthropics/claude-code/issues/16424) work;
+verify with any subagent stop and `scripts/status.py`), and `python3`
+(3.9+) on PATH. macOS/Linux only — on Windows the hooks exit silently
+(the locking uses `fcntl`).
 
 **As a plugin:**
 
@@ -73,7 +77,8 @@ call.
 ## Configuration
 
 Every knob works as an environment variable (`SUBAGENT_GAUGE_<NAME>`)
-or a key in `~/.claude/subagent-gauge.json` (env wins):
+or a key in `~/.claude/subagent-gauge.json` (env wins; point
+`SUBAGENT_GAUGE_CONFIG` at a different config path if you want one):
 
 | Knob | Default | Meaning |
 |---|---|---|
@@ -82,7 +87,7 @@ or a key in `~/.claude/subagent-gauge.json` (env wins):
 | `hard_block` | `false` | Guard requires user confirmation (`permissionDecision: ask`) instead of just warning. |
 | `system_message` | `true` | Also show each report to the human in the UI. |
 | `drain_batch_max` | `20` | Max reports injected per drain. |
-| `flush_grace_ms` | `4000` | How long the observer waits for the transcript to finish flushing (see DESIGN). |
+| `flush_grace_ms` | `4000` | How long the observer waits for the transcript to finish flushing (see DESIGN). Keep well under the observer's 10s hook timeout. |
 | `state_dir` | `~/.claude/subagent-gauge` | Where state, queues, and the ledger live. |
 | `ledger` / `ledger_max_bytes` | `true` / 5MB | Append-only JSONL audit log, rotated once over size. |
 | `state_ttl_days` | `7` | Stale session state/queues get pruned after this. |
@@ -96,6 +101,9 @@ python3 scripts/status.py             # all sessions, newest first
 python3 scripts/status.py --session 02ff  # prefix match
 ```
 
+(Plugin installs don't give you a clone; run it from the plugin cache —
+the path shown by `/plugin` — or clone the repo just for the script.)
+
 ## Limitations (read before relying on it)
 
 - **Undocumented internals.** Context is measured from the subagent
@@ -105,14 +113,31 @@ python3 scripts/status.py --session 02ff  # prefix match
   broken sessions. Built and verified against Claude Code as of
   2026-08-01.
 - **Reports are stop-time snapshots.** An agent mid-burst has grown past
-  its last report. `SubagentStop` fires after every agentic burst (not
-  just final completion), so numbers refresh often, but they are floors,
-  not ceilings.
+  its last report. In our production use `SubagentStop` fires after
+  every agentic burst (each time a teammate goes idle, not just final
+  completion — observed behavior, not documented), so numbers refresh
+  often, but they are floors, not ceilings.
 - **Post-compaction counts.** After auto-compaction, `current` reflects
   the compacted (smaller) context. The report exposes `peak` and a
   `COMPACTED xN` flag — treat any compaction as a degradation signal.
 - **Guard covers `SendMessage` re-tasking.** Fresh `Agent` spawns start
-  at zero context and need no guard.
+  at zero context and need no guard; in current Claude Code, resuming an
+  existing agent goes through `SendMessage`, which is what the guard
+  watches. If your setup has no `SendMessage` tool (no
+  teammates/background agents), the guard simply never fires; the
+  reports still work.
+- **Root session only.** Reports and the guard serve the top-level
+  orchestrator. A subagent that itself spawns sub-subagents doesn't
+  receive gauge reports (its PostToolUse drains are deliberately
+  suppressed to keep the parent's queue intact).
+- **Delivery is best-effort.** A drained report that fails to inject
+  (process killed mid-drain) is not redelivered; the per-agent state
+  files — which the guard reads — are the durable record.
+- **Overhead.** The drain runs on every parent tool call: one Python
+  interpreter spawn, ~50ms, no model tokens. The observer runs once per
+  subagent stop (bounded by `flush_grace_ms`).
+- **Install one way, not both.** Plugin install *and* `install.sh`
+  together would run every hook twice and duplicate reports.
 - **Privacy.** State files and the ledger record agent names, models,
   session IDs, token counts, and transcript paths — locally, under
   `state_dir`. No network access anywhere.
@@ -130,3 +155,7 @@ python3 -m unittest discover tests
 
 Design rationale, the empirically verified hook-channel behavior this
 depends on, and rejected alternatives: [docs/DESIGN.md](docs/DESIGN.md).
+
+## License
+
+MIT.

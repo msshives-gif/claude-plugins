@@ -16,16 +16,17 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sgauge_common as sg
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import sgauge_common as sg
+except Exception as e:
+    print(f"subagent-gauge drain: import failed: {e!r}", file=sys.stderr)
+    sys.exit(0)
 
 
 def main():
     payload = json.loads(sys.stdin.read())
-    if payload.get("agent_id") or payload.get("agent_transcript_path"):
-        return
-    tp = payload.get("transcript_path") or ""
-    if os.sep + "subagents" + os.sep in tp:
+    if sg.is_subagent_payload(payload):
         return
     session_id = payload.get("session_id") or ""
     if not session_id:

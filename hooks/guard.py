@@ -14,11 +14,18 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sgauge_common as sg
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import sgauge_common as sg
+except Exception as e:
+    print(f"subagent-gauge guard: import failed: {e!r}", file=sys.stderr)
+    sys.exit(0)
 
 
 def find_state(states, target):
+    # states arrive newest-first, so a reused name resolves to the most
+    # recent agent that carried it (matching the harness's latest-wins
+    # naming rule).
     for rec in states:
         if target in (rec.get("name"), rec.get("agent_id")):
             return rec
@@ -30,7 +37,7 @@ def main():
     if payload.get("tool_name") != "SendMessage":
         return
     # Only guard the parent session's sends, not subagent-to-subagent.
-    if payload.get("agent_id") or payload.get("agent_transcript_path"):
+    if sg.is_subagent_payload(payload):
         return
     target = (payload.get("tool_input") or {}).get("to") or ""
     if not target or target == "main":

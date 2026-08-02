@@ -40,7 +40,9 @@ Two channels that DO reach the parent model, both empirically verified
 So: the observer (SubagentStop, runs for the subagent) writes
 measurements to a per-parent-session queue file on disk; the drain
 (PostToolUse, runs for the parent) injects and empties the queue on the
-parent's next tool call. An orchestrator managing agents makes tool
+parent's next tool call. (The queue keying relies on the SubagentStop
+payload's `session_id` being the parent session's id — verified against
+live payloads and the E2E test, 2026-08-01.) An orchestrator managing agents makes tool
 calls constantly, so delivery latency is effectively one tool call.
 The guard (PreToolUse on SendMessage) reads the same state at the one
 moment that matters — when the orchestrator is about to re-task an
@@ -57,6 +59,18 @@ Deliberate consequences:
   the drain exits if the payload carries `agent_id` /
   `agent_transcript_path` or a subagent transcript path.
 
+The queue file is a trust boundary: anything running as the user could
+append to it, and its content lands in the orchestrator's context. The
+drain therefore re-sanitizes every line on the way out (control
+characters and newlines flattened, length-capped — so a crafted line
+cannot fabricate additional report lines or escape sequences), state
+directories are created 0o700 and files 0o600, and report text built
+from agent-controlled fields (name, model) is sanitized at the source
+too. Residual risk — a same-user process planting a *plausible-looking*
+single-line report — is equivalent to what any same-user process can
+already do to the transcript or settings, and is documented rather than
+defended.
+
 ## Measurement
 
 Context size = `input_tokens + cache_read_input_tokens +
@@ -71,9 +85,13 @@ resume with. `prompt` (the sum minus output) is stored too.
 **Flush race:** at SubagentStop time the transcript often lacks its
 final row (verified 2026-07-31). Waiting only "until any usage row
 exists" is wrong for reused agents — a stale row from the previous burst
-satisfies it immediately. The observer instead waits until the file size
-is stable across two 250ms polls (bounded by `flush_grace_ms`), then
-parses.
+satisfies it immediately — and "the file went quiet" is wrong when the
+flush simply hasn't started. Transcript rows carry timestamps, so the
+observer polls (a full parse is ~0.07s for a 5MB transcript) until the
+newest terminal row is recent (< 30s old), bounded by `flush_grace_ms`.
+If the deadline passes first, the best available reading is still
+recorded but flagged, and the report carries "[reading may lag]" instead
+of presenting a stale number as current.
 
 **Peak and compaction:** after auto-compaction the current context
 shrinks, so a threshold on `current` alone can be defeated. The scan

@@ -1,6 +1,9 @@
 #!/bin/bash
 # Remove every subagent-gauge hook entry from ~/.claude/settings.json
-# (or a settings file given as $1). Backs up first.
+# (or a settings file given as $1). Backs up first. Removes individual
+# hook entries (not whole groups), matching this clone's hook scripts by
+# basename — so it works whatever the clone directory is named, and
+# never removes a user's own hooks that share a group.
 set -euo pipefail
 
 SETTINGS="${1:-$HOME/.claude/settings.json}"
@@ -13,6 +16,9 @@ if not os.path.isfile(settings_path):
     print(f"{settings_path} does not exist; nothing to do")
     sys.exit(0)
 
+MARKERS = ("/hooks/observer.py", "/hooks/drain.py", "/hooks/guard.py",
+           "subagent-gauge")
+
 with open(settings_path) as fh:
     settings = json.load(fh)
 backup = f"{settings_path}.bak-subagent-gauge-{time.strftime('%Y%m%d%H%M%S')}"
@@ -21,15 +27,28 @@ print(f"backup: {backup}")
 
 removed = 0
 for event, groups in list(settings.get("hooks", {}).items()):
-    kept = [g for g in groups if "subagent-gauge" not in json.dumps(g)]
-    removed += len(groups) - len(kept)
-    if kept:
-        settings["hooks"][event] = kept
+    new_groups = []
+    for g in groups:
+        entries = g.get("hooks", [])
+        kept = [e for e in entries
+                if not any(m in e.get("command", "") for m in MARKERS)]
+        removed += len(entries) - len(kept)
+        if kept:
+            g = dict(g, hooks=kept)
+            new_groups.append(g)
+        elif not entries:
+            new_groups.append(g)
+    if new_groups:
+        settings["hooks"][event] = new_groups
     else:
         del settings["hooks"][event]
 
-with open(settings_path, "w") as fh:
+import tempfile
+settings_dir = os.path.dirname(settings_path) or "."
+fd, tmp = tempfile.mkstemp(dir=settings_dir, prefix=".subagent-gauge-")
+with os.fdopen(fd, "w") as fh:
     json.dump(settings, fh, indent=2)
     fh.write("\n")
-print(f"removed {removed} hook group(s); wrote {settings_path}")
+os.replace(tmp, settings_path)
+print(f"removed {removed} hook entrie(s); wrote {settings_path}")
 PY

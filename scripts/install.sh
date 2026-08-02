@@ -1,14 +1,20 @@
 #!/bin/bash
 # Manual (non-plugin) install: merge subagent-gauge hooks into
 # ~/.claude/settings.json (or a settings file given as $1), backing the
-# file up first. Idempotent: running twice adds nothing twice.
+# file up BEFORE parsing it. Idempotent: running twice adds nothing
+# twice. Writes are atomic (temp file + rename).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SETTINGS="${1:-$HOME/.claude/settings.json}"
 
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required (the hooks are Python)" >&2
+    exit 1
+fi
+
 python3 - "$SETTINGS" "$REPO_DIR" <<'PY'
-import json, os, shutil, sys, time
+import json, os, shlex, shutil, sys, tempfile, time
 
 settings_path, repo = sys.argv[1], sys.argv[2]
 entries = {
@@ -19,18 +25,23 @@ entries = {
 
 settings = {}
 if os.path.isfile(settings_path):
-    with open(settings_path) as fh:
-        settings = json.load(fh)
     backup = f"{settings_path}.bak-subagent-gauge-{time.strftime('%Y%m%d%H%M%S')}"
     shutil.copy2(settings_path, backup)
     print(f"backup: {backup}")
+    try:
+        with open(settings_path) as fh:
+            settings = json.load(fh)
+    except json.JSONDecodeError as e:
+        sys.exit(f"{settings_path} is not valid JSON ({e}); fix it first "
+                 f"(backup already taken)")
 
 hooks = settings.setdefault("hooks", {})
 for event, (matcher, script, timeout) in entries.items():
-    cmd = f'python3 "{repo}/hooks/{script}"'
+    script_path = os.path.join(repo, "hooks", script)
+    cmd = f"python3 {shlex.quote(script_path)}"
     groups = hooks.setdefault(event, [])
-    # json.dumps escapes the quotes in cmd, so match on the bare path.
-    if any(f"{repo}/hooks/{script}" in json.dumps(g) for g in groups):
+    # json.dumps escapes quotes/non-ASCII, so compare unescaped dumps.
+    if any(script_path in json.dumps(g, ensure_ascii=False) for g in groups):
         print(f"{event}: already installed, skipping")
         continue
     group = {"hooks": [{"type": "command", "command": cmd, "timeout": timeout}]}
@@ -39,10 +50,13 @@ for event, (matcher, script, timeout) in entries.items():
     groups.append(group)
     print(f"{event}: installed")
 
-os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-with open(settings_path, "w") as fh:
+settings_dir = os.path.dirname(settings_path) or "."
+os.makedirs(settings_dir, exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=settings_dir, prefix=".subagent-gauge-")
+with os.fdopen(fd, "w") as fh:
     json.dump(settings, fh, indent=2)
     fh.write("\n")
+os.replace(tmp, settings_path)
 print(f"wrote {settings_path}")
 print("Restart running Claude Code sessions to pick up hook changes.")
 PY

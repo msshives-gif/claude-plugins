@@ -41,7 +41,8 @@ def main():
                       key=lambda r: r.get("current", 0), reverse=True)
         for r in rows:
             age_s = ""
-            path = os.path.join(agents_root, session, f"{r['agent_id']}.json")
+            path = os.path.join(agents_root, session,
+                                f"{r.get('agent_id', '?')}.json")
             try:
                 age = time.time() - os.path.getmtime(path)
                 age_s = f"{age / 60:.0f}m ago"

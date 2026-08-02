@@ -4,5 +4,9 @@
   "version": "0.1.0",
   "author": {
     "name": "msshives-gif"
-  }
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/msshives-gif/subagent-gauge",
+  "repository": "https://github.com/msshives-gif/subagent-gauge",
+  "keywords": ["hooks", "subagents", "context", "tokens", "orchestration", "observability"]
 }

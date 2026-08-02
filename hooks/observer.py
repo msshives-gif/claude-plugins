@@ -16,8 +16,14 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sgauge_common as sg
+# Even the import must fail open: a non-zero exit surfaces a hook error
+# line in the user's session (e.g. fcntl is Unix-only).
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import sgauge_common as sg
+except Exception as e:
+    print(f"subagent-gauge observer: import failed: {e!r}", file=sys.stderr)
+    sys.exit(0)
 
 
 def main():
@@ -25,6 +31,7 @@ def main():
     if payload.get("hook_event_name") != "SubagentStop":
         return
     cfg = sg.load_config()
+    sg.prune_stale(cfg)
     session_id = payload.get("session_id") or ""
     agent_id = payload.get("agent_id") or ""
 
@@ -41,9 +48,13 @@ def main():
         return
 
     meta = sg.read_meta(atp)
-    name = meta.get("name") or meta.get("agentType") or agent_id or "subagent"
+    # Sidecar first (has teammate names); documented payload agent_type
+    # next, so a sidecar format change degrades to a readable name.
+    name = (meta.get("name") or meta.get("agentType")
+            or payload.get("agent_type") or agent_id or "subagent")
     model = meta.get("model") or ""
 
+    import time
     record = {
         "agent_id": agent_id,
         "name": name,
@@ -54,17 +65,20 @@ def main():
         "peak": res["peak"],
         "compactions": res["compactions"],
         "terminal_row": res["terminal"],
+        "stale": bool(res.get("stale")),
+        "observed_at": time.time(),
         "transcript": atp,
     }
     sg.write_agent_state(cfg, session_id, record)
-    sg.prune_stale(cfg)
     sg.ledger_append(cfg, {"event": "SubagentStop", "session": session_id,
                            **{k: record[k] for k in
                               ("agent_id", "name", "model", "current",
                                "peak", "compactions")}})
 
     out = {"suppressOutput": True}
-    if res["current"] >= cfg["report_min_tokens"]:
+    # Compaction is itself an overload signal — it must not be filtered
+    # out just because the post-compaction context is small.
+    if res["current"] >= cfg["report_min_tokens"] or res["compactions"]:
         report = sg.fmt_report(name, model, res, cfg["warn_tokens"])
         if agent_id and agent_id not in report:
             report += f" (id {agent_id})"
