@@ -37,9 +37,10 @@ Three small hooks, stdlib-Python only, all fail-open:
    > long-context agents degrade.`
 
 3. **Guard** (`PreToolUse` on `SendMessage`) — if the orchestrator is
-   about to message an agent whose last recorded context exceeds the
-   threshold, injects a warning at exactly that moment (or, with
-   `hard_block`, requires user confirmation).
+   about to message an agent whose last recorded context exceeds
+   `warn_tokens`, injects a warning at exactly that moment; at/above
+   `block_tokens` (default 350k) the send additionally needs explicit
+   confirmation — an overridable block, not an absolute one.
 
 No extra model turns, no cost added to the subagent, and the subagent's
 final deliverable is never touched.
@@ -84,7 +85,7 @@ or a key in `~/.claude/subagent-gauge.json` (env wins; point
 |---|---|---|
 | `warn_tokens` | `150000` | At/above this, reports carry the OVER-THRESHOLD warning and the guard fires. Tune to your models: ~150k is conservative for 200k-window models; raise for 1M-context agents. |
 | `report_min_tokens` | `0` | Only queue reports for agents at/above this size. `0` = report every stop. |
-| `hard_block` | `false` | Guard requires user confirmation (`permissionDecision: ask`) instead of just warning. |
+| `block_tokens` | `350000` | At/above this, the guarded send requires explicit confirmation (`permissionDecision: ask` — approve at the prompt to override). `0` disables blocking. In headless runs an unanswerable "ask" acts as a denial. |
 | `system_message` | `true` | Also show each report to the human in the UI. |
 | `drain_batch_max` | `20` | Max reports injected per drain. |
 | `flush_grace_ms` | `4000` | How long the observer waits for the transcript to finish flushing (see DESIGN). Keep well under the observer's 10s hook timeout. |

@@ -144,27 +144,27 @@ class ConfigTests(unittest.TestCase):
     def test_file_values_type_checked(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json",
                                          delete=False) as fh:
-            json.dump({"warn_tokens": "150k", "hard_block": 1,
+            json.dump({"warn_tokens": "150k", "ledger": 1,
                        "state_dir": "/ok"}, fh)
         os.environ["SUBAGENT_GAUGE_CONFIG"] = fh.name
         try:
             cfg = sg.load_config()
             self.assertEqual(cfg["warn_tokens"], sg._DEFAULTS["warn_tokens"])
-            self.assertFalse(cfg["hard_block"])
+            self.assertTrue(cfg["ledger"])  # 1 is not a strict bool
             self.assertEqual(cfg["state_dir"], "/ok")
         finally:
             os.unlink(fh.name)
 
     def test_env_overrides(self):
         os.environ["SUBAGENT_GAUGE_WARN_TOKENS"] = "42000"
-        os.environ["SUBAGENT_GAUGE_HARD_BLOCK"] = "true"
+        os.environ["SUBAGENT_GAUGE_BLOCK_TOKENS"] = "0"
         try:
             cfg = sg.load_config()
             self.assertEqual(cfg["warn_tokens"], 42000)
-            self.assertTrue(cfg["hard_block"])
+            self.assertEqual(cfg["block_tokens"], 0)
         finally:
             del os.environ["SUBAGENT_GAUGE_WARN_TOKENS"]
-            del os.environ["SUBAGENT_GAUGE_HARD_BLOCK"]
+            del os.environ["SUBAGENT_GAUGE_BLOCK_TOKENS"]
 
     def test_bad_env_int_ignored(self):
         os.environ["SUBAGENT_GAUGE_WARN_TOKENS"] = "lots"

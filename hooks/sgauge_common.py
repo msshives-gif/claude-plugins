@@ -24,10 +24,10 @@ _DEFAULTS = {
     # Only enqueue dispatcher reports for agents at/above this size.
     # 0 = report every subagent stop (recommended: reports are cheap).
     "report_min_tokens": 0,
-    # If true, the guard asks for user confirmation (permissionDecision
-    # "ask") before messaging an over-threshold agent, instead of just
-    # injecting a warning.
-    "hard_block": False,
+    # At/above this, messaging the agent needs explicit confirmation
+    # (permission "ask" — overridable at the prompt). 0 disables
+    # blocking. Between warn_tokens and here, the guard only warns.
+    "block_tokens": 350_000,
     # Also show each report to the human as a hook systemMessage.
     "system_message": True,
     # Max queued reports injected per drain (protects parent context).

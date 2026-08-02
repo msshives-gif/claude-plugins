@@ -7,8 +7,10 @@ agent's last stop. Empirically verified 2026-08-01: PreToolUse
 hookSpecificOutput.additionalContext reaches the model alongside the
 tool call.
 
-Default is a soft warning (permission untouched). With hard_block=true
-the tool call needs explicit user approval (permissionDecision "ask").
+The ladder: below warn_tokens (and uncompacted), silent; at/above
+warn_tokens, an injected warning; at/above block_tokens (default 350k,
+0 = off), permissionDecision "ask" — the send goes through only with
+explicit approval, so the block is overridable rather than absolute.
 """
 import json
 import os
@@ -47,12 +49,12 @@ def main():
     rec = find_state(sg.load_agent_states(cfg, session_id), target)
     if not rec:
         return
-    over = rec.get("current", 0) >= cfg["warn_tokens"] or rec.get("compactions", 0)
+    current = rec.get("current", 0)
+    over = current >= cfg["warn_tokens"] or rec.get("compactions", 0)
     if not over:
         return
     warn = (f"[subagent-gauge] You are messaging agent '{target}' whose "
-            f"context was ~{rec.get('current', 0) / 1000:.0f}k tokens at its "
-            f"last stop")
+            f"context was ~{current / 1000:.0f}k tokens at its last stop")
     if rec.get("compactions"):
         warn += f" (compacted x{rec['compactions']})"
     warn += (". Long-context agents degrade and anchor on their priors. "
@@ -65,7 +67,7 @@ def main():
             "additionalContext": warn,
         },
     }
-    if cfg["hard_block"]:
+    if cfg["block_tokens"] and current >= cfg["block_tokens"]:
         out["hookSpecificOutput"]["permissionDecision"] = "ask"
         out["hookSpecificOutput"]["permissionDecisionReason"] = warn
     print(json.dumps(out))
