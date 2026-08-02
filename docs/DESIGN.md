@@ -159,8 +159,9 @@ subagent), so workflow reports always route to root.
 
 The guard follows the same ownership: a send's candidate states are
 those whose `parent_agent_id` equals the sender's `agent_id` ("" for
-the root session), so a reused name can't warn about another branch's
-agent. Inside a subagent the guard only warns — `permissionDecision:
+the root session), so with current-format sidecars a reused name can't
+warn about another branch's agent (pre-2026-07-16 sidecars: see the
+fallback caveat above). Inside a subagent the guard only warns — `permissionDecision:
 "ask"` stays root-only, because a subagent may have nobody to answer
 the confirmation, and an unanswerable ask is a block.
 
