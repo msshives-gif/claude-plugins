@@ -1,0 +1,8 @@
+{
+ "agentType": "general-purpose",
+ "description": "hook-payload probe outer agent",
+ "name": "outer",
+ "toolUseId": "toolu_01Ly4DLSc8csYUzMTfijmtEc",
+ "spawnDepth": 1,
+ "model": "haiku"
+}

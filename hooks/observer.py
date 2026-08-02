@@ -47,12 +47,19 @@ def main():
     name = (meta.get("name") or meta.get("agentType")
             or payload.get("agent_type") or agent_id or "subagent")
     model = meta.get("model") or ""
+    parent = sg.resolve_parent(meta)
+    wf_run = sg.workflow_run(atp)
+    if wf_run:
+        # Workflow sidecars carry no name; label by run + short id.
+        name = f"{wf_run}/{meta.get('name') or agent_id[:10]}"
 
     record = {
         "agent_id": agent_id,
         "name": name,
         "model": model,
         "spawn_depth": meta.get("spawnDepth", 0),
+        "parent_agent_id": parent,
+        "workflow_run": wf_run,
         "current": res["current"],
         "prompt": res["prompt"],
         "peak": res["peak"],
@@ -62,22 +69,45 @@ def main():
         "observed_at": time.time(),
         "transcript": atp,
     }
-    sg.write_agent_state(cfg, session_id, record)
-    sg.ledger_append(cfg, {"event": "SubagentStop", "session": session_id,
-                           **{k: record[k] for k in
-                              ("agent_id", "name", "model", "current",
-                               "peak", "compactions")}})
+    # Each step is guarded on its own: state, then delivery, then the
+    # audit trail — no step's failure may cost a later one.
+    try:
+        sg.write_agent_state(cfg, session_id, record)
+    except Exception as e:
+        print(f"subagent-gauge observer: state write failed: {e!r}",
+              file=sys.stderr)
 
     out = {"suppressOutput": True}
+    delivered_to = "none"
     # Compaction is itself an overload signal — it must not be filtered
     # out just because the post-compaction context is small.
     if res["current"] >= cfg["report_min_tokens"] or res["compactions"]:
         report = sg.fmt_report(name, model, res, cfg["warn_tokens"])
         if agent_id and agent_id not in report:
-            report += f" (id {agent_id})"
-        sg.enqueue(cfg, session_id, report)
+            report += f" (id {sg.sanitize(agent_id, 40)})"
+        # Reports about a nested agent go to its spawner; unknown or
+        # root-owned parents go to the root session. resolve_parent
+        # already validated the id, so no fallback path is needed here.
+        consumer = parent if parent not in ("", "?") else None
+        try:
+            sg.enqueue(cfg, session_id, report, consumer_agent=consumer)
+            delivered_to = consumer or "session"
+        except Exception as e:
+            print(f"subagent-gauge observer: enqueue failed: {e!r}",
+                  file=sys.stderr)
         if cfg["system_message"]:
             out["systemMessage"] = report
+    try:
+        sg.ledger_append(cfg, {"event": "SubagentStop",
+                               "session": session_id,
+                               "delivered_to": delivered_to,
+                               **{k: record[k] for k in
+                                  ("agent_id", "name", "model", "current",
+                                   "peak", "compactions",
+                                   "parent_agent_id", "workflow_run")}})
+    except Exception as e:
+        print(f"subagent-gauge observer: ledger failed: {e!r}",
+              file=sys.stderr)
     print(json.dumps(out))
 
 

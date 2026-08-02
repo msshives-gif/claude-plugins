@@ -1,0 +1,9 @@
+{
+ "agentType": "general-purpose",
+ "description": "Test probe execution",
+ "name": "inner",
+ "toolUseId": "toolu_018H7vjNYXN9zwgcQLSzcuxR",
+ "parentAgentId": "a1afa18c59102e3b3",
+ "spawnDepth": 2,
+ "model": "haiku"
+}

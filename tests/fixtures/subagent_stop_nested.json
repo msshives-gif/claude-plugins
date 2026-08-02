@@ -1,0 +1,10 @@
+{
+ "session_id": "1885eb28-fffa-4a7c-9c36-c4c2638670e2",
+ "transcript_path": "/home/user/.claude/projects/-home-user-project/1885eb28-fffa-4a7c-9c36-c4c2638670e2.jsonl",
+ "agent_id": "af949ed757c76b5b1",
+ "agent_type": "general-purpose",
+ "hook_event_name": "SubagentStop",
+ "stop_hook_active": false,
+ "agent_transcript_path": "/home/user/.claude/projects/-home-user-project/1885eb28-fffa-4a7c-9c36-c4c2638670e2/subagents/agent-af949ed757c76b5b1.jsonl",
+ "permission_mode": "default"
+}

@@ -1,0 +1,10 @@
+{
+ "session_id": "f237d3b2-3472-470c-a87d-6d080fd2f464",
+ "transcript_path": "/home/user/.claude/projects/-home-user-projectC/f237d3b2-3472-470c-a87d-6d080fd2f464.jsonl",
+ "agent_id": "aaaf27fcbfc55e112",
+ "agent_type": "workflow-subagent",
+ "hook_event_name": "SubagentStop",
+ "stop_hook_active": false,
+ "agent_transcript_path": "/home/user/.claude/projects/-home-user-projectC/f237d3b2-3472-470c-a87d-6d080fd2f464/subagents/workflows/wf_5325b229-726/agent-aaaf27fcbfc55e112.jsonl",
+ "permission_mode": "auto"
+}

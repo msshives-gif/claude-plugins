@@ -13,6 +13,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "hooks"))
 import sgauge_common as sg
 
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "fixtures")
+
+
+def fixture(name):
+    with open(os.path.join(FIXTURES, name)) as fh:
+        return json.load(fh)
+
 
 def usage_row(inp, cr, cc, out, stop_reason):
     return {"type": "assistant",
@@ -132,6 +140,106 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(sg.load_agent_states(self.cfg, "sess1"), [rec])
 
 
+class ResolveParentTests(unittest.TestCase):
+    """Sidecar formats pinned by fixtures captured 2026-08-02 (probe A/C).
+
+    Ownership: "" = root session, agent id = that spawner, "?" = unknown
+    (deliver to root, but never owner-match)."""
+
+    def test_nested_meta_has_direct_parent(self):
+        meta = fixture("meta_nested.json")
+        self.assertEqual(sg.resolve_parent(meta), meta["parentAgentId"])
+
+    def test_depth1_meta_is_root_owned(self):
+        self.assertEqual(sg.resolve_parent(fixture("meta_depth1.json")), "")
+
+    def test_workflow_meta_is_root_owned(self):
+        self.assertEqual(sg.resolve_parent(fixture("meta_workflow.json")), "")
+
+    def test_deep_meta_without_parent_is_unknown(self):
+        # Older sidecar format: spawnDepth >= 2 but no parentAgentId.
+        self.assertEqual(sg.resolve_parent(
+            {"agentType": "general-purpose", "spawnDepth": 2}), "?")
+
+    def test_malformed_parent_is_unknown_not_fallback(self):
+        self.assertEqual(sg.resolve_parent(
+            {"parentAgentId": "../../etc", "spawnDepth": 2}), "?")
+
+    def test_missing_meta_is_unknown(self):
+        # Root ownership requires a POSITIVE shallow-depth signal; an
+        # empty or absent sidecar proves nothing.
+        self.assertEqual(sg.resolve_parent({}), "?")
+        self.assertEqual(sg.resolve_parent(None), "?")
+        self.assertEqual(sg.resolve_parent({"spawnDepth": "1"}), "?")
+        self.assertEqual(sg.resolve_parent({"parentAgentId": 123}), "?")
+
+    def test_depth_boundaries(self):
+        # 0 (teammates) and 1 (depth-1/workflow spawns) are the observed
+        # root-owned values; anything outside proves nothing.
+        self.assertEqual(sg.resolve_parent({"spawnDepth": 0}), "")
+        self.assertEqual(sg.resolve_parent({"spawnDepth": 1}), "")
+        self.assertEqual(sg.resolve_parent({"spawnDepth": -1}), "?")
+        self.assertEqual(sg.resolve_parent({"spawnDepth": 2}), "?")
+        self.assertEqual(sg.resolve_parent({"spawnDepth": True}), "?")
+
+
+class WorkflowRunTests(unittest.TestCase):
+    def test_workflow_fixture_path_parsed(self):
+        atp = fixture("subagent_stop_workflow.json")["agent_transcript_path"]
+        self.assertEqual(sg.workflow_run(atp), "wf_5325b229-726")
+
+    def test_plain_nested_path_is_not_workflow(self):
+        atp = fixture("subagent_stop_nested.json")["agent_transcript_path"]
+        self.assertEqual(sg.workflow_run(atp), "")
+
+    def test_backslash_path(self):
+        self.assertEqual(sg.workflow_run(
+            r"C:\x\subagents\workflows\wf_ab-1\agent-a1.jsonl"), "wf_ab-1")
+
+    def test_workflows_dir_elsewhere_ignored(self):
+        self.assertEqual(sg.workflow_run(
+            "/home/u/workflows/wf_1/agent-a.jsonl"), "")
+
+    def test_early_workflows_component_does_not_hide_real_one(self):
+        self.assertEqual(sg.workflow_run(
+            "/home/u/workflows/x/s1/subagents/workflows/wf_9/a.jsonl"),
+            "wf_9")
+
+
+class ConsumerQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.cfg = dict(sg._DEFAULTS, state_dir=self.dir.name)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_consumers_isolated(self):
+        sg.enqueue(self.cfg, "sess1", "for-root")
+        sg.enqueue(self.cfg, "sess1", "for-outer", consumer_agent="aOuter")
+        self.assertEqual(sg.drain_queue(self.cfg, "sess1", 10), ["for-root"])
+        self.assertEqual(
+            sg.drain_queue(self.cfg, "sess1", 10, consumer_agent="aOuter"),
+            ["for-outer"])
+        self.assertEqual(
+            sg.drain_queue(self.cfg, "sess1", 10, consumer_agent="aOuter"),
+            [])
+
+    def test_same_agent_id_isolated_across_sessions(self):
+        sg.enqueue(self.cfg, "sess1", "one", consumer_agent="aX")
+        self.assertEqual(
+            sg.drain_queue(self.cfg, "sess2", 10, consumer_agent="aX"), [])
+
+    def test_unusable_consumer_rejected_not_shared(self):
+        self.assertFalse(
+            sg.enqueue(self.cfg, "sess1", "r", consumer_agent="../../etc"))
+        self.assertEqual(
+            sg.drain_queue(self.cfg, "sess1", 10,
+                           consumer_agent="../../etc"), [])
+        # Nothing leaked into the root queue either.
+        self.assertEqual(sg.drain_queue(self.cfg, "sess1", 10), [])
+
+
 class LockTests(unittest.TestCase):
     def test_contention_loses_no_writes(self):
         import threading
@@ -224,10 +332,13 @@ class FailOpenTests(unittest.TestCase):
                              "..", "hooks")
 
     def run_hook(self, script, stdin_text):
+        import shutil
         import subprocess
+        state_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state_dir, ignore_errors=True)
         env = dict(os.environ,
                    SUBAGENT_GAUGE_CONFIG="/nonexistent/sgauge-test.json",
-                   SUBAGENT_GAUGE_STATE_DIR=tempfile.mkdtemp())
+                   SUBAGENT_GAUGE_STATE_DIR=state_dir)
         p = subprocess.run(
             [sys.executable, os.path.join(self.HOOKS_DIR, script)],
             input=stdin_text, capture_output=True, text=True, env=env,
@@ -243,6 +354,133 @@ class FailOpenTests(unittest.TestCase):
                                  f"{stdin_text!r}: {p.stderr}")
                 if p.stdout.strip():
                     json.loads(p.stdout)  # stdout must be valid JSON
+
+
+class RunHookMixin:
+    HOOKS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "hooks")
+
+    def run_hook(self, script, payload, state_dir):
+        import subprocess
+        env = dict(os.environ,
+                   SUBAGENT_GAUGE_CONFIG="/nonexistent/sgauge-test.json",
+                   SUBAGENT_GAUGE_STATE_DIR=state_dir)
+        p = subprocess.run(
+            [sys.executable, os.path.join(self.HOOKS_DIR, script)],
+            input=json.dumps(payload), capture_output=True, text=True,
+            env=env, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(p.stdout) if p.stdout.strip() else {}
+
+
+class DrainRouterTests(RunHookMixin, unittest.TestCase):
+    """Routing pinned by real captured payloads: a subagent's PostToolUse
+    drains only the queue addressed to that agent; the root session's
+    PostToolUse drains only the session queue."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.cfg = dict(sg._DEFAULTS, state_dir=self.dir.name)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_subagent_payload_drains_own_queue_only(self):
+        p = fixture("posttooluse_in_subagent.json")
+        sess, aid = p["session_id"], p["agent_id"]
+        sg.enqueue(self.cfg, sess, "for-root")
+        sg.enqueue(self.cfg, sess, "for-subagent", consumer_agent=aid)
+        out = self.run_hook("drain.py", p, self.dir.name)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("for-subagent", ctx)
+        self.assertNotIn("for-root", ctx)
+        self.assertEqual(sg.drain_queue(self.cfg, sess, 10), ["for-root"])
+
+    def test_root_payload_drains_session_queue_only(self):
+        p = fixture("posttooluse_root.json")
+        sess = p["session_id"]
+        sg.enqueue(self.cfg, sess, "for-root")
+        sg.enqueue(self.cfg, sess, "for-subagent", consumer_agent="aX")
+        out = self.run_hook("drain.py", p, self.dir.name)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("for-root", ctx)
+        self.assertNotIn("for-subagent", ctx)
+
+
+class ObserverRoutingTests(RunHookMixin, unittest.TestCase):
+    """End-to-end observer runs against the captured payload shapes, with
+    transcripts and sidecars rebuilt in a temp dir."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.dir.name, "state")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _fake_agent_files(self, subdir, agent_id, meta):
+        d = os.path.join(self.dir.name, "sess", "subagents", subdir or "")
+        os.makedirs(d, exist_ok=True)
+        atp = os.path.join(d, f"agent-{agent_id}.jsonl")
+        write_jsonl(atp, [usage_row(10_000, 0, 0, 500, "end_turn")])
+        with open(atp[:-6] + ".meta.json", "w") as fh:
+            json.dump(meta, fh)
+        return atp
+
+    def test_nested_stop_report_goes_to_spawner_queue(self):
+        payload = fixture("subagent_stop_nested.json")
+        meta = fixture("meta_nested.json")
+        payload["agent_transcript_path"] = self._fake_agent_files(
+            "", payload["agent_id"], meta)
+        self.run_hook("observer.py", payload, self.state)
+        cfg = dict(sg._DEFAULTS, state_dir=self.state)
+        sess = payload["session_id"]
+        spawner_q = sg.drain_queue(cfg, sess, 10,
+                                   consumer_agent=meta["parentAgentId"])
+        self.assertEqual(len(spawner_q), 1)
+        self.assertIn("~10k", spawner_q[0])
+        self.assertEqual(sg.drain_queue(cfg, sess, 10), [])
+        rec = sg.load_agent_states(cfg, sess)[0]
+        self.assertEqual(rec["parent_agent_id"], meta["parentAgentId"])
+
+    def test_workflow_stop_report_goes_to_root_with_run_label(self):
+        payload = fixture("subagent_stop_workflow.json")
+        meta = fixture("meta_workflow.json")
+        payload["agent_transcript_path"] = self._fake_agent_files(
+            os.path.join("workflows", "wf_5325b229-726"),
+            payload["agent_id"], meta)
+        self.run_hook("observer.py", payload, self.state)
+        cfg = dict(sg._DEFAULTS, state_dir=self.state)
+        root_q = sg.drain_queue(cfg, payload["session_id"], 10)
+        self.assertEqual(len(root_q), 1)
+        self.assertIn("wf_5325b229-726", root_q[0])
+
+
+class GuardOwnerTests(unittest.TestCase):
+    def test_owner_filter(self):
+        sys.path.insert(0, RunHookMixin.HOOKS_DIR)
+        import guard
+        states = [
+            {"name": "worker", "agent_id": "aChild",
+             "parent_agent_id": "aOuter", "current": 200_000},
+            {"name": "worker", "agent_id": "aRootKid",
+             "parent_agent_id": "", "current": 10_000},
+            {"name": "ghost", "agent_id": "aGhost",
+             "parent_agent_id": "?", "current": 999_000},
+        ]
+        # Root ("") sees only its own child, even under a reused name.
+        self.assertEqual(
+            guard.find_state(states, "worker", "")["agent_id"], "aRootKid")
+        # The spawner sees its child.
+        self.assertEqual(
+            guard.find_state(states, "worker", "aOuter")["agent_id"],
+            "aChild")
+        # Unknown-parent records match nobody.
+        self.assertIsNone(guard.find_state(states, "ghost", ""))
+        # Legacy records without the field count as root-owned.
+        legacy = [{"name": "old", "agent_id": "aOld", "current": 1}]
+        self.assertEqual(
+            guard.find_state(legacy, "old", "")["agent_id"], "aOld")
 
 
 class SanitizeTests(unittest.TestCase):
@@ -300,16 +538,39 @@ class PruneTests(unittest.TestCase):
             sg.enqueue(cfg, "old-sess", "r")
             sg.enqueue(cfg, "new-sess", "r")
             sg.write_agent_state(cfg, "old-sess", {"agent_id": "aX"})
+            sg.enqueue(cfg, "old-sess", "r", consumer_agent="aX")
+            sg.enqueue(cfg, "new-sess", "r", consumer_agent="aY")
             old_q = sg.state_paths(cfg, "old-sess")["queue"]
             old_a = sg.state_paths(cfg, "old-sess")["agents"]
+            old_aq = sg.state_paths(cfg, "old-sess")["agent_queues"]
             stale = __import__("time").time() - 8 * 86400
-            os.utime(old_q, (stale, stale))
-            os.utime(old_a, (stale, stale))
+            for p in (old_q, old_a, old_aq):
+                os.utime(p, (stale, stale))
+                if os.path.isdir(p):
+                    for f in os.listdir(p):
+                        os.utime(os.path.join(p, f), (stale, stale))
             sg.prune_stale(cfg)
             self.assertFalse(os.path.exists(old_q))
             self.assertFalse(os.path.exists(old_a))
+            self.assertFalse(os.path.exists(old_aq))
             self.assertTrue(os.path.exists(
                 sg.state_paths(cfg, "new-sess")["queue"]))
+            self.assertTrue(os.path.exists(
+                sg.queue_path(cfg, "new-sess", "aY")))
+
+    def test_fresh_file_in_old_dir_survives(self):
+        # Appends refresh the file's mtime but not its directory's: a
+        # week-old session dir can hold a report queued a minute ago.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = dict(sg._DEFAULTS, state_dir=d, state_ttl_days=7)
+            sg.enqueue(cfg, "sess", "fresh", consumer_agent="aX")
+            qdir = sg.state_paths(cfg, "sess")["agent_queues"]
+            stale = __import__("time").time() - 8 * 86400
+            os.utime(qdir, (stale, stale))  # dir old, file fresh
+            sg.prune_stale(cfg)
+            self.assertEqual(
+                sg.drain_queue(cfg, "sess", 10, consumer_agent="aX"),
+                ["fresh"])
 
 
 class FormatTests(unittest.TestCase):

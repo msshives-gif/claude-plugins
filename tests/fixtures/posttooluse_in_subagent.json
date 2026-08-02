@@ -1,0 +1,9 @@
+{
+ "session_id": "1885eb28-fffa-4a7c-9c36-c4c2638670e2",
+ "transcript_path": "/home/user/.claude/projects/-home-user-project/1885eb28-fffa-4a7c-9c36-c4c2638670e2.jsonl",
+ "agent_id": "a1afa18c59102e3b3",
+ "agent_type": "general-purpose",
+ "hook_event_name": "PostToolUse",
+ "tool_name": "Agent",
+ "tool_use_id": "toolu_018H7vjNYXN9zwgcQLSzcuxR"
+}

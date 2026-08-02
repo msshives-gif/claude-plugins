@@ -1,0 +1,7 @@
+{
+ "session_id": "f237d3b2-3472-470c-a87d-6d080fd2f464",
+ "transcript_path": "/home/user/.claude/projects/-home-user-projectC/f237d3b2-3472-470c-a87d-6d080fd2f464.jsonl",
+ "hook_event_name": "PostToolUse",
+ "tool_name": "Workflow",
+ "tool_use_id": "toolu_01P6HTSL1tpqCSyst8Fy1xg5"
+}

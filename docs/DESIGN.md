@@ -38,7 +38,7 @@ Two channels that DO reach the parent model, both empirically verified
   alongside the tool call.
 
 So: the observer (SubagentStop, runs for the subagent) writes
-measurements to a per-parent-session queue file on disk; the drain
+measurements to a per-consumer queue file on disk; the drain
 (PostToolUse, runs for the parent) injects and empties the queue on the
 parent's next tool call. An orchestrator managing agents makes tool
 calls constantly, so delivery latency is effectively one tool call.
@@ -55,11 +55,10 @@ Deliberate consequences:
 - The subagent's final message is untouched.
 - Works for background agents, foreground agents, teammates, and agents
   with no messaging tools.
-- A subagent's own PostToolUse events must NOT drain the parent's queue;
-  the drain exits if the payload carries `agent_id` /
-  `agent_transcript_path` or a subagent transcript path. A consequence:
-  reports serve the root session only — a subagent that itself spawns
-  sub-subagents doesn't receive them.
+- Each consumer has its own queue file, so a report can never land in
+  the wrong context. The payload's `agent_id` picks the queue: absent →
+  the root session's, present → the one addressed to that subagent
+  (see "Nested and workflow agents").
 - Delivery is best-effort: a drained batch that never gets injected
   (process killed at the wrong moment) is not redelivered. The
   per-agent state files, which the guard reads, are the durable record.
@@ -124,6 +123,55 @@ parsing an undocumented format show up — `no-exact-transcript`,
 report is produced. Without it, a Claude Code format change would look
 identical to "no subagents ran".
 
+## Nested and workflow agents
+
+Subagents can spawn subagents (three layers below the main conversation
+by default; `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`), and the Workflow
+tool fans out its own agents. Both fire SubagentStop with an exact
+`agent_transcript_path` and the ROOT session's `session_id`; tool
+events inside a subagent fire with that subagent's `agent_id` and the
+root `session_id` too. All verified 2026-08-02 with captured payloads —
+pinned in `tests/fixtures/`.
+
+Routing is by consumer, resolved from the stopping agent's sidecar:
+
+- `parentAgentId` present → the report is for that spawner. It goes to
+  `queue-agents/<session>/<parent>.jsonl`, and the drain delivers it on
+  the spawner's next tool call, into the spawner's own context
+  (injection into a subagent's context verified by echo test).
+- No `parentAgentId`, verified depth 0 or 1 → treated as root-owned
+  (root session queue, as before). This branch is a FALLBACK for
+  sidecars written before `parentAgentId` existed (first seen
+  2026-07-16): current-format sidecars name their spawner whenever one
+  exists, at any depth — teammates are depth 0, so a teammate's child
+  is depth 1. When the fallback fires, root ownership is inferred, not
+  proven; a pre-2026-07-16 teammate-child sidecar would be attributed
+  to root.
+- Anything else (no usable `parentAgentId`, no verified shallow depth)
+  → ownership is UNKNOWN, written as `"?"`. Delivery degrades to the
+  root queue, but the record can never be owner-matched — a root-owned
+  lookup must not silently match somebody else's child.
+
+Workflow agents get their run id (from the transcript path) as the
+report label, since their sidecars carry no name. The Workflow
+tool exists only in the root session (it is stripped from every
+subagent), so workflow reports always route to root.
+
+The guard follows the same ownership: a send's candidate states are
+those whose `parent_agent_id` equals the sender's `agent_id` ("" for
+the root session), so a reused name can't warn about another branch's
+agent. Inside a subagent the guard only warns — `permissionDecision:
+"ask"` stays root-only, because a subagent may have nobody to answer
+the confirmation, and an unanswerable ask is a block.
+
+Deliberately not built, until real use demands it: report rollups for
+large workflow fan-outs (the drain batch cap already bounds one
+injection; typical workflows are ≤15 agents), dedup of per-burst
+teammate stops, and any persistent parent graph — ownership lives on
+each state record and nowhere else. Known consequence of ownership
+scoping: a teammate messaging a SIBLING teammate is not guarded
+(the sender doesn't own the target; root does).
+
 ## Rejected alternatives
 
 - **Relay through the stopping agent** (v1) — see above.
@@ -159,7 +207,7 @@ undocumented internals. Everything parses defensively (per-line, typed
 checks) and every entry point fails open (`exit 0` always; errors to
 stderr, observations to the ledger). A format change should degrade to
 "no reports", never to a broken session. Fixtures in `tests/` pin the
-formats this was built against (Claude Code, 2026-08-01).
+formats this was built against (Claude Code, 2026-08-02).
 
 ## Prior art
 

@@ -117,6 +117,45 @@ def path_component(value, fallback="unknown"):
     return fallback
 
 
+def resolve_parent(meta):
+    """Who consumes reports about this agent, from its sidecar meta.
+
+    Returns "" (root session owns it), a spawner agent id, or "?" when
+    ownership is unknown (nested spawn whose sidecar lacks a usable
+    parentAgentId — deliver to root, but never let it match a root-owned
+    record in owner-filtered lookups).
+    """
+    if not isinstance(meta, dict):
+        return "?"
+    parent = meta.get("parentAgentId")
+    if parent is not None:
+        if isinstance(parent, str) and path_component(parent, fallback=""):
+            return parent
+        return "?"
+    # Root ownership must be POSITIVELY established: a verified shallow
+    # depth. Absent or malformed depth is unknown — a silent guard beats
+    # a misattributed one.
+    # Fallback for sidecars from before parentAgentId existed
+    # (2026-07-16): current sidecars name their spawner at any depth.
+    # Shallow depth (0-1) makes root ownership LIKELY, not proven — a
+    # teammate's child is also depth 1 (teammates are depth 0).
+    depth = meta.get("spawnDepth")
+    if isinstance(depth, int) and not isinstance(depth, bool) \
+            and 0 <= depth < 2:
+        return ""
+    return "?"
+
+
+def workflow_run(transcript_path):
+    """The workflow run id from a transcript path like
+    .../subagents/workflows/<runId>/agent-<id>.jsonl, else ""."""
+    parts = str(transcript_path or "").replace("\\", "/").split("/")
+    for i in range(len(parts) - 3, 0, -1):
+        if parts[i] == "workflows" and parts[i - 1] == "subagents":
+            return sanitize(parts[i + 1], 60)
+    return ""
+
+
 def is_subagent_payload(payload):
     """True when a hook payload originated inside a subagent rather than
     the root session (agent fields present, or the transcript lives
@@ -346,7 +385,21 @@ def state_paths(cfg, session_id):
     return {
         "agents": os.path.join(root, "agents", sess),
         "queue": os.path.join(root, "queue", f"{sess}.jsonl"),
+        "agent_queues": os.path.join(root, "queue-agents", sess),
     }
+
+
+def queue_path(cfg, session_id, consumer_agent=None):
+    """Queue file for a consumer: the root session (consumer_agent None)
+    or a spawning agent within it. Returns None for an unusable agent id
+    — callers must skip, never fall back to a shared file."""
+    paths = state_paths(cfg, session_id)
+    if consumer_agent is None:
+        return paths["queue"]
+    aid = path_component(consumer_agent, fallback="")
+    if not aid:
+        return None
+    return os.path.join(paths["agent_queues"], f"{aid}.jsonl")
 
 
 def write_agent_state(cfg, session_id, record):
@@ -387,23 +440,28 @@ def load_agent_states(cfg, session_id):
     return [rec for _, rec in sorted(entries, key=lambda e: e[0], reverse=True)]
 
 
-def enqueue(cfg, session_id, text):
-    q = state_paths(cfg, session_id)["queue"]
+def enqueue(cfg, session_id, text, consumer_agent=None):
+    """Queue a report for a consumer. Returns False (after a ledger
+    note is the caller's job) when the consumer key is unusable."""
+    q = queue_path(cfg, session_id, consumer_agent)
+    if q is None:
+        return False
     _private_makedirs(os.path.dirname(q))
     _write_sentinel(cfg)
     with _locked_open(q, "a") as fh:
         fh.write(json.dumps({"ts": time.time(), "text": sanitize(text)}) + "\n")
+    return True
 
 
-def drain_queue(cfg, session_id, batch_max):
+def drain_queue(cfg, session_id, batch_max, consumer_agent=None):
     """Take up to batch_max entries under lock, leaving the remainder.
 
     Truncate-in-place, not tmp-and-rename: on Windows, os.replace over a
     file we still hold open would fail. Texts are re-sanitized on the
     way out — anything running as the user could have appended to the
     queue file, and its content ends up in the orchestrator's context."""
-    q = state_paths(cfg, session_id)["queue"]
-    if not os.path.isfile(q) or os.path.getsize(q) == 0:
+    q = queue_path(cfg, session_id, consumer_agent)
+    if q is None or not os.path.isfile(q) or os.path.getsize(q) == 0:
         return []
     texts = []
     with _locked_open(q, "r+") as fh:
@@ -476,17 +534,20 @@ def prune_stale(cfg):
             p = os.path.join(qdir, n)
             if expendable(n) and not os.path.islink(p) and old(p):
                 os.remove(p)
-        adir = os.path.join(root, "agents")
-        for sess in os.listdir(adir) if os.path.isdir(adir) else []:
-            sp = os.path.join(adir, sess)
-            if os.path.islink(sp) or not os.path.isdir(sp) or not old(sp):
-                continue
-            for f in os.listdir(sp):
-                fp = os.path.join(sp, f)
-                if expendable(f) and not os.path.islink(fp):
-                    os.remove(fp)
-            if not os.listdir(sp):
-                os.rmdir(sp)
+        for sub in ("agents", "queue-agents"):
+            adir = os.path.join(root, sub)
+            for sess in os.listdir(adir) if os.path.isdir(adir) else []:
+                sp = os.path.join(adir, sess)
+                if os.path.islink(sp) or not os.path.isdir(sp) or not old(sp):
+                    continue
+                # Appends don't refresh the DIRECTORY mtime, so an old
+                # dir can still hold a fresh file — age-check each one.
+                for f in os.listdir(sp):
+                    fp = os.path.join(sp, f)
+                    if expendable(f) and not os.path.islink(fp) and old(fp):
+                        os.remove(fp)
+                if not os.listdir(sp):
+                    os.rmdir(sp)
     except OSError:
         pass
 

@@ -5,6 +5,10 @@ subagent context sizes to the orchestrating agent. Shared logic lives in
 `hooks/sgauge_common.py`; hook entry points stay thin and MUST fail open
 (exit 0 on every path — a gauge must never block agent work).
 
+Simple code and simple documentation is best; complexity and big words
+are the enemy. Prefer the boring obvious shape; build machinery only
+when real use forces it (see DESIGN.md "Deliberately not built").
+
 - The transcript JSONL / meta.json formats are undocumented Claude Code
   internals. Never make parsing stricter without keeping the
   degrade-to-no-report behavior; update `tests/` fixtures when the

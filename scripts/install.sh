@@ -18,7 +18,7 @@ import json, os, shlex, shutil, sys, tempfile, time
 
 settings_path, repo = sys.argv[1], sys.argv[2]
 entries = {
-    "SubagentStop": (None, "observer.py", 10),
+    "SubagentStop": (None, "observer.py", 15),
     "PostToolUse": ("*", "drain.py", 5),
     "PreToolUse": ("SendMessage", "guard.py", 5),
 }
@@ -44,7 +44,17 @@ for event, (matcher, script, timeout) in entries.items():
     groups = hooks.setdefault(event, [])
     # json.dumps escapes quotes/non-ASCII, so compare unescaped dumps.
     if any(script_path in json.dumps(g, ensure_ascii=False) for g in groups):
-        print(f"{event}: already installed, skipping")
+        # Already installed: refresh the timeout in place so upgrades
+        # that change it (0.1.0 shipped SubagentStop at 10) take effect.
+        updated = False
+        for g in groups:
+            for e in g.get("hooks", []):
+                if script_path in e.get("command", "") \
+                        and e.get("timeout") != timeout:
+                    e["timeout"] = timeout
+                    updated = True
+        print(f"{event}: timeout updated to {timeout}" if updated
+              else f"{event}: already installed, skipping")
         continue
     group = {"hooks": [{"type": "command", "command": cmd, "timeout": timeout}]}
     if matcher is not None:

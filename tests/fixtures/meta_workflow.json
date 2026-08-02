@@ -1,0 +1,5 @@
+{
+ "agentType": "workflow-subagent",
+ "spawnDepth": 1,
+ "model": "haiku"
+}

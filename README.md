@@ -22,7 +22,7 @@ a problem it goes quiet — it will never break or block your session.
 1. **Observer** (`SubagentStop`) — when a subagent stops, reads its
    context size from its transcript (current, peak, and whether it was
    ever compacted) and saves the numbers.
-2. **Drain** (`PostToolUse`) — on the main session's next tool call,
+2. **Drain** (`PostToolUse`) — on the orchestrator's next tool call,
    slips any new reports into its context:
 
    > `[subagent-gauge] research-worker (claude-opus-5): ~383k tokens —
@@ -37,6 +37,12 @@ a problem it goes quiet — it will never break or block your session.
 
 This costs you nothing: no extra model calls, and the subagent's own
 final answer is never altered.
+
+Reports go to whoever spawned the agent. The root session gets reports
+for its own spawns, teammates, and Workflow-tool agents (labeled with
+the run id); a subagent that spawns its own subagents gets their
+reports in its own context, and the same warn logic applies when it
+re-tasks them.
 
 ## Install
 
@@ -110,7 +116,7 @@ script from the plugin's own directory — `/plugin` shows you the path.
   Code's subagent transcript files, whose format is not a public
   interface. If a Claude Code update changes those formats, this plugin
   stops producing reports. It will not break your session. Built and
-  verified against Claude Code as of 2026-08-01.
+  verified against Claude Code as of 2026-08-02.
 - **Numbers are minimums.** Reports are taken when an agent stops. In
   practice that's often — `SubagentStop` fires every time an agent goes
   idle, not only when it finishes for good (that's what we observed; it
