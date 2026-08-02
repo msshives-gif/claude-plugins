@@ -40,14 +40,14 @@ Two channels that DO reach the parent model, both empirically verified
 So: the observer (SubagentStop, runs for the subagent) writes
 measurements to a per-parent-session queue file on disk; the drain
 (PostToolUse, runs for the parent) injects and empties the queue on the
-parent's next tool call. (The queue keying relies on the SubagentStop
-payload's `session_id` being the parent session's id — verified against
-live payloads and the E2E test, 2026-08-01.) An orchestrator managing agents makes tool
+parent's next tool call. An orchestrator managing agents makes tool
 calls constantly, so delivery latency is effectively one tool call.
 The guard (PreToolUse on SendMessage) reads the same state at the one
-moment that matters — when the orchestrator is about to re-task an
-agent — closing the loop even if the earlier report scrolled out of
-attention.
+moment that matters — right before the orchestrator gives more work to
+an agent — closing the loop even if the earlier report scrolled out of
+attention. The queue keying relies on the SubagentStop payload's
+`session_id` being the parent session's id; verified against live
+payloads and end-to-end tests, 2026-08-01.
 
 Deliberate consequences:
 
@@ -57,19 +57,30 @@ Deliberate consequences:
   with no messaging tools.
 - A subagent's own PostToolUse events must NOT drain the parent's queue;
   the drain exits if the payload carries `agent_id` /
-  `agent_transcript_path` or a subagent transcript path.
+  `agent_transcript_path` or a subagent transcript path. A consequence:
+  reports serve the root session only — a subagent that itself spawns
+  sub-subagents doesn't receive them.
+- Delivery is best-effort: a drained batch that never gets injected
+  (process killed at the wrong moment) is not redelivered. The
+  per-agent state files, which the guard reads, are the durable record.
+- Overhead is one interpreter spawn (~35ms measured, no model tokens)
+  per parent tool call, plus one bounded observer run per subagent stop.
 
-The queue file is a trust boundary: anything running as the user could
-append to it, and its content lands in the orchestrator's context. The
-drain therefore re-sanitizes every line on the way out (control
-characters and newlines flattened, length-capped — so a crafted line
-cannot fabricate additional report lines or escape sequences), state
-directories are created 0o700 and files 0o600, and report text built
-from agent-controlled fields (name, model) is sanitized at the source
-too. Residual risk — a same-user process planting a *plausible-looking*
-single-line report — is equivalent to what any same-user process can
-already do to the transcript or settings, and is documented rather than
-defended.
+### The queue file is where trust ends
+
+Whatever sits in the queue file gets read into the orchestrator's
+context, and any program running as the user could write to that file.
+So the drain cleans every line again on the way out: control characters
+and newlines are flattened and the line is capped in length, which
+means a planted line can't forge extra report lines or slip in escape
+sequences. State directories are created `0o700` and files `0o600`,
+and the agent-supplied name and model are cleaned where they enter,
+too.
+
+What this does not stop: a program running as the user could plant one
+plausible-looking report line. That's no worse than what the same
+program could already do to the transcript or the settings file, so we
+document it rather than defend against it.
 
 ## Measurement
 
@@ -100,31 +111,48 @@ the guard and report treat any compaction as an overload signal.
 
 **Identity:** from the transcript's `meta.json` sidecar (`name`,
 `agentType`, `model`, `spawnDepth`), falling back to the payload
-`agent_id`. Filename parsing is not used. Exact attribution only: if the
-payload doesn't name a real `agent_transcript_path`, the observer logs
-`no-exact-transcript` and records nothing — a guessed transcript
-attributes another agent's tokens to this one (observed in v1
-production; strictly worse than no number).
+`agent_id`. Filename parsing is not used. We only measure the
+transcript the payload names; if it doesn't name a real one, the
+observer records nothing and logs `no-exact-transcript`. Guessing means
+charging one agent's tokens to another, which is worse than having no
+number at all — v1 guessed by file mtime, and we watched it
+misattribute.
+
+**Why the ledger exists:** it is the only place the failure modes of
+parsing an undocumented format show up — `no-exact-transcript`,
+`unmeasurable`, and stale readings are recorded there even when no
+report is produced. Without it, a Claude Code format change would look
+identical to "no subagents ran".
 
 ## Rejected alternatives
 
 - **Relay through the stopping agent** (v1) — see above.
 - **Parent-side PostToolUse on the Agent tool result** — works only for
   foreground spawns; background spawns return `async_launched` before
-  any usage exists (upstream #5812 territory).
+  any usage exists (which is what #5812 asked for).
 - **Statusline / dashboards** — inform the human, not the orchestrator;
   the decision-maker here is the model.
 - **OTEL metrics** — no per-subagent context metric exists, and the
   orchestrator can't read OTEL mid-session anyway.
 
-## Compatibility posture
+## Running on other platforms
 
-File locking uses a sidecar lock file (`O_CREAT|O_EXCL`) rather than
-`flock`/`fcntl`: one mechanism that behaves identically on Linux,
-macOS, and Windows, with bounded waits and stale-lock breaking, at the
-cost of being advisory-by-convention rather than kernel-enforced. Hook
-commands try `python3` then `python`, covering Windows installs where
-Python has no `python3` name.
+File locking uses a sidecar lock file (created `O_CREAT|O_EXCL`, with
+an ownership token) rather than `flock`/`fcntl`: one mechanism that
+behaves the same on Linux, macOS, and Windows, with bounded waits and
+stale-lock breaking. The catch is that it only works while every
+program agrees to use it — the kernel isn't enforcing anything — and if
+a hook is killed while holding the lock, other hooks wait out their
+bounded timeout and skip work until the 10-second stale threshold
+breaks the dead lock. The token stops a lock-breaker from later
+deleting a lock that a newer holder owns. The queue's drain rewrites in
+place (truncate) rather than swapping a temp file in, because renaming
+over an open file fails on Windows.
+
+Hook commands try `python3` then `python`, covering Windows installs
+where Python has no `python3` name.
+
+## When Claude Code's internals change
 
 The transcript JSONL, `meta.json`, and the `subagents/` layout are
 undocumented internals. Everything parses defensively (per-line, typed

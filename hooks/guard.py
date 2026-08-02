@@ -1,16 +1,10 @@
-"""PreToolUse hook on SendMessage: warn (or ask) before the orchestrator
-re-tasks a subagent whose recorded context is over the warn threshold.
+"""PreToolUse hook on SendMessage: catch the moment before the
+orchestrator gives more work to an already-full agent.
 
-This attacks the actual unsafe action — resuming an overloaded agent —
-at the moment it happens, using the state observer.py recorded at the
-agent's last stop. Empirically verified 2026-08-01: PreToolUse
-hookSpecificOutput.additionalContext reaches the model alongside the
-tool call.
-
-The ladder: below warn_tokens (and uncompacted), silent; at/above
-warn_tokens, an injected warning; at/above block_tokens (default 350k,
-0 = off), permissionDecision "ask" — the send goes through only with
-explicit approval, so the block is overridable rather than absolute.
+Below warn_tokens (and uncompacted): silent. At warn_tokens: a warning
+is injected next to the tool call. At block_tokens (0 = off): the send
+also needs explicit confirmation — overridable, not absolute.
+Channel rationale and verification: docs/DESIGN.md.
 """
 import json
 import os
@@ -42,6 +36,7 @@ def main():
     if sg.is_subagent_payload(payload):
         return
     target = (payload.get("tool_input") or {}).get("to") or ""
+    # "main" is the orchestrator's own address, not a subagent.
     if not target or target == "main":
         return
     cfg = sg.load_config()

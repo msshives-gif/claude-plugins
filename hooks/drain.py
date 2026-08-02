@@ -1,16 +1,10 @@
-"""PostToolUse hook (parent session): inject queued subagent context
-reports into the orchestrator's context via additionalContext.
+"""PostToolUse hook (parent session): deliver queued context reports by
+injecting them into the orchestrator's context (additionalContext).
 
-Empirically verified 2026-08-01: PostToolUse hookSpecificOutput
-.additionalContext reaches the session's model as a system-reminder.
-This is the delivery channel — zero extra model turns, works for
-background agents and for agents without messaging tools, and never
-touches the subagent's final deliverable.
-
-Guard against draining from INSIDE a subagent: if the payload names an
-agent transcript or carries an agent_id, this tool call belongs to a
-subagent, whose injections would leak the parent's reports into the
-wrong context. Exit silently there.
+Runs on every tool call, so it exits as fast as possible when there is
+nothing to deliver — and never runs for tool calls made inside a
+subagent, which would leak the parent's reports into the wrong context.
+Channel rationale and verification: docs/DESIGN.md.
 """
 import json
 import os

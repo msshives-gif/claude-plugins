@@ -1,62 +1,44 @@
 # subagent-gauge
 
-**A fuel gauge for your subagents.** Claude Code hooks that tell the
-orchestrating agent how full each subagent's context is — and warn it
-before it re-tasks an overloaded one.
+**A fuel gauge for your subagents.** Your main Claude Code session
+can't see how full each subagent's context is. These hooks tell it —
+and warn it before it hands more work to an agent that's already full.
 
 ## The problem
 
-When a Claude Code session orchestrates subagents (background agents,
-teammates, review panels), the orchestrator has no visibility into how
-much context each subagent has consumed. Nothing in Claude Code reports
-it — not task notifications, not the `/agents` UI, and hook payloads
-carry no usage fields. So orchestrators routinely send "one more round"
-to an agent sitting at 350k+ tokens. Long-context agents degrade: recall
-drops, they anchor on their own earlier conclusions, and review passes
-rubber-stamp. The orchestrator never finds out why.
-
-(Feature requests for pieces of this have been closed as not-planned
-upstream: [#5812](https://github.com/anthropics/claude-code/issues/5812),
-[#22625](https://github.com/anthropics/claude-code/issues/22625).
-[#16424](https://github.com/anthropics/claude-code/issues/16424) added
-the hook payload fields that make this plugin possible, but no context
-reporting.)
+When a Claude session runs subagents (background agents, teammates,
+review panels), nothing reports how much context each one has used —
+not task notifications, not the `/agents` UI, not hook payloads. So the
+main session routinely says "one more round" to an agent sitting at
+350k+ tokens. Agents that full get worse: recall drops, they lean on
+their own earlier conclusions, reviews rubber-stamp. And the main
+session never finds out why.
 
 ## What it does
 
-Three small hooks, stdlib-Python only, all fail-open:
+Three small hooks. Pure Python, nothing else to install. If a hook hits
+a problem it goes quiet — it will never break or block your session.
 
-1. **Observer** (`SubagentStop`) — when a subagent stops, measures its
-   context from its transcript (current, peak, compaction count), stores
-   a per-agent state file, and queues a one-line report.
-2. **Drain** (`PostToolUse`, parent session) — injects queued reports
-   into the orchestrator's context on its next tool call:
+1. **Observer** (`SubagentStop`) — when a subagent stops, reads its
+   context size from its transcript (current, peak, and whether it was
+   ever compacted) and saves the numbers.
+2. **Drain** (`PostToolUse`) — on the main session's next tool call,
+   slips any new reports into its context:
 
    > `[subagent-gauge] research-worker (claude-opus-5): ~383k tokens —
    > OVER THRESHOLD: prefer spawning a fresh agent over re-tasking this
    > one; long-context agents degrade.`
 
-3. **Guard** (`PreToolUse` on `SendMessage`) — if the orchestrator is
-   about to message an agent whose last recorded context exceeds
-   `warn_tokens`, injects a warning at exactly that moment; at/above
-   `block_tokens` (default 350k) the send additionally needs explicit
-   confirmation — an overridable block, not an absolute one.
+3. **Guard** (`PreToolUse` on `SendMessage`) — catches the moment
+   before the main session sends more work to a full agent. Past
+   `warn_tokens` it adds a warning to that tool call. Past
+   `block_tokens` (350k by default) it also asks you to confirm. You
+   can always say yes.
 
-No extra model turns, no cost added to the subagent, and the subagent's
-final deliverable is never touched.
+This costs you nothing: no extra model calls, and the subagent's own
+final answer is never altered.
 
 ## Install
-
-Requirements: a Claude Code version whose SubagentStop hook payload
-carries `agent_id` / `agent_transcript_path` (present since the
-[#16424](https://github.com/anthropics/claude-code/issues/16424) work;
-verify with any subagent stop and `scripts/status.py`), and Python 3.9+
-on PATH as `python3` or `python`. Pure standard library, no platform
-branches. Developed and tested on Linux; macOS uses the same code
-paths; Windows is supported by construction (portable file locking,
-`python` fallback) but has not been tested on a real Windows machine —
-reports welcome. On Windows, install as a plugin (`install.sh` is a
-bash script).
 
 **As a plugin:**
 
@@ -72,12 +54,21 @@ git clone https://github.com/msshives-gif/subagent-gauge
 cd subagent-gauge && ./scripts/install.sh   # merges into ~/.claude/settings.json, with backup
 ```
 
-`./scripts/uninstall.sh` reverses it. Restart running sessions either
-way; hooks are snapshotted at startup.
+Either way, restart any running Claude Code sessions — hooks are read
+at startup. `./scripts/uninstall.sh` reverses the manual install.
 
-Verify: spawn any subagent, then check `python3 scripts/status.py` and
-watch for a `[subagent-gauge]` line in the parent after its next tool
-call.
+**Requirements**
+
+- Python 3.9 or newer, on PATH as `python3` or `python`. No other
+  dependencies.
+- A Claude Code version that includes `agent_id` and
+  `agent_transcript_path` in the `SubagentStop` hook payload. To check:
+  spawn any subagent, then run `python3 scripts/status.py`. If it lists
+  the agent, you're set.
+- Developed and tested on Linux; macOS runs the same code paths.
+  Windows should work (portable locking, `python` fallback) but hasn't
+  been tested on a real Windows machine — reports welcome. On Windows,
+  install as a plugin (`install.sh` is a bash script).
 
 ## Configuration
 
@@ -87,65 +78,56 @@ or a key in `~/.claude/subagent-gauge.json` (env wins; point
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `warn_tokens` | `150000` | At/above this, reports carry the OVER-THRESHOLD warning and the guard fires. Tune to your models: ~150k is conservative for 200k-window models; raise for 1M-context agents. |
-| `report_min_tokens` | `0` | Only queue reports for agents at/above this size. `0` = report every stop. |
-| `block_tokens` | `350000` | At/above this, the guarded send requires explicit confirmation (`permissionDecision: ask` — approve at the prompt to override). `0` disables blocking. In headless runs an unanswerable "ask" acts as a denial. |
-| `system_message` | `true` | Also show each report to the human in the UI. |
-| `drain_batch_max` | `20` | Max reports injected per drain. |
-| `flush_grace_ms` | `4000` | How long the observer waits for the transcript to finish flushing (see DESIGN). Keep well under the observer's 10s hook timeout. |
-| `state_dir` | `~/.claude/subagent-gauge` | Where state, queues, and the ledger live. |
-| `ledger` / `ledger_max_bytes` | `true` / 5MB | Append-only JSONL audit log, rotated once over size. |
-| `state_ttl_days` | `7` | Stale session state/queues get pruned after this. |
+| `warn_tokens` | `150000` | Above this, reports carry an OVER-THRESHOLD warning and the guard starts firing. |
+| `block_tokens` | `350000` | Above this, messaging the agent needs your confirmation. `0` turns this off. |
+| `report_min_tokens` | `0` | Only report agents at least this big. `0` = report every stop. |
+| `system_message` | `true` | Also show each report to you in the UI. |
+| `drain_batch_max` | `20` | Max reports delivered per tool call. |
+| `flush_grace_ms` | `4000` | How long to wait for a stopping agent's transcript to finish being written. |
+| `state_dir` | `~/.claude/subagent-gauge` | Where recorded numbers live. |
+| `ledger` / `ledger_max_bytes` | `true` / 5MB | Keep an audit log of every observation, rotated at the size limit. |
+| `state_ttl_days` | `7` | Old sessions' records get cleaned up after this. |
 
-## Pull-side status
+150k suits models with a 200k window; raise it if you run 1M-context
+agents. The confirmation prompt can't be answered in a headless run, so
+there the block acts as a refusal.
 
-The injected reports are push; for pull, or for a human:
+## Checking the numbers yourself
+
+Reports arrive on their own. To look at the current numbers any time:
 
 ```bash
-python3 scripts/status.py             # all sessions, newest first
+python3 scripts/status.py                 # all sessions, newest first
 python3 scripts/status.py --session 02ff  # prefix match
 ```
 
-(Plugin installs don't give you a clone; run it from the plugin cache —
-the path shown by `/plugin` — or clone the repo just for the script.)
+Installed as a plugin, you won't have a clone of the repo. Run the
+script from the plugin's own directory — `/plugin` shows you the path.
 
 ## Limitations (read before relying on it)
 
-- **Undocumented internals.** Context is measured from the subagent
-  transcript JSONL and its `meta.json` sidecar — internal Claude Code
-  formats with no stability guarantee. The parser is defensive and the
-  hooks fail open: a format change degrades to "no reports," never to
-  broken sessions. Built and verified against Claude Code as of
-  2026-08-01.
-- **Reports are stop-time snapshots.** An agent mid-burst has grown past
-  its last report. In our production use `SubagentStop` fires after
-  every agentic burst (each time a teammate goes idle, not just final
-  completion — observed behavior, not documented), so numbers refresh
-  often, but they are floors, not ceilings.
-- **Post-compaction counts.** After auto-compaction, `current` reflects
-  the compacted (smaller) context. The report exposes `peak` and a
-  `COMPACTED xN` flag — treat any compaction as a degradation signal.
-- **Guard covers `SendMessage` re-tasking.** Fresh `Agent` spawns start
-  at zero context and need no guard; in current Claude Code, resuming an
-  existing agent goes through `SendMessage`, which is what the guard
-  watches. If your setup has no `SendMessage` tool (no
-  teammates/background agents), the guard simply never fires; the
-  reports still work.
-- **Root session only.** Reports and the guard serve the top-level
-  orchestrator. A subagent that itself spawns sub-subagents doesn't
-  receive gauge reports (its PostToolUse drains are deliberately
-  suppressed to keep the parent's queue intact).
-- **Delivery is best-effort.** A drained report that fails to inject
-  (process killed mid-drain) is not redelivered; the per-agent state
-  files — which the guard reads — are the durable record.
-- **Overhead.** The drain runs on every parent tool call: one Python
-  interpreter spawn, ~50ms, no model tokens. The observer runs once per
-  subagent stop (bounded by `flush_grace_ms`).
+- **Built on undocumented internals.** Context is measured from Claude
+  Code's subagent transcript files, whose format is not a public
+  interface. If a Claude Code update changes those formats, this plugin
+  stops producing reports. It will not break your session. Built and
+  verified against Claude Code as of 2026-08-01.
+- **Numbers are minimums.** Reports are taken when an agent stops. In
+  practice that's often — `SubagentStop` fires every time an agent goes
+  idle, not only when it finishes for good (that's what we observed; it
+  isn't documented) — but an agent that's mid-task has already grown
+  past its last report.
+- **Compaction is treated as a warning sign.** After auto-compaction an
+  agent's current context looks small again. Reports show the peak and
+  a `COMPACTED xN` flag, and the guard still fires for it.
+- **The guard watches `SendMessage`.** That's how existing agents get
+  more work in current Claude Code. Fresh `Agent` spawns start empty
+  and need no guard. No `SendMessage` tool in your setup? The guard
+  never fires; reports still work.
+- **Privacy.** Recorded state stays on your machine, under `state_dir`:
+  agent names, models, session IDs, token counts, transcript paths.
+  Nothing goes over the network.
 - **Install one way, not both.** Plugin install *and* `install.sh`
   together would run every hook twice and duplicate reports.
-- **Privacy.** State files and the ledger record agent names, models,
-  session IDs, token counts, and transcript paths — locally, under
-  `state_dir`. No network access anywhere.
 
 ## Uninstall
 
@@ -158,8 +140,8 @@ Plugin: `/plugin uninstall subagent-gauge`. Manual:
 python3 -m unittest discover tests
 ```
 
-Design rationale, the empirically verified hook-channel behavior this
-depends on, and rejected alternatives: [docs/DESIGN.md](docs/DESIGN.md).
+Design rationale, the verified hook-channel behavior this depends on,
+and rejected alternatives: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## License
 

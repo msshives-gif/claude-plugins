@@ -1,20 +1,14 @@
 """SubagentStop hook: measure the stopping agent's context, record it,
-and queue a report for the orchestrator.
+and queue a report for the orchestrator (drain.py delivers it).
 
-Exact attribution only: we measure ONLY the transcript the payload names
-(agent_transcript_path). No mtime-newest fallback — a guessed transcript
-attributes another agent's tokens to this one, which is worse than no
-number (verified in production, 2026-07-31..08-01).
-
-This hook never uses additionalContext: on SubagentStop that channel
-continues the STOPPING agent (not the parent), which costs a full extra
-model turn on a possibly-huge context and overwrites the agent's final
-deliverable with the relay acknowledgment. Delivery to the orchestrator
-happens via drain.py instead.
+We only measure the transcript the payload names — guessing charges one
+agent's tokens to another. Why this hook never continues the stopping
+agent to deliver the report: docs/DESIGN.md, "The delivery problem".
 """
 import json
 import os
 import sys
+import time
 
 # Even the import must fail open: a non-zero exit surfaces a hook error
 # line in the user's session (e.g. fcntl is Unix-only).
@@ -54,7 +48,6 @@ def main():
             or payload.get("agent_type") or agent_id or "subagent")
     model = meta.get("model") or ""
 
-    import time
     record = {
         "agent_id": agent_id,
         "name": name,

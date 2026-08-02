@@ -11,6 +11,7 @@ Parsing is defensive; when the format is unrecognizable we record
 import contextlib
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -47,55 +48,60 @@ _DEFAULTS = {
 _ENV_PREFIX = "SUBAGENT_GAUGE_"
 
 
+def _coerce(default, value):
+    """Convert a raw config value (JSON value or env string) to the
+    default's type. Returns None when the value can't be used — bool is
+    checked before int because bool subclasses int."""
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return None
+    if isinstance(default, int):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, str):
+            try:
+                value = int(value)
+            except ValueError:
+                return None
+        return value if isinstance(value, int) and value >= 0 else None
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def load_config():
     """Defaults <- optional JSON config file <- environment variables."""
-    cfg = dict(_DEFAULTS)
     path = os.environ.get(
         _ENV_PREFIX + "CONFIG",
         os.path.expanduser("~/.claude/subagent-gauge.json"))
+    file_cfg = {}
     try:
         with open(path) as fh:
-            file_cfg = json.load(fh)
-        if isinstance(file_cfg, dict):
-            for k, v in file_cfg.items():
-                if k in cfg:
-                    cfg[k] = v
+            loaded = json.load(fh)
+        if isinstance(loaded, dict):
+            file_cfg = loaded
     except FileNotFoundError:
         pass
     except Exception:
         _log_error(f"config file {path} unreadable; using defaults")
-    # File values must match the default's type (bool is checked before
-    # int since bool subclasses int); wrong-typed values are ignored
-    # loudly rather than exploding later in a comparison.
+
+    cfg = dict(_DEFAULTS)
     for k, dflt in _DEFAULTS.items():
-        v = cfg[k]
-        if isinstance(dflt, bool):
-            ok = isinstance(v, bool)
-        elif isinstance(dflt, int):
-            ok = isinstance(v, int) and not isinstance(v, bool) and v >= 0
-        else:
-            ok = isinstance(v, str) and v.strip()
-        if not ok:
-            _log_error(f"config {k}={v!r} has wrong type; using default")
-            cfg[k] = dflt
-    for k in cfg:
-        env = os.environ.get(_ENV_PREFIX + k.upper())
-        if env is None:
-            continue
-        if isinstance(cfg[k], bool):
-            cfg[k] = env.strip().lower() in ("1", "true", "yes", "on")
-        elif isinstance(cfg[k], int):
-            try:
-                cfg[k] = max(0, int(env))
-            except ValueError:
-                _log_error(f"env {_ENV_PREFIX}{k.upper()}={env!r} not an int")
-        else:
-            cfg[k] = env
-    # Range clamps: values that would make the tool destructive or
-    # inert are pulled back to sane minimums.
+        for raw in (file_cfg.get(k), os.environ.get(_ENV_PREFIX + k.upper())):
+            if raw is None:
+                continue
+            v = _coerce(dflt, raw)
+            if v is None:
+                _log_error(f"config {k}={raw!r} is unusable; ignoring it")
+            else:
+                cfg[k] = v
+    # Pull values that would make the tool destructive or inert back to
+    # sane bounds.
     cfg["drain_batch_max"] = max(1, cfg["drain_batch_max"])
     cfg["state_ttl_days"] = max(1, cfg["state_ttl_days"])
     cfg["ledger_max_bytes"] = max(65_536, cfg["ledger_max_bytes"])
+    cfg["flush_grace_ms"] = min(cfg["flush_grace_ms"], 8_000)
     cfg["state_dir"] = os.path.abspath(os.path.expanduser(cfg["state_dir"]))
     return cfg
 
@@ -137,6 +143,13 @@ def _log_error(msg):
 
 # ---------------------------------------------------------------- measure
 
+def _tok(usage, key):
+    """A token count from a usage dict — 0 unless it's a plain
+    nonnegative int (True/False would otherwise count as 1/0)."""
+    v = usage.get(key, 0)
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+
 def _scan(path):
     """One full pass over a transcript JSONL.
 
@@ -174,14 +187,10 @@ def _scan(path):
             if not any(isinstance(u.get(k), int) for k in known):
                 continue
 
-            def tok(key):
-                v = u.get(key, 0)
-                return v if isinstance(v, int) and not isinstance(v, bool) \
-                    and v >= 0 else 0
-
-            prompt = (tok("input_tokens") + tok("cache_read_input_tokens")
-                      + tok("cache_creation_input_tokens"))
-            total = prompt + tok("output_tokens")
+            prompt = (_tok(u, "input_tokens")
+                      + _tok(u, "cache_read_input_tokens")
+                      + _tok(u, "cache_creation_input_tokens"))
+            total = prompt + _tok(u, "output_tokens")
             res["rows"] += 1
             # Streaming writes preliminary usage rows (stop_reason null)
             # before the terminal row for the same request; prefer
@@ -276,10 +285,13 @@ def _locked_open(path, mode, timeout=2.0):
     killed process and broken.
     """
     lock = path + ".lock"
+    token = os.urandom(8).hex()
     deadline = time.monotonic() + timeout
     while True:
         try:
-            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, token.encode())
+            os.close(fd)
             break
         except FileExistsError:
             try:
@@ -299,8 +311,12 @@ def _locked_open(path, mode, timeout=2.0):
                 pass
             yield fh
     finally:
+        # Remove the lock only if it is still OURS: after a stale-break,
+        # deleting blindly would free the next holder's lock too.
         try:
-            os.remove(lock)
+            with open(lock) as lf:
+                if lf.read() == token:
+                    os.remove(lock)
         except OSError:
             pass
 
@@ -330,8 +346,6 @@ def state_paths(cfg, session_id):
     return {
         "agents": os.path.join(root, "agents", sess),
         "queue": os.path.join(root, "queue", f"{sess}.jsonl"),
-        "ledger": os.path.join(root, "ledger.jsonl"),
-        "sentinel": os.path.join(root, ".subagent-gauge-state"),
     }
 
 
@@ -384,22 +398,19 @@ def enqueue(cfg, session_id, text):
 def drain_queue(cfg, session_id, batch_max):
     """Take up to batch_max entries under lock, leaving the remainder.
 
-    The remainder is written to a temp file and swapped in, so a crash
-    mid-drain loses nothing (worst case: the batch is re-delivered).
-    Texts are re-sanitized on the way out — the queue file is the trust
-    boundary; anything could have appended to it."""
+    Truncate-in-place, not tmp-and-rename: on Windows, os.replace over a
+    file we still hold open would fail. Texts are re-sanitized on the
+    way out — anything running as the user could have appended to the
+    queue file, and its content ends up in the orchestrator's context."""
     q = state_paths(cfg, session_id)["queue"]
     if not os.path.isfile(q) or os.path.getsize(q) == 0:
         return []
     texts = []
     with _locked_open(q, "r+") as fh:
         lines = fh.readlines()
-        keep = lines[batch_max:]
-        tmp = q + ".tmp"
-        with open(tmp, "w") as out:
-            out.writelines(keep)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, q)
+        fh.seek(0)
+        fh.writelines(lines[batch_max:])
+        fh.truncate()
     for line in lines[:batch_max]:
         try:
             texts.append(sanitize(json.loads(line)["text"]))
@@ -411,7 +422,7 @@ def drain_queue(cfg, session_id, batch_max):
 def _write_sentinel(cfg):
     """Marks the state dir as ours; prune refuses to run without it, so
     a misconfigured state_dir can never make prune touch user files."""
-    p = state_paths(cfg, "")["sentinel"]
+    p = os.path.join(cfg["state_dir"], ".subagent-gauge-state")
     if not os.path.isfile(p):
         with open(p, "w") as fh:
             fh.write("Managed by subagent-gauge. Safe to delete this "
@@ -422,7 +433,7 @@ def _write_sentinel(cfg):
 def ledger_append(cfg, entry):
     if not cfg["ledger"]:
         return
-    path = state_paths(cfg, "")["ledger"]
+    path = os.path.join(cfg["state_dir"], "ledger.jsonl")
     _private_makedirs(os.path.dirname(path))
     _write_sentinel(cfg)
     entry = {"v": SCHEMA_VERSION, "ts": time.time(), **entry}
@@ -431,7 +442,6 @@ def ledger_append(cfg, entry):
         # locked inode as the live ledger.
         try:
             if os.fstat(fh.fileno()).st_size > cfg["ledger_max_bytes"]:
-                import shutil
                 shutil.copyfile(path, path + ".1")
                 os.chmod(path + ".1", 0o600)
                 fh.truncate(0)
@@ -449,7 +459,7 @@ def prune_stale(cfg):
     contents pruned); never follows symlinks; only deletes filenames
     matching what this tool writes."""
     root = cfg["state_dir"]
-    if not os.path.isfile(state_paths(cfg, "")["sentinel"]):
+    if not os.path.isfile(os.path.join(root, ".subagent-gauge-state")):
         return
     cutoff = time.time() - cfg["state_ttl_days"] * 86400
 

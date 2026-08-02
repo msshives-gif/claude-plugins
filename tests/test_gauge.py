@@ -132,6 +132,48 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(sg.load_agent_states(self.cfg, "sess1"), [rec])
 
 
+class LockTests(unittest.TestCase):
+    def test_contention_loses_no_writes(self):
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "f.jsonl")
+
+            def writer(i):
+                with sg._locked_open(p, "a") as fh:
+                    fh.write(f"line-{i}\n")
+
+            threads = [threading.Thread(target=writer, args=(i,))
+                       for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(len(open(p).readlines()), 8)
+
+    def test_stale_lock_broken_but_not_cross_deleted(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "f.jsonl")
+            stale = p + ".lock"
+            with open(stale, "w") as fh:
+                fh.write("dead-holder-token")
+            os.utime(stale, (0, 0))  # ancient -> breakable
+            with sg._locked_open(p, "a") as fh:
+                fh.write("x\n")
+                # While we hold the lock, a dead holder's cleanup must
+                # not free it: simulate by checking token mismatch.
+                self.assertNotEqual(open(stale).read(), "dead-holder-token")
+            self.assertFalse(os.path.exists(stale))
+
+    def test_timeout_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "f.jsonl")
+            with open(p + ".lock", "w") as fh:
+                fh.write("held")  # fresh foreign lock, not stale
+            with self.assertRaises(TimeoutError):
+                with sg._locked_open(p, "a", timeout=0.3):
+                    pass
+
+
 class ConfigTests(unittest.TestCase):
     def setUp(self):
         # Isolate from any real ~/.claude/subagent-gauge.json the
