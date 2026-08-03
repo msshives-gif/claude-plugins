@@ -1,8 +1,8 @@
-"""Shared library for subagent-gauge hooks.
+"""Shared library for subagent-context hooks.
 
-Design notes live in docs/DESIGN.md. Everything here fails open: a gauge
-must never block agent work, so callers wrap entry points and exit 0 on
-any exception (after best-effort error logging).
+Design notes live in docs/DESIGN.md. Everything here fails open: a
+reporting tool must never block agent work, so callers wrap entry points
+and exit 0 on any exception (after best-effort error logging).
 
 The subagent transcript JSONL is an UNDOCUMENTED Claude Code internal.
 Parsing is defensive; when the format is unrecognizable we record
@@ -19,9 +19,9 @@ SCHEMA_VERSION = 1
 
 _DEFAULTS = {
     # Context size (tokens) at/above which reports are flagged and the
-    # guard warns before re-tasking the agent. 150k is conservative for
-    # mixed models; raise it if you routinely run 1M-context agents.
-    "warn_tokens": 150_000,
+    # guard warns before re-tasking the agent. Assumes long-context
+    # models; per-model overrides live under the "models" config key.
+    "warn_tokens": 250_000,
     # Only enqueue dispatcher reports for agents at/above this size.
     # 0 = report every subagent stop (recommended: reports are cheap).
     "report_min_tokens": 0,
@@ -37,7 +37,7 @@ _DEFAULTS = {
     # flushing before measuring (see measure(): stability wait).
     "flush_grace_ms": 4000,
     # Where state (per-agent readings, queues, ledger) lives.
-    "state_dir": "~/.claude/subagent-gauge",
+    "state_dir": "~/.claude/subagent-context",
     # Append every observation to <state_dir>/ledger.jsonl.
     "ledger": True,
     "ledger_max_bytes": 5_000_000,
@@ -45,7 +45,10 @@ _DEFAULTS = {
     "state_ttl_days": 7,
 }
 
-_ENV_PREFIX = "SUBAGENT_GAUGE_"
+_ENV_PREFIX = "SUBAGENT_CONTEXT_"
+
+# The knobs a per-model override (config key "models") may set.
+_PER_MODEL_KEYS = ("warn_tokens", "block_tokens", "report_min_tokens")
 
 
 def _coerce(default, value):
@@ -70,11 +73,40 @@ def _coerce(default, value):
     return value if isinstance(value, str) and value.strip() else None
 
 
+def _parse_models(raw):
+    """Validate the "models" config value: {model-id-substring: {knob:
+    value}}. Env passes it as a JSON string. Unusable entries are logged
+    and dropped; returns None when the whole value is unusable."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for pat, overrides in raw.items():
+        if not pat.strip() or not isinstance(overrides, dict):
+            _log_error(f"models entry {pat!r} is unusable; ignoring it")
+            continue
+        clean = {}
+        for k, v in overrides.items():
+            c = _coerce(_DEFAULTS[k], v) if k in _PER_MODEL_KEYS else None
+            if c is None:
+                _log_error(f"models[{pat!r}].{k}={v!r} is unusable; "
+                           "ignoring it")
+            else:
+                clean[k] = c
+        if clean:
+            out[pat] = clean
+    return out
+
+
 def load_config():
     """Defaults <- optional JSON config file <- environment variables."""
     path = os.environ.get(
         _ENV_PREFIX + "CONFIG",
-        os.path.expanduser("~/.claude/subagent-gauge.json"))
+        os.path.expanduser("~/.claude/subagent-context.json"))
     file_cfg = {}
     try:
         with open(path) as fh:
@@ -96,6 +128,16 @@ def load_config():
                 _log_error(f"config {k}={raw!r} is unusable; ignoring it")
             else:
                 cfg[k] = v
+    cfg["models"] = {}
+    for raw in (file_cfg.get("models"),
+                os.environ.get(_ENV_PREFIX + "MODELS")):
+        if raw is None:
+            continue
+        models = _parse_models(raw)
+        if models is None:
+            _log_error(f"config models={raw!r} is unusable; ignoring it")
+        else:
+            cfg["models"] = models
     # Pull values that would make the tool destructive or inert back to
     # sane bounds.
     cfg["drain_batch_max"] = max(1, cfg["drain_batch_max"])
@@ -104,6 +146,21 @@ def load_config():
     cfg["flush_grace_ms"] = min(cfg["flush_grace_ms"], 8_000)
     cfg["state_dir"] = os.path.abspath(os.path.expanduser(cfg["state_dir"]))
     return cfg
+
+
+def thresholds(cfg, model):
+    """Effective warn/block/report_min values for one agent. The longest
+    "models" pattern that is a substring of the model id (case-insensitive)
+    supplies overrides; unmatched or empty model ids get the globals."""
+    eff = {k: cfg[k] for k in _PER_MODEL_KEYS}
+    model = str(model or "").lower()
+    best = ""
+    for pat in cfg.get("models", {}):
+        if len(pat) > len(best) and pat.lower() in model:
+            best = pat
+    if best:
+        eff.update(cfg["models"][best])
+    return eff
 
 
 def path_component(value, fallback="unknown"):
@@ -177,7 +234,7 @@ def _log_error(msg):
     # stderr only: on exit 0 Claude Code keeps hook stderr out of the
     # conversation (visible in --debug), which is the failure visibility
     # this tool can afford without risking sessions.
-    print(f"subagent-gauge: {msg}", file=sys.stderr)
+    print(f"subagent-context: {msg}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- measure
@@ -480,10 +537,10 @@ def drain_queue(cfg, session_id, batch_max, consumer_agent=None):
 def _write_sentinel(cfg):
     """Marks the state dir as ours; prune refuses to run without it, so
     a misconfigured state_dir can never make prune touch user files."""
-    p = os.path.join(cfg["state_dir"], ".subagent-gauge-state")
+    p = os.path.join(cfg["state_dir"], ".subagent-context-state")
     if not os.path.isfile(p):
         with open(p, "w") as fh:
-            fh.write("Managed by subagent-gauge. Safe to delete this "
+            fh.write("Managed by subagent-context. Safe to delete this "
                      "whole directory.\n")
         os.chmod(p, 0o600)
 
@@ -513,11 +570,11 @@ def prune_stale(cfg):
     for state_ttl_days. Called opportunistically from the observer.
 
     Deletion safety: refuses to run unless the sentinel file marks the
-    state dir as gauge-owned (a typo'd state_dir must never get its
+    state dir as ours (a typo'd state_dir must never get its
     contents pruned); never follows symlinks; only deletes filenames
     matching what this tool writes."""
     root = cfg["state_dir"]
-    if not os.path.isfile(os.path.join(root, ".subagent-gauge-state")):
+    if not os.path.isfile(os.path.join(root, ".subagent-context-state")):
         return
     cutoff = time.time() - cfg["state_ttl_days"] * 86400
 
@@ -559,7 +616,7 @@ def fmt_report(name, model, res, warn_tokens):
         parts.append(f"peak ~{res['peak'] / 1000:.0f}k")
     if res["compactions"]:
         parts.append(f"COMPACTED x{res['compactions']}")
-    line = f"[subagent-gauge] {sanitize(name, 80)}"
+    line = f"[subagent-context] {sanitize(name, 80)}"
     if model:
         line += f" ({sanitize(model, 40)})"
     line += ": " + ", ".join(parts)

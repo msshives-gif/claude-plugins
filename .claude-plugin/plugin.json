@@ -1,13 +1,13 @@
 {
-  "name": "subagent-gauge",
-  "description": "A fuel gauge for your subagents: reports each subagent's context size to the orchestrating agent and warns before an overloaded subagent gets re-tasked.",
-  "version": "0.2.0",
+  "name": "subagent-context",
+  "description": "Reports each subagent's context size to the orchestrating agent and warns before an overloaded subagent gets re-tasked.",
+  "version": "0.3.0",
   "author": {
     "name": "msshives-gif"
   },
   "license": "MIT",
-  "homepage": "https://github.com/msshives-gif/subagent-gauge",
-  "repository": "https://github.com/msshives-gif/subagent-gauge",
+  "homepage": "https://github.com/msshives-gif/subagent-context",
+  "repository": "https://github.com/msshives-gif/subagent-context",
   "keywords": [
     "hooks",
     "subagents",

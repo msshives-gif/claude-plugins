@@ -1,5 +1,5 @@
 #!/bin/bash
-# Manual (non-plugin) install: merge subagent-gauge hooks into
+# Manual (non-plugin) install: merge subagent-context hooks into
 # ~/.claude/settings.json (or a settings file given as $1), backing the
 # file up BEFORE parsing it. Idempotent: running twice adds nothing
 # twice. Writes are atomic (temp file + rename).
@@ -25,7 +25,7 @@ entries = {
 
 settings = {}
 if os.path.isfile(settings_path):
-    backup = f"{settings_path}.bak-subagent-gauge-{time.strftime('%Y%m%d%H%M%S')}"
+    backup = f"{settings_path}.bak-subagent-context-{time.strftime('%Y%m%d%H%M%S')}"
     shutil.copy2(settings_path, backup)
     print(f"backup: {backup}")
     try:
@@ -64,7 +64,7 @@ for event, (matcher, script, timeout) in entries.items():
 
 settings_dir = os.path.dirname(settings_path) or "."
 os.makedirs(settings_dir, exist_ok=True)
-fd, tmp = tempfile.mkstemp(dir=settings_dir, prefix=".subagent-gauge-")
+fd, tmp = tempfile.mkstemp(dir=settings_dir, prefix=".subagent-context-")
 with os.fdopen(fd, "w") as fh:
     json.dump(settings, fh, indent=2)
     fh.write("\n")

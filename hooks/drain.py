@@ -15,9 +15,9 @@ import sys
 
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import sgauge_common as sg
+    import subagent_context as sg
 except Exception as e:
-    print(f"subagent-gauge drain: import failed: {e!r}", file=sys.stderr)
+    print(f"subagent-context drain: import failed: {e!r}", file=sys.stderr)
     sys.exit(0)
 
 
@@ -48,5 +48,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"subagent-gauge drain: {e!r}", file=sys.stderr)
+        print(f"subagent-context drain: {e!r}", file=sys.stderr)
     sys.exit(0)

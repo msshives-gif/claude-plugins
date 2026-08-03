@@ -1,8 +1,9 @@
-# subagent-gauge
+# subagent-context
 
-**A fuel gauge for your subagents.** Your main Claude Code session
-can't see how full each subagent's context is. These hooks tell it —
-and warn it before it hands more work to an agent that's already full.
+**Context-size reports for your subagents.** Your main Claude Code
+session can't see how full each subagent's context is. These hooks tell
+it — and warn it before it hands more work to an agent that's already
+full.
 
 ## The problem
 
@@ -25,7 +26,7 @@ a problem it goes quiet — it will never break or block your session.
 2. **Drain** (`PostToolUse`) — on the orchestrator's next tool call,
    slips any new reports into its context:
 
-   > `[subagent-gauge] research-worker (claude-opus-5): ~383k tokens —
+   > `[subagent-context] research-worker (claude-opus-5): ~383k tokens —
    > OVER THRESHOLD: prefer spawning a fresh agent over re-tasking this
    > one; long-context agents degrade.`
 
@@ -49,15 +50,15 @@ re-tasks them.
 **As a plugin:**
 
 ```
-/plugin marketplace add msshives-gif/subagent-gauge
-/plugin install subagent-gauge@subagent-gauge
+/plugin marketplace add msshives-gif/subagent-context
+/plugin install subagent-context@subagent-context
 ```
 
 **Manual (no plugin system):**
 
 ```bash
-git clone https://github.com/msshives-gif/subagent-gauge
-cd subagent-gauge && ./scripts/install.sh   # merges into ~/.claude/settings.json, with backup
+git clone https://github.com/msshives-gif/subagent-context
+cd subagent-context && ./scripts/install.sh   # merges into ~/.claude/settings.json, with backup
 ```
 
 Either way, restart any running Claude Code sessions — hooks are read
@@ -78,25 +79,52 @@ at startup. `./scripts/uninstall.sh` reverses the manual install.
 
 ## Configuration
 
-Every knob works as an environment variable (`SUBAGENT_GAUGE_<NAME>`)
-or a key in `~/.claude/subagent-gauge.json` (env wins; point
-`SUBAGENT_GAUGE_CONFIG` at a different config path if you want one):
+Every knob works as an environment variable (`SUBAGENT_CONTEXT_<NAME>`)
+or a key in `~/.claude/subagent-context.json` (env wins; point
+`SUBAGENT_CONTEXT_CONFIG` at a different config path if you want one):
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `warn_tokens` | `150000` | Above this, reports carry an OVER-THRESHOLD warning and the guard starts firing. |
+| `warn_tokens` | `250000` | Above this, reports carry an OVER-THRESHOLD warning and the guard starts firing. |
 | `block_tokens` | `350000` | Above this, messaging the agent needs your confirmation. `0` turns this off. |
 | `report_min_tokens` | `0` | Only report agents at least this big. `0` = report every stop. |
+| `models` | `{}` | Per-model overrides for the three knobs above — see below. |
 | `system_message` | `true` | Also show each report to you in the UI. |
 | `drain_batch_max` | `20` | Max reports delivered per tool call. |
 | `flush_grace_ms` | `4000` | How long to wait for a stopping agent's transcript to finish being written. |
-| `state_dir` | `~/.claude/subagent-gauge` | Where recorded numbers live. |
+| `state_dir` | `~/.claude/subagent-context` | Where recorded numbers live. |
 | `ledger` / `ledger_max_bytes` | `true` / 5MB | Keep an audit log of every observation, rotated at the size limit. |
 | `state_ttl_days` | `7` | Old sessions' records get cleaned up after this. |
 
-150k suits models with a 200k window; raise it if you run 1M-context
-agents. The confirmation prompt can't be answered in a headless run, so
-there the block acts as a refusal.
+The defaults assume long-context models. A model with a 200k window
+compacts before reaching 250k — compaction is itself reported and
+guarded, but if you mix model families, give each its own thresholds.
+The confirmation prompt can't be answered in a headless run, so there
+the block acts as a refusal.
+
+### Per-model thresholds
+
+`models` maps a model-ID substring to overrides for `warn_tokens`,
+`block_tokens`, and `report_min_tokens`. In
+`~/.claude/subagent-context.json`:
+
+```json
+{
+  "warn_tokens": 250000,
+  "models": {
+    "claude-fable-5": { "warn_tokens": 400000, "block_tokens": 700000 },
+    "opus": { "warn_tokens": 250000, "block_tokens": 350000 },
+    "haiku": { "warn_tokens": 150000 }
+  }
+}
+```
+
+A pattern matches when it appears anywhere in the agent's model ID
+(case-insensitive); the longest matching pattern wins, so
+`claude-opus-4-8` can be more specific than `opus`. Knobs a match
+doesn't set fall back to the global values, and agents whose model is
+unknown always use the globals. As an environment variable,
+`SUBAGENT_CONTEXT_MODELS` takes the same mapping as a JSON string.
 
 ## Checking the numbers yourself
 
@@ -137,8 +165,8 @@ script from the plugin's own directory — `/plugin` shows you the path.
 
 ## Uninstall
 
-Plugin: `/plugin uninstall subagent-gauge`. Manual:
-`./scripts/uninstall.sh`. Then delete `~/.claude/subagent-gauge/`.
+Plugin: `/plugin uninstall subagent-context`. Manual:
+`./scripts/uninstall.sh`. Then delete `~/.claude/subagent-context/`.
 
 ## Development
 

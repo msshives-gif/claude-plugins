@@ -1,14 +1,14 @@
 {
-  "name": "subagent-gauge",
-  "description": "Marketplace for the subagent-gauge plugin: context-size reporting for Claude Code subagents.",
+  "name": "subagent-context",
+  "description": "Marketplace for the subagent-context plugin: context-size reporting for Claude Code subagents.",
   "owner": {
     "name": "msshives-gif"
   },
   "plugins": [
     {
-      "name": "subagent-gauge",
+      "name": "subagent-context",
       "source": "./",
-      "description": "A fuel gauge for your subagents: reports each subagent's context size to the orchestrating agent and warns before an overloaded subagent gets re-tasked."
+      "description": "Reports each subagent's context size to the orchestrating agent and warns before an overloaded subagent gets re-tasked."
     }
   ]
 }

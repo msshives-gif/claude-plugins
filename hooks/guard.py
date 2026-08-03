@@ -3,8 +3,9 @@ orchestrator gives more work to an already-full agent.
 
 Below warn_tokens (and uncompacted): silent. At warn_tokens: a warning
 is injected next to the tool call. At block_tokens (0 = off): the send
-also needs explicit confirmation — overridable, not absolute.
-Channel rationale and verification: docs/DESIGN.md.
+also needs explicit confirmation — overridable, not absolute. Both
+thresholds honor per-model "models" overrides for the target agent's
+recorded model. Channel rationale and verification: docs/DESIGN.md.
 """
 import json
 import os
@@ -12,9 +13,9 @@ import sys
 
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import sgauge_common as sg
+    import subagent_context as sg
 except Exception as e:
-    print(f"subagent-gauge guard: import failed: {e!r}", file=sys.stderr)
+    print(f"subagent-context guard: import failed: {e!r}", file=sys.stderr)
     sys.exit(0)
 
 
@@ -56,10 +57,11 @@ def main():
     if not rec:
         return
     current = rec.get("current", 0)
-    over = current >= cfg["warn_tokens"] or rec.get("compactions", 0)
+    th = sg.thresholds(cfg, rec.get("model"))
+    over = current >= th["warn_tokens"] or rec.get("compactions", 0)
     if not over:
         return
-    warn = (f"[subagent-gauge] You are messaging agent '{target}' whose "
+    warn = (f"[subagent-context] You are messaging agent '{target}' whose "
             f"context was ~{current / 1000:.0f}k tokens at its last stop")
     if rec.get("compactions"):
         warn += f" (compacted x{rec['compactions']})"
@@ -76,7 +78,7 @@ def main():
     # "ask" only for the root session: a subagent may have no one to
     # answer the confirmation, and an unanswerable ask is a block —
     # stronger than this tool's fail-open promise allows.
-    if not sender and cfg["block_tokens"] and current >= cfg["block_tokens"]:
+    if not sender and th["block_tokens"] and current >= th["block_tokens"]:
         out["hookSpecificOutput"]["permissionDecision"] = "ask"
         out["hookSpecificOutput"]["permissionDecisionReason"] = warn
     print(json.dumps(out))
@@ -86,5 +88,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"subagent-gauge guard: {e!r}", file=sys.stderr)
+        print(f"subagent-context guard: {e!r}", file=sys.stderr)
     sys.exit(0)

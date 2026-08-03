@@ -14,9 +14,9 @@ import time
 # line in the user's session (e.g. fcntl is Unix-only).
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import sgauge_common as sg
+    import subagent_context as sg
 except Exception as e:
-    print(f"subagent-gauge observer: import failed: {e!r}", file=sys.stderr)
+    print(f"subagent-context observer: import failed: {e!r}", file=sys.stderr)
     sys.exit(0)
 
 
@@ -74,15 +74,16 @@ def main():
     try:
         sg.write_agent_state(cfg, session_id, record)
     except Exception as e:
-        print(f"subagent-gauge observer: state write failed: {e!r}",
+        print(f"subagent-context observer: state write failed: {e!r}",
               file=sys.stderr)
 
     out = {"suppressOutput": True}
     delivered_to = "none"
     # Compaction is itself an overload signal — it must not be filtered
     # out just because the post-compaction context is small.
-    if res["current"] >= cfg["report_min_tokens"] or res["compactions"]:
-        report = sg.fmt_report(name, model, res, cfg["warn_tokens"])
+    th = sg.thresholds(cfg, model)
+    if res["current"] >= th["report_min_tokens"] or res["compactions"]:
+        report = sg.fmt_report(name, model, res, th["warn_tokens"])
         if agent_id and agent_id not in report:
             report += f" (id {sg.sanitize(agent_id, 40)})"
         # Reports about a nested agent go to its spawner; unknown or
@@ -93,7 +94,7 @@ def main():
             sg.enqueue(cfg, session_id, report, consumer_agent=consumer)
             delivered_to = consumer or "session"
         except Exception as e:
-            print(f"subagent-gauge observer: enqueue failed: {e!r}",
+            print(f"subagent-context observer: enqueue failed: {e!r}",
                   file=sys.stderr)
         if cfg["system_message"]:
             out["systemMessage"] = report
@@ -106,7 +107,7 @@ def main():
                                    "peak", "compactions",
                                    "parent_agent_id", "workflow_run")}})
     except Exception as e:
-        print(f"subagent-gauge observer: ledger failed: {e!r}",
+        print(f"subagent-context observer: ledger failed: {e!r}",
               file=sys.stderr)
     print(json.dumps(out))
 
@@ -115,5 +116,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:  # fail open, loudly on stderr
-        print(f"subagent-gauge observer: {e!r}", file=sys.stderr)
+        print(f"subagent-context observer: {e!r}", file=sys.stderr)
     sys.exit(0)

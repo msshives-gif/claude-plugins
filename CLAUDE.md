@@ -1,9 +1,10 @@
-# subagent-gauge
+# subagent-context
 
 Claude Code plugin: three hooks (observer/drain/guard) that report
 subagent context sizes to the orchestrating agent. Shared logic lives in
-`hooks/sgauge_common.py`; hook entry points stay thin and MUST fail open
-(exit 0 on every path — a gauge must never block agent work).
+`hooks/subagent_context.py`; hook entry points stay thin and MUST fail
+open (exit 0 on every path — a reporting tool must never block agent
+work).
 
 Simple code and simple documentation is best; complexity and big words
 are the enemy. Prefer the boring obvious shape; build machinery only

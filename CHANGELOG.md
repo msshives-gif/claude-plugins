@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 — 2026-08-02
+
+Renamed `subagent-gauge` → `subagent-context` (the fuel-gauge analogy is
+gone). This touches every user-facing surface: plugin name, report
+prefix (`[subagent-context]`), env prefix (`SUBAGENT_CONTEXT_*`), config
+file (`~/.claude/subagent-context.json`), and state dir
+(`~/.claude/subagent-context`). Old state is simply abandoned — delete
+`~/.claude/subagent-gauge/` after upgrading; `uninstall.sh` still
+removes pre-rename hook entries.
+
+- `warn_tokens` default raised 150k → 250k.
+- New `models` config key: per-model overrides for `warn_tokens`,
+  `block_tokens`, and `report_min_tokens`, keyed by model-ID substring
+  (longest match wins). Observer, guard, and status all honor them.
+
 ## 0.2.0 — 2026-08-02
 
 Reports now reach every orchestrator, not just the root session:

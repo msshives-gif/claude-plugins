@@ -13,7 +13,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "hooks"))
-import sgauge_common as sg
+import subagent_context as sg
 
 
 def main():
@@ -44,7 +44,8 @@ def main():
             if r.get("observed_at"):
                 age_s = f"{(time.time() - r['observed_at']) / 60:.0f}m ago"
             flags = []
-            if r.get("current", 0) >= cfg["warn_tokens"]:
+            if r.get("current", 0) >= \
+                    sg.thresholds(cfg, r.get("model"))["warn_tokens"]:
                 flags.append("OVER-THRESHOLD")
             if r.get("compactions"):
                 flags.append(f"compacted x{r['compactions']}")
