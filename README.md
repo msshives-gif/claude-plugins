@@ -1,24 +1,22 @@
 # subagent-context
 
-**Context-size reports for your subagents.** Your main Claude Code
-session can't see how full each subagent's context is. These hooks tell
-it — and warn it before it hands more work to an agent that's already
-full.
+Your main Claude Code session can't see how full each subagent's
+context is. These hooks tell it — and warn it before it hands more
+work to an agent with degraded performance.
 
 ## The problem
 
 When a Claude session runs subagents (background agents, teammates,
-review panels), nothing reports how much context each one has used —
-not task notifications, not the `/agents` UI, not hook payloads. So the
-main session routinely says "one more round" to an agent sitting at
+review panels), nothing reports how much context each one has used. So
+the main session routinely says "one more round" to an agent sitting at
 350k+ tokens. Agents that full get worse: recall drops, they lean on
-their own earlier conclusions, reviews rubber-stamp. And the main
-session never finds out why.
+their own earlier conclusions, they churn more, and reviews may
+rubber-stamp. This plugin gives the dispatcher context awareness,
+configurable.
 
 ## What it does
 
-Three small hooks. Pure Python, nothing else to install. If a hook hits
-a problem it goes quiet — it will never break or block your session.
+Three small hooks.
 
 1. **Observer** (`SubagentStop`) — when a subagent stops, reads its
    context size from its transcript (current, peak, and whether it was
@@ -36,10 +34,10 @@ a problem it goes quiet — it will never break or block your session.
    `block_tokens` (350k by default) it also asks you to confirm. You
    can always say yes.
 
-This costs you nothing: no extra model calls, and the subagent's own
-final answer is never altered.
+This costs you nothing other than a few tokens on an existing message:
+no extra model calls.
 
-Reports go to whoever spawned the agent. The root session gets reports
+Reports go to whatever session spawned the agent. The root session gets reports
 for its own spawns, teammates, and Workflow-tool agents (labeled with
 the run id); a subagent that spawns its own subagents gets their
 reports in its own context, and the same warn logic applies when it
