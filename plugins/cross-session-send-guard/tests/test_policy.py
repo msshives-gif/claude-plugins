@@ -32,7 +32,7 @@ class PolicyTests(unittest.TestCase):
         self.proc = os.path.join(self.tmp.name, "proc")
         os.makedirs(self.sessions)
 
-    def add_peer(self, name, tokens, cold, pid=101, session_id="sess-a"):
+    def add_peer(self, name, tokens, cold, pid=101, session_id="sess-aaaa-1111"):
         with open(os.path.join(self.sessions, f"{pid}.json"), "w") as fh:
             json.dump({"pid": pid, "name": name, "sessionId": session_id,
                        "cwd": "/home/u/proj", "updatedAt": 1,

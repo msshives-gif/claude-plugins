@@ -9,7 +9,8 @@ disambiguation ref ("name [fc9877]"), and a direct socket path
 
 Everything here fails open: any surprise returns None (the guard stays
 silent). Never guess — a wrong-session measurement is worse than no
-warning. The pid/cwd/newest-transcript heuristic from issue #1 is
+warning, and the ONLY path that can gate a send must never rest on a
+guess. The pid/cwd/newest-transcript heuristic from issue #1 is
 deliberately NOT implemented as a gating path.
 """
 import json
@@ -17,6 +18,11 @@ import os
 import re
 
 _REF_SUFFIX = re.compile(r"\s+\[[0-9a-f]{4,12}\]$")
+# Registry files are tiny (~300 bytes); anything bigger is not ours.
+_REGISTRY_MAX_BYTES = 65_536
+# Never examine more registry files than this per resolution.
+_REGISTRY_MAX_FILES = 200
+_SESSION_ID_OK = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 
 
 def parse_address(to):
@@ -42,7 +48,7 @@ def _proc_start(pid, proc_root):
     last ')'."""
     try:
         with open(os.path.join(proc_root, str(pid), "stat")) as fh:
-            stat = fh.read()
+            stat = fh.read(8192)
         fields = stat[stat.rindex(")") + 2:].split()
         return int(fields[19])  # starttime is field 22, 20th after comm
     except Exception:
@@ -51,22 +57,20 @@ def _proc_start(pid, proc_root):
 
 def is_alive(entry, proc_root="/proc"):
     """Live means the pid exists AND its kernel starttime matches the
-    registry's procStart — a recycled pid must not count (spike: age
-    alone proves nothing; sessions here run for weeks)."""
+    registry's procStart. A missing or malformed procStart is NOT
+    proof of liveness — a recycled pid must never count (sessions here
+    run for weeks; every genuine registry entry observed carries a
+    string procStart)."""
     pid = entry.get("pid")
     if not isinstance(pid, int):
         return False
     start = _proc_start(pid, proc_root)
     if start is None:
         return False
-    reg_start = entry.get("procStart")
-    if reg_start is None:
-        return True  # older registry versions: existence is best we have
     try:
         # The live registry stores procStart as a STRING (observed
-        # 2026-08-15); tolerate either form, but a malformed value is
-        # not proof of liveness.
-        return start == int(reg_start)
+        # 2026-08-15); tolerate either form.
+        return start == int(entry.get("procStart"))
     except (TypeError, ValueError):
         return False
 
@@ -75,14 +79,32 @@ def _slug(cwd):
     return cwd.replace("/", "-")
 
 
+def _read_entry(path):
+    """One registry entry, or None. Regular, small files only — a
+    FIFO/symlink-to-something-huge must not stall the 5s hook budget."""
+    try:
+        st = os.stat(path)
+        if not os.path.isfile(path) or st.st_size > _REGISTRY_MAX_BYTES:
+            return None
+        with open(path) as fh:
+            entry = json.load(fh)
+        return entry if isinstance(entry, dict) else None
+    except Exception:
+        return None
+
+
 def resolve_peer(to, payload, cfg, proc_root="/proc"):
     """-> {"session_id", "transcript", "name", "status"} or None.
 
-    None when: empty/"main" target, no live registry match, resolved
-    session is the sender's own, or the transcript file is absent.
-    Multiple live matches resolve to the newest updatedAt (the
-    harness's own latest-wins naming rule); the [ref] hex is not
-    derivable from on-disk state, so it only strips.
+    None when: empty/"main" target; no live registry match; the live
+    matches span MORE THAN ONE distinct sessionId (bare or ref-bearing
+    — the ref can't be mapped from disk, and the harness rejects
+    ambiguous bare names itself, so guessing could measure or GATE the
+    wrong session); a uds: address that isn't the matched entry's own
+    declared socket; the resolved session is the sender's own; a
+    malformed sessionId; or a missing transcript. Multiple pids for
+    ONE session (a --resume pair) resolve to that session's newest
+    entry.
     """
     try:
         if not to or to == "main":
@@ -90,43 +112,49 @@ def resolve_peer(to, payload, cfg, proc_root="/proc"):
         parsed = parse_address(to)
         if parsed is None:
             return None
-        kind, key, had_ref = parsed
-        candidates = []
+        kind, key, _had_ref = parsed
         sessions_dir = cfg["sessions_dir"]
-        for fn in os.listdir(sessions_dir):
-            if not fn.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(sessions_dir, fn)) as fh:
-                    entry = json.load(fh)
-            except Exception:
-                continue
-            if not isinstance(entry, dict):
-                continue
-            if kind == "pid" and entry.get("pid") != key:
-                continue
-            if kind == "name" and entry.get("name") != key:
-                continue
-            if not is_alive(entry, proc_root):
-                continue
-            candidates.append(entry)
+        candidates = []
+        if kind == "pid":
+            entry = _read_entry(os.path.join(sessions_dir, f"{key}.json"))
+            if entry is not None:
+                # The send goes to that literal socket: only trust the
+                # entry if it declares exactly this socket as its own.
+                declared = entry.get("messagingSocketPath")
+                if declared and os.path.normpath(declared) == \
+                        os.path.normpath(to[4:]) and \
+                        is_alive(entry, proc_root):
+                    candidates.append(entry)
+        else:
+            names = sorted(os.listdir(sessions_dir))[:_REGISTRY_MAX_FILES]
+            for fn in names:
+                if not fn.endswith(".json"):
+                    continue
+                entry = _read_entry(os.path.join(sessions_dir, fn))
+                if entry is None or entry.get("name") != key:
+                    continue
+                if not is_alive(entry, proc_root):
+                    continue
+                candidates.append(entry)
         if not candidates:
             return None
-        if had_ref and len(candidates) > 1:
-            # The sender named a SPECIFIC peer via "[ref]" but the ref
-            # can't be mapped to a registry entry from disk. Guessing
-            # newest could measure — and worse, GATE — the wrong peer.
-            # A wrong-session measurement is worse than no warning.
-            return None
+        session_ids = {e.get("sessionId") for e in candidates}
+        if len(session_ids) > 1:
+            return None  # distinct sessions share the name: never guess
         best = max(candidates, key=lambda e: e.get("updatedAt") or 0)
         session_id = best.get("sessionId")
         cwd = best.get("cwd")
         if not session_id or not cwd:
             return None
+        if not _SESSION_ID_OK.match(str(session_id)):
+            return None  # path-escape / malformed id: never build a path
         if session_id == payload.get("session_id"):
             return None  # never measure the sender's own session
-        transcript = os.path.join(cfg["projects_dir"], _slug(cwd),
-                                  f"{session_id}.jsonl")
+        projects = os.path.realpath(cfg["projects_dir"])
+        transcript = os.path.realpath(
+            os.path.join(projects, _slug(cwd), f"{session_id}.jsonl"))
+        if not transcript.startswith(projects + os.sep):
+            return None
         if not os.path.isfile(transcript):
             return None
         return {"session_id": session_id, "transcript": transcript,

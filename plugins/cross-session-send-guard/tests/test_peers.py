@@ -56,12 +56,15 @@ class ResolveTests(unittest.TestCase):
 
     def add_session(self, pid, name, session_id, cwd="/home/u/proj",
                     proc_start=777, updated=1000, registry_start=None,
-                    transcript=True):
+                    transcript=True, socket=True, omit_proc_start=False):
         # The real registry stores procStart as a string; mirror that.
         start = proc_start if registry_start is None else registry_start
         entry = {"pid": pid, "name": name, "sessionId": session_id,
-                 "cwd": cwd, "updatedAt": updated,
-                 "procStart": str(start) if start is not None else None}
+                 "cwd": cwd, "updatedAt": updated}
+        if not omit_proc_start:
+            entry["procStart"] = str(start) if start is not None else None
+        if socket:
+            entry["messagingSocketPath"] =                 f"/run/user/1000/cc-socks/{pid}.sock"
         with open(os.path.join(self.sessions, f"{pid}.json"), "w") as fh:
             json.dump(entry, fh)
         if proc_start is not None:
@@ -77,41 +80,64 @@ class ResolveTests(unittest.TestCase):
                                   proc_root=self.proc)
 
     def test_resolves_live_name(self):
-        self.add_session(101, "peer-a", "sess-a")
+        self.add_session(101, "peer-a", "sess-aaaa-1111")
         got = self.resolve("peer-a")
-        self.assertEqual(got["session_id"], "sess-a")
-        self.assertTrue(got["transcript"].endswith("sess-a.jsonl"))
+        self.assertEqual(got["session_id"], "sess-aaaa-1111")
+        self.assertTrue(got["transcript"].endswith("sess-aaaa-1111.jsonl"))
 
     def test_main_and_empty_are_none(self):
         self.assertIsNone(self.resolve("main"))
         self.assertIsNone(self.resolve(""))
 
     def test_unknown_name_is_none(self):
-        self.add_session(101, "peer-a", "sess-a")
+        self.add_session(101, "peer-a", "sess-aaaa-1111")
         self.assertIsNone(self.resolve("stranger"))
 
     def test_dead_pid_is_none(self):
-        self.add_session(101, "peer-a", "sess-a", proc_start=None)
+        self.add_session(101, "peer-a", "sess-aaaa-1111", proc_start=None)
         self.assertIsNone(self.resolve("peer-a"))
 
     def test_recycled_pid_is_none(self):
         # /proc pid exists but with a different kernel starttime than
         # the registry recorded: a recycled pid, not our session.
-        self.add_session(101, "peer-a", "sess-a", proc_start=777,
+        self.add_session(101, "peer-a", "sess-aaaa-1111", proc_start=777,
                          registry_start=555)
         self.assertIsNone(self.resolve("peer-a"))
 
-    def test_collision_resolves_to_newest(self):
-        self.add_session(101, "peer-a", "sess-old", updated=1000)
-        self.add_session(102, "peer-a", "sess-new", updated=2000)
-        self.assertEqual(self.resolve("peer-a")["session_id"], "sess-new")
+    def test_distinct_session_collision_is_none(self):
+        # Two DIFFERENT sessions sharing one name: the harness itself
+        # rejects an ambiguous bare send, and guessing newest could
+        # measure or gate the wrong one. Silence, with or without ref.
+        self.add_session(101, "peer-a", "sess-old-1111", updated=1000)
+        self.add_session(102, "peer-a", "sess-new-2222", updated=2000)
+        self.assertIsNone(self.resolve("peer-a"))
+
+    def test_resume_pair_same_session_resolves(self):
+        # Two live pids for ONE session (claude --resume beside the
+        # original) is not ambiguity: both name the same transcript.
+        self.add_session(101, "peer-a", "sess-aaaa-1111", updated=1000)
+        self.add_session(102, "peer-a", "sess-aaaa-1111", updated=2000)
+        self.assertEqual(self.resolve("peer-a")["session_id"], "sess-aaaa-1111")
+
+    def test_missing_proc_start_is_not_live(self):
+        # A registry entry without procStart cannot prove the pid
+        # wasn't recycled: not live.
+        self.add_session(101, "peer-a", "sess-aaaa-1111", omit_proc_start=True)
+        self.assertIsNone(self.resolve("peer-a"))
+
+    def test_path_escaping_session_id_is_none(self):
+        # The escape target EXISTS, so only the validation can save us.
+        self.add_session(101, "peer-a", "../escaped-file",
+                         transcript=False)
+        os.makedirs(self.projects, exist_ok=True)
+        with open(os.path.join(self.projects, "..",
+                               "escaped-file.jsonl"), "w") as fh:
+            fh.write("{}\n")
+        self.assertIsNone(self.resolve("peer-a"))
 
     def test_ref_with_ambiguous_name_is_none(self):
-        # The sender named a SPECIFIC peer via [ref]; the ref can't be
-        # mapped from disk, and guessing newest could gate the wrong
-        # session. Ambiguity + ref => silent.
-        self.add_session(101, "peer-a", "sess-old", updated=1000)
-        self.add_session(102, "peer-a", "sess-new", updated=2000)
+        self.add_session(101, "peer-a", "sess-old-1111", updated=1000)
+        self.add_session(102, "peer-a", "sess-new-2222", updated=2000)
         self.assertIsNone(self.resolve("peer-a [fc9877]"))
 
     def test_own_session_is_none(self):
@@ -119,18 +145,28 @@ class ResolveTests(unittest.TestCase):
         self.assertIsNone(self.resolve("peer-a"))
 
     def test_missing_transcript_is_none(self):
-        self.add_session(101, "peer-a", "sess-a", transcript=False)
+        self.add_session(101, "peer-a", "sess-aaaa-1111", transcript=False)
         self.assertIsNone(self.resolve("peer-a"))
 
-    def test_uds_form_resolves_by_pid(self):
-        self.add_session(101, "peer-a", "sess-a")
+    def test_uds_form_resolves_by_declared_socket(self):
+        self.add_session(101, "peer-a", "sess-aaaa-1111")
         got = self.resolve("uds:/run/user/1000/cc-socks/101.sock")
-        self.assertEqual(got["session_id"], "sess-a")
+        self.assertEqual(got["session_id"], "sess-aaaa-1111")
+
+    def test_uds_wrong_path_is_none(self):
+        # Same pid basename, different directory: the send goes to a
+        # socket the registry entry does not declare as its own.
+        self.add_session(101, "peer-a", "sess-aaaa-1111")
+        self.assertIsNone(self.resolve("uds:/tmp/cc-socks/101.sock"))
+
+    def test_uds_without_declared_socket_is_none(self):
+        self.add_session(101, "peer-a", "sess-aaaa-1111", socket=False)
+        self.assertIsNone(self.resolve("uds:/run/user/1000/cc-socks/101.sock"))
 
     def test_ref_suffix_stripped(self):
-        self.add_session(101, "peer-a", "sess-a")
+        self.add_session(101, "peer-a", "sess-aaaa-1111")
         self.assertEqual(self.resolve("peer-a [fc9877]")["session_id"],
-                         "sess-a")
+                         "sess-aaaa-1111")
 
     def test_missing_sessions_dir_is_none(self):
         cfg = {"sessions_dir": os.path.join(self.tmp.name, "nope"),

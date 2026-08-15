@@ -16,6 +16,7 @@ appear there. Unresolvable targets are silent. Every path fails open.
 """
 import json
 import os
+import re
 import sys
 
 try:
@@ -28,8 +29,18 @@ except Exception as e:
           file=sys.stderr)
     sys.exit(0)
 
+# Registry names are harness-derived slugs; anything outside this
+# charset in a display name is another session's doing — mask it
+# rather than inject free-form text into the sender's context.
+_NAME_OK = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def display_name(name):
+    return _NAME_OK.sub("?", str(name))[:60]
+
+
 def main():
-    payload = json.loads(sys.stdin.read())
+    payload = json.loads(sys.stdin.read(1_000_000))
     if payload.get("tool_name") != "SendMessage":
         return
     cfg = config.load_config()
@@ -55,15 +66,9 @@ def main():
             res = _core._scan(peer["transcript"])
         except Exception:
             res = None
-    if res and res["rows"]:
-        current = res["current"]
-        model = ""  # registry doesn't record the model; use globals
-    else:
-        current = None
-        model = ""
-    th = config.thresholds(cfg, model)
+    current = res["current"] if res and res["rows"] else None
 
-    if current is not None and current < th["warn_tokens"]:
+    if current is not None and current < cfg["warn_tokens"]:
         return
     if current is None and size <= cfg["measure_max_bytes"]:
         return  # resolvable but unmeasurable (no usage rows): stay silent
@@ -80,7 +85,7 @@ def main():
     state_txt = (f"cold (idle ~{age_s / 60:.0f}m, past the cache TTL)"
                  if cold else f"warm (active ~{age_s / 60:.0f}m ago)")
 
-    warn = (f"[cross-session-send-guard] '{_core.sanitize(peer['name'], 60)}'"
+    warn = (f"[cross-session-send-guard] '{display_name(peer['name'])}'"
             f" is a peer session with {size_txt}, currently {state_txt}"
             f"{cost_txt}. If you only need to hand off information, write "
             "it to a file or the handoff instead of waking the peer; wake "
@@ -97,9 +102,9 @@ def main():
     # Confirmation only from the root session (a subagent may have no
     # one to answer; an unanswerable ask is a hard block) and only for
     # a big COLD peer — warm peers are cheap to message.
-    big = (current is not None and th["block_tokens"]
-           and current >= th["block_tokens"]) or size > cfg["measure_max_bytes"]
-    if not payload.get("agent_id") and cold and big and th["block_tokens"]:
+    big = (current is not None and cfg["block_tokens"]
+           and current >= cfg["block_tokens"]) or size > cfg["measure_max_bytes"]
+    if not payload.get("agent_id") and cold and big and cfg["block_tokens"]:
         out["hookSpecificOutput"]["permissionDecision"] = "ask"
         out["hookSpecificOutput"]["permissionDecisionReason"] = warn
     print(json.dumps(out))

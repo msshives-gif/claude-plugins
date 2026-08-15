@@ -1,24 +1,42 @@
 #!/bin/bash
 # Remove the cross-session-send-guard hook entry from
-# ~/.claude/settings.json (or a settings file given as $1). Matches
-# only this plugin's own hook script path — never another plugin's.
+# ~/.claude/settings.json (or a settings file given as $1). Matching is
+# boundary-safe and narrow (same rule as the sibling plugin): THIS
+# clone's exact hook path, plus standard-directory installs
+# (…/cross-session-send-guard/hooks/peer_send_guard.py) — never a bare
+# basename, so an unrelated or sibling hook that reuses the filename,
+# or a ".backup" copy, is never touched.
 set -euo pipefail
 
+PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SETTINGS="${1:-$HOME/.claude/settings.json}"
 
-python3 - "$SETTINGS" <<'PY'
+python3 - "$SETTINGS" "$PLUGIN_DIR" <<'PY'
 import json, os, shutil, sys, time
 
-settings_path = sys.argv[1]
+settings_path, plugin = sys.argv[1], sys.argv[2]
 if not os.path.isfile(settings_path):
     print(f"{settings_path} does not exist; nothing to do")
     sys.exit(0)
 
-MARKER = "/hooks/peer_send_guard.py"
+EXACT = os.path.join(plugin, "hooks",
+                     "peer_send_guard.py").replace("\\", "/")
+STANDARD = "/cross-session-send-guard/hooks/peer_send_guard.py"
+
+
+def _matches(c, path):
+    i = c.find(path)
+    while i != -1:
+        j = i + len(path)
+        if j == len(c) or c[j] in " \t'\"":
+            return True
+        i = c.find(path, i + 1)
+    return False
 
 
 def is_ours(command):
-    return MARKER in command.replace("\\", "/")
+    c = command.replace("\\", "/")
+    return _matches(c, EXACT) or _matches(c, STANDARD)
 
 
 with open(settings_path) as fh:

@@ -8,6 +8,7 @@ smaller peer is already worth flagging (the motivating incident was
 ~100k tokens).
 """
 import json
+import math
 import os
 import sys
 
@@ -45,7 +46,9 @@ DEFAULTS = {
 }
 
 _ENV_PREFIX = "CROSS_SESSION_SEND_GUARD_"
-_PER_MODEL_KEYS = ("warn_tokens", "block_tokens")
+# Bigger config files than this are not ours (bounded reads: nothing
+# in this hook may stall the 5s budget).
+_CONFIG_MAX_BYTES = 1_000_000
 
 
 def _coerce(default, value):
@@ -53,14 +56,14 @@ def _coerce(default, value):
     if isinstance(default, float):
         if isinstance(value, bool):
             return None
-        if isinstance(value, (int, float)):
-            return float(value) if value >= 0 else None
         if isinstance(value, str):
             try:
-                v = float(value)
+                value = float(value)
             except ValueError:
                 return None
-            return v if v >= 0 else None
+        if isinstance(value, (int, float)):
+            v = float(value)
+            return v if v >= 0 and math.isfinite(v) else None
         return None
     return _core._coerce(default, value)
 
@@ -71,10 +74,11 @@ def load_config():
         os.path.expanduser("~/.claude/cross-session-send-guard.json"))
     file_cfg = {}
     try:
-        with open(path) as fh:
-            loaded = json.load(fh)
-        if isinstance(loaded, dict):
-            file_cfg = loaded
+        if os.path.isfile(path) and os.path.getsize(path) <= _CONFIG_MAX_BYTES:
+            with open(path) as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                file_cfg = loaded
     except FileNotFoundError:
         pass
     except Exception:
@@ -92,41 +96,12 @@ def load_config():
                       "unusable; ignoring it", file=sys.stderr)
             else:
                 cfg[k] = v
-    cfg["models"] = {}
-    raw_models = (os.environ.get(_ENV_PREFIX + "MODELS")
-                  or file_cfg.get("models"))
-    if raw_models is not None:
-        if isinstance(raw_models, str):
-            try:
-                raw_models = json.loads(raw_models)
-            except ValueError:
-                raw_models = None
-        if isinstance(raw_models, dict):
-            clean = {}
-            for pat, overrides in raw_models.items():
-                if not isinstance(overrides, dict) or not pat.strip():
-                    continue
-                kept = {k: _coerce(DEFAULTS[k], v)
-                        for k, v in overrides.items()
-                        if k in _PER_MODEL_KEYS}
-                kept = {k: v for k, v in kept.items() if v is not None}
-                if kept:
-                    clean[pat] = kept
-            cfg["models"] = clean
     cfg["cache_ttl_seconds"] = max(60, cfg["cache_ttl_seconds"])
+    # A nonzero gate below the warn threshold is unreachable (the hook
+    # returns early below warn_tokens): pull it up rather than let it
+    # silently never fire.
+    if cfg["block_tokens"] and cfg["block_tokens"] < cfg["warn_tokens"]:
+        cfg["block_tokens"] = cfg["warn_tokens"]
     cfg["sessions_dir"] = os.path.expanduser(cfg["sessions_dir"])
     cfg["projects_dir"] = os.path.expanduser(cfg["projects_dir"])
     return cfg
-
-
-def thresholds(cfg, model):
-    """Longest matching model-substring override, like the sibling."""
-    eff = {k: cfg[k] for k in _PER_MODEL_KEYS}
-    model = str(model or "").lower()
-    best = ""
-    for pat in cfg.get("models", {}):
-        if len(pat) > len(best) and pat.lower() in model:
-            best = pat
-    if best:
-        eff.update(cfg["models"][best])
-    return eff

@@ -8,8 +8,9 @@ Claude Code session.
 Sessions on one machine can message each other. Waking a peer replays
 its whole transcript; once its prompt cache has expired, that's a
 full-price cold read of everything the peer ever did. Session age tells
-you nothing about size — a session forked from a half-full parent
-carries the parent's context from minute one. The motivating incident:
+you nothing about size — and a freshly forked session even
+under-reports briefly (its transcript starts modest and catches up as
+it runs), so "started 1m ago" proves nothing. The motivating incident:
 a quick deconfliction ping to a "started 1m ago" peer that was actually
 a ~100k-token fork, billed as a cold read.
 
@@ -65,17 +66,18 @@ Env `CROSS_SESSION_SEND_GUARD_<NAME>` or a key in
 | `usd_per_mtok` | `3.00` | Price for the *estimated* cost line only. |
 | `system_message` | `true` | Also show warnings to you in the UI. |
 | `measure_max_bytes` | `50000000` | Transcripts bigger than this warn as size-unknown instead of being parsed (hook-budget cap). |
-| `models` | `{}` | Per-model overrides for `warn_tokens`/`block_tokens` (registry doesn't record models today, so globals normally apply). |
 
 Defaults are lower than subagent-context's on purpose: a cold wake
 pays full input price on the whole transcript.
 
 ## Interplay with subagent-context
 
-Both plugins hook `PreToolUse` on `SendMessage`; domains are disjoint
-by construction (subagent = recorded in-process spawn, peer = live
-registry entry with a real process). If both ever spoke, the outputs
-compose: warnings are additive and the harness takes the most
+Both plugins hook `PreToolUse` on `SendMessage` and consult different
+stores (subagent = recorded in-process spawn; peer = live registry
+entry with a real process). Normally exactly one speaks. The stores
+are not provably exclusive — a name could simultaneously be a spawned
+subagent and a live peer session — but in that overlap the outputs
+compose safely: warnings are additive and the harness takes the most
 restrictive permission decision.
 
 ## Limitations
