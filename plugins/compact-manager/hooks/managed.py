@@ -1908,6 +1908,11 @@ def cli_main(argv=None, run_tmux=default_run_tmux):
         binding, error = _cli_binding("", pane, False, run_tmux, wait_s=30)
         if error:
             print("compact-manager: %s" % error, file=sys.stderr)
+            print("compact-manager: the tmux session is left running "
+                  "(pane %s). A startup dialog (e.g. folder trust) blocks "
+                  "the session registry: attach, complete it, then use "
+                  "'adopt -t %s --attended'." % (pane, pane),
+                  file=sys.stderr)
             return 1
         result = spawn_watcher(binding)
     elif args.command == "adopt":

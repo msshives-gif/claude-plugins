@@ -316,7 +316,10 @@ MSG="$("$CMBIN" resolve "$SID" 2>&1)"; RC=$?
 [ $RC -eq 0 ] && row s10_resolve_dead pass "$MSG" || row s10_resolve_dead fail "rc=$RC $MSG"
 
 # --- s11: start mode — pane dies with claude, watcher retires
-MSG="$(env COMPACT_MANAGER_MANAGED_TRIGGER_PCT=0.99 "$CMBIN" start --session-name cml2start -- claude --model haiku --settings "$WORK/settings.json" --allowedTools Read 2>&1)"; RC=$?
+# start from the trusted workspace: an untrusted cwd leaves claude at
+# the trust dialog, no registry entry is written, and binding times out
+# (run-11 lesson; the CLI's failure hint covers real users).
+MSG="$(cd "$WORK" && env COMPACT_MANAGER_MANAGED_TRIGGER_PCT=0.99 "$CMBIN" start --session-name cml2start -- claude --model haiku --settings "$WORK/settings.json" --allowedTools Read 2>&1)"; RC=$?
 if [ $RC -eq 0 ]; then
   SPANE="$(pane_of cml2start)"
   SPID="$(echo "$MSG" | grep -o 'pid=[0-9]*' | cut -d= -f2)"
