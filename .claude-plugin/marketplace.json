@@ -9,6 +9,11 @@
       "name": "subagent-context",
       "source": "./",
       "description": "Reports each subagent's context size to the orchestrating agent and warns before an overloaded subagent gets re-tasked."
+    },
+    {
+      "name": "cross-session-send-guard",
+      "source": "./plugins/cross-session-send-guard",
+      "description": "Warns before, and can gate, a SendMessage to a large idle peer session — a cold wake replays the peer's whole transcript at full price."
     }
   ]
 }

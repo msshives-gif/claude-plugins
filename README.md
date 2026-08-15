@@ -5,7 +5,7 @@ Claude Code plugins for context-size awareness, in one marketplace:
 | Plugin | What it does | Install id |
 |---|---|---|
 | subagent-context (this page, below) | Reports each subagent's context size to the orchestrating agent; warns before an overloaded agent gets re-tasked | `subagent-context@subagent-context` |
-| cross-session-send-guard (planned) | Warns before, and can gate, messaging a large idle peer session — a cold wake replays its whole transcript at full price | — |
+| [cross-session-send-guard](plugins/cross-session-send-guard/README.md) | Warns before, and can gate, messaging a large idle peer session — a cold wake replays its whole transcript at full price | `cross-session-send-guard@subagent-context` |
 | compact-manager (planned) | Warns the main session as its own context fills; reorients it after compaction | — |
 
 One `/plugin marketplace add msshives-gif/subagent-context` serves all of

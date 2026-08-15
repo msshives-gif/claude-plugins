@@ -1,0 +1,11 @@
+{
+  "name": "cross-session-send-guard",
+  "version": "0.1.0",
+  "description": "Warns before, and can gate, a SendMessage to a large idle peer Claude Code session — a cold wake replays the peer's whole transcript at full price.",
+  "author": {
+    "name": "msshives-gif"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/msshives-gif/subagent-context/tree/main/plugins/cross-session-send-guard",
+  "repository": "https://github.com/msshives-gif/subagent-context"
+}
