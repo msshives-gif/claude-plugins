@@ -727,6 +727,20 @@ class GuardFreshReadTests(unittest.TestCase):
         _, compactions, _ = self.guard.live_reading(rec)
         self.assertEqual(compactions, 1)
 
+    def test_preliminary_only_never_claims_live(self):
+        # A transcript with only streaming (stop_reason null) rows is
+        # not a completed measurement: merge the max but live=False.
+        write_jsonl(self.path, [usage_row(10, 370_000, 9_000, 990, None)])
+        rec = {"current": 10_000, "compactions": 0, "transcript": self.path}
+        current, compactions, live = self.guard.live_reading(rec)
+        self.assertEqual(current, 380_000)
+        self.assertFalse(live)
+
+    def test_preliminary_only_never_weakens(self):
+        write_jsonl(self.path, [usage_row(10, 50_000, 9_000, 990, None)])
+        rec = {"current": 380_000, "compactions": 1, "transcript": self.path}
+        self.assertEqual(self.guard.live_reading(rec), (380_000, 1, False))
+
     def test_missing_transcript_file_falls_back(self):
         rec = {"current": 123_000, "compactions": 2,
                "transcript": os.path.join(self.dir.name, "gone.jsonl")}

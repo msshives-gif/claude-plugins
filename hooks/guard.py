@@ -83,10 +83,16 @@ def live_reading(rec):
     if not fresh:
         return current, compactions, False
     compactions = max(compactions, fresh["compactions"])
+    if not fresh.get("terminal"):
+        # Preliminary rows only: not a completed measurement. Merge the
+        # facts (never weaken) but never claim liveness from it.
+        return max(current, fresh["current"]), compactions, False
     if fresh["peak"] >= current:
         return fresh["current"], compactions, True
-    return (max(current, fresh["current"]), compactions,
-            fresh["current"] >= current)
+    # Containment failed: the file was truncated/replaced. peak >=
+    # fresh current always, so the stored number wins here — present it
+    # without a liveness claim.
+    return max(current, fresh["current"]), compactions, False
 
 
 def main():

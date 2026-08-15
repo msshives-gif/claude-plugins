@@ -124,8 +124,13 @@ row flushed before the post-compaction terminal row): equal counts,
 but the fresh scan still wins on containment. If containment fails the
 file was truncated or replaced — fall back to the max, never weakening
 on partial data. The compaction count is a monotonic max either way.
-Any failure falls back to the stored numbers; the warn text says which
-reading it presents ("is ~Nk" live vs "was ~Nk at its last stop").
+A fresh scan with no terminal row (streaming rows only) merges the max
+but never claims liveness. Any failure falls back to the stored
+numbers; the warn text says which reading it presents ("is ~Nk" live
+vs "was ~Nk at its last stop"). Known transient: in the window between
+a compaction summary flushing and the first post-compaction terminal
+row landing, the guard can present the pre-compaction size briefly —
+over-warning in the cautious direction until the next completed call.
 
 Two sub-choices deliberately not built: **no write-back** of the fresh
 reading to the state record (it would race the observer's lockless

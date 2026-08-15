@@ -34,13 +34,31 @@ HISTORICAL = tuple(f"/{name}/hooks/{s}"
                    for s in SCRIPTS)
 
 
+def _matches(c, path):
+    # Path-boundary containment: the path must be followed by
+    # end-of-string, whitespace, or a closing quote, so
+    # ".../hooks/guard.py.backup" never matches ".../hooks/guard.py".
+    i = c.find(path)
+    while i != -1:
+        j = i + len(path)
+        if j == len(c) or c[j] in " \t'\"":
+            return True
+        i = c.find(path, i + 1)
+    return False
+
+
 def is_ours(command):
     # Normalize Windows separators so manual installs with backslash
-    # paths still match.
+    # paths still match. THIS clone's exact paths win first — even if
+    # the clone itself sits under some plugins/ directory, its own
+    # uninstall must work. Only then does the plugins/ exemption keep
+    # us away from sibling plugins that share standard-looking paths.
     c = command.replace("\\", "/")
+    if any(_matches(c, p) for p in EXACT):
+        return True
     if "/plugins/" in c:
         return False  # sibling plugins live under plugins/, never ours
-    return any(p in c for p in EXACT) or any(h in c for h in HISTORICAL)
+    return any(_matches(c, h) for h in HISTORICAL)
 
 
 with open(settings_path) as fh:

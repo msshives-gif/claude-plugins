@@ -156,6 +156,48 @@ class InstallScriptTests(unittest.TestCase):
         _run(UNINSTALL, self.settings)
         self.assertEqual(_hook_commands(self.read()), [])
 
+    def test_uninstall_ignores_backup_suffixed_paths(self):
+        cmd = "python3 /opt/subagent-context/hooks/guard.py.backup"
+        with open(self.settings, "w") as fh:
+            json.dump({"hooks": {"PreToolUse": [
+                {"hooks": [{"type": "command", "command": cmd,
+                            "timeout": 5}]}]}}, fh)
+        _run(UNINSTALL, self.settings)
+        self.assertEqual(_hook_commands(self.read()), [cmd])
+
+    def test_uninstall_removes_own_clone_even_under_plugins_dir(self):
+        # If THIS clone happens to live under some plugins/ directory,
+        # its exact paths must still uninstall (exact match runs before
+        # the plugins/ exemption). Simulate by symlinking the clone
+        # under a plugins/ path and uninstalling from the symlink.
+        link_root = os.path.join(self.tmp.name, "plugins")
+        os.makedirs(link_root)
+        link = os.path.join(link_root, "subagent-context-clone")
+        os.symlink(REPO, link)
+        own = os.path.join(link, "hooks", "guard.py")
+        with open(self.settings, "w") as fh:
+            json.dump({"hooks": {"PreToolUse": [
+                {"hooks": [{"type": "command",
+                            "command": f"python3 {own}",
+                            "timeout": 5}]}]}}, fh)
+        r = subprocess.run(
+            ["bash", os.path.join(link, "scripts", "uninstall.sh"),
+             self.settings], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(_hook_commands(self.read()), [])
+
+    def test_uninstall_exempts_standard_paths_under_foreign_plugins_dir(self):
+        # A standard-named clone under someone ELSE's plugins/ dir is
+        # not ours (exact match fails): the plugins/ exemption must
+        # keep it alive even though the historical marker matches.
+        cmd = "python3 /opt/plugins/subagent-context/hooks/guard.py"
+        with open(self.settings, "w") as fh:
+            json.dump({"hooks": {"PreToolUse": [
+                {"hooks": [{"type": "command", "command": cmd,
+                            "timeout": 5}]}]}}, fh)
+        _run(UNINSTALL, self.settings)
+        self.assertEqual(_hook_commands(self.read()), [cmd])
+
     def test_uninstall_removes_legacy_gauge_paths(self):
         legacy = "/home/user/subagent-gauge/hooks/observer.py"
         with open(self.settings, "w") as fh:
