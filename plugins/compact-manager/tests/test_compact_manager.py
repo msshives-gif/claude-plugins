@@ -102,6 +102,26 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(st["current"], 5_010)
         self.assertEqual(st["peak"], 150_510)
 
+    def test_boundary_resets_current_to_post_tokens(self):
+        # Observed live (M2): with no usage row yet after the boundary,
+        # a stale pre-compact `current` made the advisor tell a
+        # freshly-compacted session it was still ~116% full.
+        append_jsonl(self.path, [
+            usage_row(10, 150_000, 0, 500),
+            boundary_row("manual", 150_510, 28_552),
+        ])
+        st = self.scan()
+        self.assertEqual(st["current"], 28_552)
+        self.assertEqual(st["peak"], 150_510)
+
+    def test_boundary_without_post_tokens_resets_to_zero(self):
+        append_jsonl(self.path, [
+            usage_row(10, 150_000, 0, 500),
+            {"type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "manual"}},
+        ])
+        self.assertEqual(self.scan()["current"], 0)
+
     def test_model_captured(self):
         append_jsonl(self.path, [usage_row(1, 1, 1, 1,
                                            model="claude-opus-9[1m]")])

@@ -69,3 +69,29 @@ the plan audit is closed by design, pending the L2 spikes (S6).
 
 SessionStart fires with `source` ∈ startup | resume | compact (and
 docs list clear/fork); `-p --continue` fires `resume` every call.
+
+## M2 — live verification of Layer 1 (2026-08-15)
+
+Scripted haiku session (tmux) with the five real hooks via
+`--settings`, `COMPACT_MANAGER_MODE=advisory`, claimed 100k window.
+Observed:
+
+- Advisory injected once at the hard crossing; NO repeat on the
+  following no-op turn (hysteresis held across advisor + reorient).
+- `/compact focus on …` → packet seq 1 persisted with the
+  custom_instructions verbatim, pre_current/pre_peak, and a FRESH
+  handoff excerpt (model had written the file the advisory named).
+- Post-compaction: reorientation delivered exactly twice as designed —
+  SessionStart(compact) copy + the durable drain — and the CAS
+  advanced (`last_drained_packet_seq` 1, boundaries 1); the later
+  reorient hook found it drained and stayed silent.
+- Measurement lag is one full model call: at PostToolUse time the
+  current turn's terminal usage row is not yet flushed, so with
+  ~30k-token jumps the soft level was stepped over entirely. Fine at
+  realistic tool-call granularity; documented limitation.
+- DEFECT FOUND AND FIXED: after the boundary row, `current` still held
+  the stale pre-compact reading, so the advisor re-fired "~116% full —
+  compaction imminent" at the freshly-compacted session (ledger inject
+  n=2). Fix: a boundary row resets `current` to
+  `compactMetadata.postTokens` (0 if absent); any later usage row
+  overrides. Regression-pinned in ScanTests.

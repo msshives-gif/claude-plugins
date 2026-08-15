@@ -315,6 +315,13 @@ def incremental_scan(st, transcript):
             st["boundaries"] = st.get("boundaries", 0) + 1
             if md.get("trigger") == "auto":
                 st["auto_boundaries"] = st.get("auto_boundaries", 0) + 1
+            # The pre-compact reading is stale the moment the boundary
+            # lands; without this reset the next advisory tells a
+            # freshly-compacted session its context is still full
+            # (observed live, M2 verification). postTokens is the
+            # compaction's own post-size; a later usage row overrides.
+            post = md.get("postTokens")
+            st["current"] = post if isinstance(post, int) and post >= 0 else 0
         m = row.get("message")
         if not isinstance(m, dict):
             continue
