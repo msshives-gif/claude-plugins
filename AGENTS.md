@@ -20,5 +20,7 @@ when real use forces it (see DESIGN.md "Deliberately not built").
 - Test discipline: measurement core and state IO are unit-tested
   (`python3 -m unittest discover tests`) — keep new parsing logic
   covered there. Hook wiring is verified by live headless-session tests
-  (see DESIGN); install scripts are covered by running them against a
-  temp settings file, not unit tests.
+  (see DESIGN); install scripts are covered by
+  `tests/test_install_scripts.py`, which runs them against a temp
+  settings file — uninstall markers must match only this plugin's own
+  hook paths (never the repo name; siblings in plugins/ share it).

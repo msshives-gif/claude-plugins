@@ -1,6 +1,6 @@
 {
   "name": "subagent-context",
-  "description": "Marketplace for the subagent-context plugin: context-size reporting for Claude Code subagents.",
+  "description": "claude context tools — Claude Code plugins for context-size awareness: subagent context reporting today; cross-session send-guarding and main-session compaction management to come.",
   "owner": {
     "name": "msshives-gif"
   },

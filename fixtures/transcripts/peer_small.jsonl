@@ -1,0 +1,3 @@
+{"type": "user", "message": {"role": "user"}}
+{"timestamp": "2026-08-15T05:01:00.000Z", "message": {"role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 1200, "cache_read_input_tokens": 30000, "cache_creation_input_tokens": 8000, "output_tokens": 900}}}
+{"timestamp": "2026-08-15T05:02:00.000Z", "message": {"role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 5, "cache_read_input_tokens": 39000, "cache_creation_input_tokens": 2500, "output_tokens": 700}}}

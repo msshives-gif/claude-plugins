@@ -16,10 +16,13 @@ if not os.path.isfile(settings_path):
     print(f"{settings_path} does not exist; nothing to do")
     sys.exit(0)
 
-# "subagent-gauge" stays in the marker list so this also cleans up
-# installs made before the rename to subagent-context.
+# Match ONLY this plugin's hook scripts by path suffix. A bare
+# "subagent-context" marker would also match sibling plugins installed
+# from plugins/<name>/ in this repo (their absolute paths contain the
+# repo directory name) and rip their hooks out. "subagent-gauge" stays
+# for pre-rename installs; no sibling can live under that path.
 MARKERS = ("/hooks/observer.py", "/hooks/drain.py", "/hooks/guard.py",
-           "subagent-context", "subagent-gauge")
+           "subagent-gauge")
 
 with open(settings_path) as fh:
     settings = json.load(fh)

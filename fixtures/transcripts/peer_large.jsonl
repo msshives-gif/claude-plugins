@@ -1,0 +1,13 @@
+{"type": "user", "message": {"role": "user"}}
+{"timestamp": "2026-08-15T05:01:00.000Z", "message": {"role": "assistant", "stop_reason": null, "usage": {"input_tokens": 10, "cache_read_input_tokens": 62000, "cache_creation_input_tokens": 1500, "output_tokens": 400}}}
+{"timestamp": "2026-08-15T05:01:30.000Z", "message": {"role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 10, "cache_read_input_tokens": 62000, "cache_creation_input_tokens": 1500, "output_tokens": 800}}}
+{"timestamp": "2026-08-15T05:02:00.000Z", "message": {"role": "assistant", "stop_reason": null, "usage": {"input_tokens": 10, "cache_read_input_tokens": 84000, "cache_creation_input_tokens": 1500, "output_tokens": 400}}}
+{"timestamp": "2026-08-15T05:02:30.000Z", "message": {"role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 10, "cache_read_input_tokens": 84000, "cache_creation_input_tokens": 1500, "output_tokens": 800}}}
+{"timestamp": "2026-08-15T05:03:00.000Z", "message": {"role": "assistant", "stop_reason": null, "usage": {"input_tokens": 10, "cache_read_input_tokens": 106000, "cache_creation_input_tokens": 1500, "output_tokens": 400}}}
+{"timestamp": "2026-08-15T05:03:30.000Z", "message": {"role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 10, "cache_read_input_tokens": 106000, "cache_creation_input_tokens": 1500, "output_tokens": 800}}}
+{"timestamp": "2026-08-15T05:04:00.000Z", "message": {"role": "assistant", "stop_reason": null, "usage": {"input_tokens": 10, "cache_read_input_tokens": 128000, "cache_creation_input_tokens": 1500, "output_tokens": 400}}}
+{"timestamp": "2026-08-15T05:04:30.000Z", "message": {"role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 10, "cache_read_input_tokens": 128000, "cache_creation_input_tokens": 1500, "output_tokens": 800}}}
+{"timestamp": "2026-08-15T05:05:00.000Z", "message": {"role": "assistant", "stop_reason": null, "usage": {"input_tokens": 10, "cache_read_input_tokens": 150000, "cache_creation_input_tokens": 1500, "output_tokens": 400}}}
+{"timestamp": "2026-08-15T05:05:30.000Z", "message": {"role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 10, "cache_read_input_tokens": 150000, "cache_creation_input_tokens": 1500, "output_tokens": 800}}}
+{"timestamp": "2026-08-15T05:06:00.000Z", "message": {"role": "assistant", "stop_reason": null, "usage": {"input_tokens": 10, "cache_read_input_tokens": 172000, "cache_creation_input_tokens": 1500, "output_tokens": 400}}}
+{"timestamp": "2026-08-15T05:06:30.000Z", "message": {"role": "assistant", "stop_reason": "end_turn", "usage": {"input_tokens": 10, "cache_read_input_tokens": 172000, "cache_creation_input_tokens": 1500, "output_tokens": 800}}}

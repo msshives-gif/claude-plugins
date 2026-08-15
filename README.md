@@ -1,3 +1,20 @@
+# claude context tools
+
+Claude Code plugins for context-size awareness, in one marketplace:
+
+| Plugin | What it does | Install id |
+|---|---|---|
+| subagent-context (this page, below) | Reports each subagent's context size to the orchestrating agent; warns before an overloaded agent gets re-tasked | `subagent-context@subagent-context` |
+| cross-session-send-guard (planned) | Warns before, and can gate, messaging a large idle peer session — a cold wake replays its whole transcript at full price | — |
+| compact-manager (planned) | Warns the main session as its own context fills; reorients it after compaction | — |
+
+One `/plugin marketplace add msshives-gif/subagent-context` serves all of
+them; each installs independently. Repository layout: subagent-context
+lives at the repo root; siblings under [`plugins/`](plugins/README.md);
+rationale in [docs/SUITE.md](docs/SUITE.md).
+
+---
+
 # subagent-context
 
 Your main Claude Code session can't see how full each subagent's

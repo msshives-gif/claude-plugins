@@ -1,0 +1,13 @@
+{
+  "pid": 123456,
+  "sessionId": "aaaabbbb-cccc-dddd-eeee-ffff00001111",
+  "cwd": "/home/user/projects/example",
+  "version": "2.1.231",
+  "peerProtocol": 1,
+  "kind": "interactive",
+  "messagingSocketPath": "/run/user/1000/cc-socks/123456.sock",
+  "name": "example-a1",
+  "nameSource": "derived",
+  "status": "idle",
+  "updatedAt": 1786770210909
+}
