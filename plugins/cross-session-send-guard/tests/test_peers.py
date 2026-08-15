@@ -27,16 +27,16 @@ def make_proc(root, pid, starttime):
 class ParseAddressTests(unittest.TestCase):
     def test_plain_name(self):
         self.assertEqual(peers.parse_address("projects-f7"),
-                         ("name", "projects-f7"))
+                         ("name", "projects-f7", False))
 
     def test_name_with_ref_suffix(self):
         self.assertEqual(peers.parse_address("worker-a [fc9877]"),
-                         ("name", "worker-a"))
+                         ("name", "worker-a", True))
 
     def test_uds_socket(self):
         self.assertEqual(
             peers.parse_address("uds:/run/user/1000/cc-socks/2144162.sock"),
-            ("pid", 2144162))
+            ("pid", 2144162, False))
 
     def test_uds_garbage(self):
         self.assertIsNone(peers.parse_address("uds:/tmp/not-a-sock"))
@@ -105,6 +105,14 @@ class ResolveTests(unittest.TestCase):
         self.add_session(101, "peer-a", "sess-old", updated=1000)
         self.add_session(102, "peer-a", "sess-new", updated=2000)
         self.assertEqual(self.resolve("peer-a")["session_id"], "sess-new")
+
+    def test_ref_with_ambiguous_name_is_none(self):
+        # The sender named a SPECIFIC peer via [ref]; the ref can't be
+        # mapped from disk, and guessing newest could gate the wrong
+        # session. Ambiguity + ref => silent.
+        self.add_session(101, "peer-a", "sess-old", updated=1000)
+        self.add_session(102, "peer-a", "sess-new", updated=2000)
+        self.assertIsNone(self.resolve("peer-a [fc9877]"))
 
     def test_own_session_is_none(self):
         self.add_session(101, "peer-a", "my-own-session")

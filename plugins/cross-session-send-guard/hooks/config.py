@@ -32,6 +32,10 @@ DEFAULTS = {
     "usd_per_mtok": 3.0,
     # Also surface warnings to the human as a hook systemMessage.
     "system_message": True,
+    # Transcripts bigger than this aren't parsed (the scanner has no
+    # internal deadline; stay inside the 5s hook budget). Oversized
+    # peers still warn as size-unknown and still gate when cold.
+    "measure_max_bytes": 50_000_000,
     # Where the harness's per-session registry and transcripts live,
     # and the proc filesystem for liveness checks. Overridable for
     # tests only.

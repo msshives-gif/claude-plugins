@@ -20,16 +20,20 @@ _REF_SUFFIX = re.compile(r"\s+\[[0-9a-f]{4,12}\]$")
 
 
 def parse_address(to):
-    """-> ("pid", <int>) for uds: form, ("name", <base>) otherwise."""
+    """-> ("pid", <int>, False) for uds: form,
+    ("name", <base>, <had_ref>) otherwise. had_ref records that the
+    sender disambiguated with a "[ref]" suffix — the ref itself is not
+    mappable to a registry entry from on-disk state."""
     if to.startswith("uds:"):
         base = os.path.basename(to[4:])
         if base.endswith(".sock"):
             try:
-                return ("pid", int(base[:-5]))
+                return ("pid", int(base[:-5]), False)
             except ValueError:
                 return None
         return None
-    return ("name", _REF_SUFFIX.sub("", to))
+    stripped = _REF_SUFFIX.sub("", to)
+    return ("name", stripped, stripped != to)
 
 
 def _proc_start(pid, proc_root):
@@ -86,7 +90,7 @@ def resolve_peer(to, payload, cfg, proc_root="/proc"):
         parsed = parse_address(to)
         if parsed is None:
             return None
-        kind, key = parsed
+        kind, key, had_ref = parsed
         candidates = []
         sessions_dir = cfg["sessions_dir"]
         for fn in os.listdir(sessions_dir):
@@ -107,6 +111,12 @@ def resolve_peer(to, payload, cfg, proc_root="/proc"):
                 continue
             candidates.append(entry)
         if not candidates:
+            return None
+        if had_ref and len(candidates) > 1:
+            # The sender named a SPECIFIC peer via "[ref]" but the ref
+            # can't be mapped to a registry entry from disk. Guessing
+            # newest could measure — and worse, GATE — the wrong peer.
+            # A wrong-session measurement is worse than no warning.
             return None
         best = max(candidates, key=lambda e: e.get("updatedAt") or 0)
         session_id = best.get("sessionId")

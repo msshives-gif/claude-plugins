@@ -34,7 +34,10 @@ Unresolvable targets are silent; every path fails open. Address forms
 understood: the peer's registry name, `name [ref]`, and
 `uds:/…/cc-socks/<pid>.sock`. Liveness requires the registry's recorded
 process start time to match the live process (a recycled pid never
-counts); name collisions resolve to the newest entry.
+counts); name collisions resolve to the newest entry — unless the send
+carried a `[ref]` disambiguator, in which case ambiguity means silence
+(the ref isn't derivable from disk, and gating a guessed session would
+be worse than no warning).
 
 ## Install
 
@@ -61,6 +64,7 @@ Env `CROSS_SESSION_SEND_GUARD_<NAME>` or a key in
 | `cache_ttl_seconds` | `3600` | Transcript idle longer than this = cold. |
 | `usd_per_mtok` | `3.00` | Price for the *estimated* cost line only. |
 | `system_message` | `true` | Also show warnings to you in the UI. |
+| `measure_max_bytes` | `50000000` | Transcripts bigger than this warn as size-unknown instead of being parsed (hook-budget cap). |
 | `models` | `{}` | Per-model overrides for `warn_tokens`/`block_tokens` (registry doesn't record models today, so globals normally apply). |
 
 Defaults are lower than subagent-context's on purpose: a cold wake

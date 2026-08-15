@@ -118,6 +118,29 @@ class PolicyTests(unittest.TestCase):
         os.utime(tp, (old, old))
         self.assertEqual(self.run_hook("peer-a"), {})
 
+    def test_oversized_cold_peer_warns_size_unknown_and_asks(self):
+        self.add_peer("peer-a", 200_000, cold=True)
+        out = self.run_hook("peer-a", extra_env={
+            "CROSS_SESSION_SEND_GUARD_MEASURE_MAX_BYTES": "10"})
+        hso = out["hookSpecificOutput"]
+        self.assertIn("too large to measure", hso["additionalContext"])
+        self.assertEqual(hso["permissionDecision"], "ask")
+
+    def test_oversized_warm_peer_warns_without_ask(self):
+        self.add_peer("peer-a", 200_000, cold=False)
+        out = self.run_hook("peer-a", extra_env={
+            "CROSS_SESSION_SEND_GUARD_MEASURE_MAX_BYTES": "10"})
+        hso = out["hookSpecificOutput"]
+        self.assertIn("too large to measure", hso["additionalContext"])
+        self.assertNotIn("permissionDecision", hso)
+
+    def test_malformed_registry_entry_beside_good_one(self):
+        with open(os.path.join(self.sessions, "999.json"), "w") as fh:
+            fh.write("{broken json")
+        self.add_peer("peer-a", 200_000, cold=False)
+        out = self.run_hook("peer-a")
+        self.assertIn("~200k", out["hookSpecificOutput"]["additionalContext"])
+
     def test_garbage_stdin_fails_open(self):
         p = subprocess.run([sys.executable, HOOK], input="{not json",
                            capture_output=True, text=True, timeout=30)

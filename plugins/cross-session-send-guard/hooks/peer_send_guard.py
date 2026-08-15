@@ -28,13 +28,6 @@ except Exception as e:
           file=sys.stderr)
     sys.exit(0)
 
-# Skip measuring transcripts bigger than this (same rationale as the
-# sibling guard: _scan has no internal deadline; stay inside the 5s
-# hook budget). Oversized peers are exactly the ones worth warning
-# about, so emit a size-unknown warning rather than staying silent.
-MEASURE_MAX_BYTES = 50_000_000
-
-
 def main():
     payload = json.loads(sys.stdin.read())
     if payload.get("tool_name") != "SendMessage":
@@ -57,7 +50,7 @@ def main():
     cold = age_s > cfg["cache_ttl_seconds"]
 
     res = None
-    if size <= MEASURE_MAX_BYTES:
+    if size <= cfg["measure_max_bytes"]:
         try:
             res = _core._scan(peer["transcript"])
         except Exception:
@@ -72,7 +65,7 @@ def main():
 
     if current is not None and current < th["warn_tokens"]:
         return
-    if current is None and size <= MEASURE_MAX_BYTES:
+    if current is None and size <= cfg["measure_max_bytes"]:
         return  # resolvable but unmeasurable (no usage rows): stay silent
 
     if current is not None:
@@ -105,7 +98,7 @@ def main():
     # one to answer; an unanswerable ask is a hard block) and only for
     # a big COLD peer — warm peers are cheap to message.
     big = (current is not None and th["block_tokens"]
-           and current >= th["block_tokens"]) or size > MEASURE_MAX_BYTES
+           and current >= th["block_tokens"]) or size > cfg["measure_max_bytes"]
     if not payload.get("agent_id") and cold and big and th["block_tokens"]:
         out["hookSpecificOutput"]["permissionDecision"] = "ask"
         out["hookSpecificOutput"]["permissionDecisionReason"] = warn
