@@ -264,7 +264,7 @@ json.dump({"seq": 9999, "trigger": "manual", "base_compaction_count": 9999,
            "custom_instructions": "foreign harness packet"}, open(path, "w"))
 EOF
 kill -CONT "$WPID"
-latched() { jstates "$SID" | grep -q LATCHED; }
+latched() { grep -q foreign_uncertain "$STATE/managed/watchers/$SID.journal.jsonl" 2>/dev/null; }
 if wait_for 240 latched; then
   J="$(jstates "$SID")"
   echo "$J" | grep -q ALERT_DELIVERY && row s09_foreign pass "$J" \

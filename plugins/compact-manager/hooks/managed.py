@@ -765,6 +765,7 @@ def journal_record(path, state, attempt, now_wall=None, **extra):
         "attempt_packet_seq_floor": attempt.get("attempt_packet_seq_floor", 0),
         "nonces": list(attempt.get("nonces", [])),
         "latch_kind": attempt.get("latch_kind"),
+        "latch_tokens": attempt.get("latch_tokens"),
         "timers": dict(attempt.get("timers", {})),
     }
     record.update(extra)
@@ -1363,22 +1364,39 @@ class Watcher:
                            self.cfg["rearm_band_pct"]):
                     # The completed compaction left the session at/near the
                     # trigger; re-firing immediately would loop. THRESHOLD
-                    # latch until pct re-arms below the band (the LATCHED
-                    # branch above clears it).
+                    # latch until meaningful NEW content accumulates (the
+                    # LATCHED branch above clears it).
                     self.attempt = transition_attempt(
                         self.attempt, "threshold_latch", now, self.cfg)
                     self.attempt["generation"] = current_generation
+                    # The attempt's injection lifecycle is OVER: its own
+                    # already-consumed packet must not re-ACK the latch, so
+                    # drop the nonce identity and rebase the packet floor.
+                    self.attempt["nonces"] = []
+                    self.attempt["nonce"] = ""
+                    self.attempt["attempt_packet_seq_floor"] = packet_seq(packet)
+                    self.attempt["latch_tokens"] = self.cursor.get("current", 0)
                     journal_record(self.paths["journal"], "LATCHED",
                                    self.attempt, latch_kind="THRESHOLD",
                                    reason="still_above_rearm_band")
-                    self.alert_if_needed("BOUNDARY_CONFIRMED")
                     return True, "latched"
                 self.attempt = None
             elif self.attempt.get("state") == "LATCHED":
                 if self.attempt.get("latch_kind") == "THRESHOLD":
                     eff = cm.window_for(self.cfg, self.cursor.get("model"))
-                    pct = self.cursor.get("current", 0) / eff["context_window"]
-                    if pct < self.cfg["managed_trigger_pct"] - self.cfg["rearm_band_pct"]:
+                    window = eff["context_window"]
+                    pct = self.cursor.get("current", 0) / window
+                    # Context only grows between compactions, so a pure
+                    # pct-drop re-arm would latch managed mode forever
+                    # after one compaction. Re-arm when meaningful NEW
+                    # content accumulated past the latch point (or on a
+                    # genuine pct drop) — each re-fire then costs a full
+                    # re-arm band of real work, so no compaction churn.
+                    grown = (self.cursor.get("current", 0) -
+                             self.attempt.get("latch_tokens", 0))
+                    if (pct < (self.cfg["managed_trigger_pct"] -
+                               self.cfg["rearm_band_pct"]) or
+                            grown >= self.cfg["rearm_band_pct"] * window):
                         self.attempt = transition_attempt(
                             self.attempt, "pct_rearmed", now, self.cfg,
                             generation_value=current_generation)
@@ -1809,8 +1827,11 @@ def resolve_session(cfg, sid):
             if lease and lease.get("run_token") == token and lease_is_live(lease):
                 return False, "session lease is still live"
         cursor = load_cursor(paths["scan"])
+        # The human has dispositioned this attempt; a LATE own-nonce
+        # packet must not resurrect it to ACKED, so the resolved latch
+        # drops the nonce identity.
         resolved = dict(tail, state="LATCHED", latch_kind="SAFETY",
-                        reason="operator_resolved",
+                        reason="operator_resolved", nonce="", nonces=[],
                         generation=generation(cursor))
         journal_record(paths["journal"], "LATCHED", resolved,
                        latch_kind="SAFETY", reason="operator_resolved")
@@ -1864,7 +1885,9 @@ def cli_main(argv=None, run_tmux=default_run_tmux):
                   file=sys.stderr)
             return 1
         pane = out.strip().splitlines()[-1]
-        binding, error = _cli_binding("", pane, False, run_tmux, wait_s=10)
+        # 30s: a cold claude start on a loaded machine can take >10s to
+        # write its registry entry (observed live).
+        binding, error = _cli_binding("", pane, False, run_tmux, wait_s=30)
         if error:
             print("compact-manager: %s" % error, file=sys.stderr)
             return 1

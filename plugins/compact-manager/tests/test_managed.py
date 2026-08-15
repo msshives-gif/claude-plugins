@@ -1048,6 +1048,50 @@ class TickWiringTests(unittest.TestCase):
                           watcher.attempt["latch_kind"]),
                          ("LATCHED", "THRESHOLD"))
 
+    def test_threshold_latch_immune_to_stale_own_packet(self):
+        # The consumed attempt's packet must not re-ACK the latch (its
+        # injection lifecycle is over), and the latch must re-arm on
+        # GROWTH: context only grows between compactions, so a pure
+        # pct-drop re-arm would latch managed mode forever.
+        rows = [usage_row(170000), boundary_row(post=170000)]
+        tmux = EchoTmux()
+        watcher = self.make_watcher(rows, tmux)
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(managed.default_cursor()),
+            0, 0.0, "boot")
+        nonce = watcher.attempt["nonce"]
+        watcher.attempt["state"] = "SUBMITTED"
+        watcher.attempt["timers"]["ack_deadline_mono"] = 10 ** 9
+        packet_file = managed.packet_path(self.cfg, self.sid)
+        cm._private_makedirs(os.path.dirname(packet_file))
+        with open(packet_file, "w") as fh:
+            json.dump({"seq": 1, "custom_instructions": "[cm-%s]" % nonce,
+                       "base_compaction_count": 0}, fh)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertEqual(watcher.attempt["nonces"], [])
+        keep, reason = watcher.tick()  # stale own packet must NOT re-ACK
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertEqual(watcher.attempt["state"], "LATCHED")
+
+    def test_threshold_latch_rearms_on_growth_and_refires(self):
+        rows = [usage_row(170000), boundary_row(post=150000)]
+        watcher = self.make_watcher(rows, EchoTmux())
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(managed.default_cursor()),
+            0, 0.0, "boot")
+        watcher.attempt["state"] = "SUBMITTED"
+        watcher.attempt["timers"]["ack_deadline_mono"] = 10 ** 9
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        # rearm_band_pct * 200k window = 16k; grow past it, above trigger
+        append_rows(self.transcript, [usage_row(180000)])
+        keep, reason = watcher.tick()   # re-arm tick
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertIsNone(watcher.attempt)
+        keep, reason = watcher.tick()   # re-fire
+        self.assertEqual((keep, reason), (True, "SUBMITTED"))
+
     def test_boundary_confirmed_clears_when_rearmed(self):
         rows = [usage_row(170000), boundary_row(post=5000)]
         watcher = self.make_watcher(rows, LadderTmux([IDLE]))
