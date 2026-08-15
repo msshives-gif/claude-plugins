@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0 — 2026-08-15
+
+- **Guard fresh-read.** The `SendMessage` guard now re-scans the
+  target's transcript at decision time, so a re-tasked agent is judged
+  on its current size, not the number recorded at its last stop (which
+  could be half an hour and hundreds of thousands of tokens stale).
+  One bounded parse inside the hook budget; any failure falls back to
+  the stored reading, and the warning says which it presents. Fresh
+  reads are skipped for transcripts over ~50MB.
+- **New `compaction_action` knob** (`off` | `warn` | `block`,
+  per-model overridable). **Behavior change: default `block`** — a
+  compacted agent now requires your confirmation before being
+  re-tasked (root session only; headless runs treat it as a refusal),
+  where 0.3.0 only warned. Set `compaction_action: "warn"` to keep the
+  old behavior; `off` stops compaction from triggering anything.
+- Hook commands now end in `|| true` so a missing script or broken
+  interpreter can never surface a blocking exit code (fresh installs
+  and the plugin; existing manual installs keep their old command).
+- Repo restructure: this repository is now also the "claude context
+  tools" marketplace; sibling plugins land under `plugins/`.
+  `uninstall.sh` markers narrowed to this plugin's own hook paths so a
+  subagent-context uninstall can never remove a sibling's hooks.
+
 ## 0.3.0 — 2026-08-02
 
 Renamed `subagent-gauge` → `subagent-context` (the fuel-gauge analogy is

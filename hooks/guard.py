@@ -1,11 +1,14 @@
 """PreToolUse hook on SendMessage: catch the moment before the
 orchestrator gives more work to an already-full agent.
 
-Below warn_tokens (and uncompacted): silent. At warn_tokens: a warning
-is injected next to the tool call. At block_tokens (0 = off): the send
-also needs explicit confirmation — overridable, not absolute. Both
-thresholds honor per-model "models" overrides for the target agent's
-recorded model. Channel rationale and verification: docs/DESIGN.md.
+The target's transcript is re-scanned live at decision time (one
+bounded parse), so the judgment reflects the agent's current size, not
+its last stop. Below warn_tokens: silent. At warn_tokens: a warning is
+injected next to the tool call. At block_tokens (0 = off): the send
+also needs explicit confirmation — overridable, not absolute. A
+compacted target escalates per the compaction_action knob (off | warn |
+block, default block). Thresholds honor per-model "models" overrides
+for the target agent's recorded model. Rationale: docs/DESIGN.md.
 """
 import json
 import os
@@ -38,6 +41,49 @@ def find_state(states, target, sender):
     return None
 
 
+# Fresh reads larger than this fall back to the stored numbers: _scan
+# has no internal deadline, and a pathological transcript must not eat
+# the 5s PreToolUse hook budget. ~50MB parses in well under a second.
+FRESH_READ_MAX_BYTES = 50_000_000
+
+
+def live_reading(rec):
+    """Strengthen the stored reading with a live re-scan of the target's
+    transcript, so the guard judges the agent on what it is NOW rather
+    than what it was at its last stop.
+
+    Merge rules (never weaken the guard by accident):
+    - compactions: max of stored and fresh (a monotonic count).
+    - current: if the fresh scan shows MORE compactions than stored, a
+      real compaction reset the context — accept the fresh current (a
+      stale pre-compaction size must not keep blocking under
+      compaction_action "off"/"warn"). Otherwise take the max.
+    Falls back to the stored numbers on any error (no transcript field,
+    unreadable/oversized file) — the guard stays fail-open and inside
+    its 5s budget: grace_ms=0 means exactly one bounded parse.
+
+    Returns (current, compactions, live) where live says whether a
+    fresh scan succeeded (for honest warn wording).
+    """
+    current = rec.get("current", 0)
+    compactions = rec.get("compactions", 0)
+    tp = rec.get("transcript")
+    fresh = None
+    if tp:
+        try:
+            if os.path.getsize(tp) <= FRESH_READ_MAX_BYTES:
+                fresh = sg.measure(tp, grace_ms=0)
+        except Exception:
+            fresh = None
+    if not fresh:
+        return current, compactions, False
+    if fresh["compactions"] > compactions:
+        current = fresh["current"]
+    else:
+        current = max(current, fresh["current"])
+    return current, max(compactions, fresh["compactions"]), True
+
+
 def main():
     payload = json.loads(sys.stdin.read())
     if payload.get("tool_name") != "SendMessage":
@@ -56,15 +102,18 @@ def main():
     rec = find_state(sg.load_agent_states(cfg, session_id), target, sender)
     if not rec:
         return
-    current = rec.get("current", 0)
     th = sg.thresholds(cfg, rec.get("model"))
-    over = current >= th["warn_tokens"] or rec.get("compactions", 0)
+    current, compactions, live = live_reading(rec)
+    compaction_signal = compactions and th["compaction_action"] != "off"
+    over = current >= th["warn_tokens"] or compaction_signal
     if not over:
         return
+    size_txt = (f"context is ~{current / 1000:.0f}k tokens" if live else
+                f"context was ~{current / 1000:.0f}k tokens at its last stop")
     warn = (f"[subagent-context] You are messaging agent '{target}' whose "
-            f"context was ~{current / 1000:.0f}k tokens at its last stop")
-    if rec.get("compactions"):
-        warn += f" (compacted x{rec['compactions']})"
+            + size_txt)
+    if compactions:
+        warn += f" (compacted x{compactions})"
     warn += (". Long-context agents degrade and anchor on their priors. "
              "For a cheap, targeted follow-up this is fine; for a new task "
              "or a fresh review round, spawn a new agent instead.")
@@ -78,7 +127,9 @@ def main():
     # "ask" only for the root session: a subagent may have no one to
     # answer the confirmation, and an unanswerable ask is a block —
     # stronger than this tool's fail-open promise allows.
-    if not sender and th["block_tokens"] and current >= th["block_tokens"]:
+    size_block = th["block_tokens"] and current >= th["block_tokens"]
+    compaction_block = th["compaction_action"] == "block" and compactions
+    if not sender and (size_block or compaction_block):
         out["hookSpecificOutput"]["permissionDecision"] = "ask"
         out["hookSpecificOutput"]["permissionDecisionReason"] = warn
     print(json.dumps(out))

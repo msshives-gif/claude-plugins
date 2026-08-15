@@ -1,7 +1,7 @@
 {
   "name": "subagent-context",
   "description": "Reports each subagent's context size to the orchestrating agent and warns before an overloaded subagent gets re-tasked.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": {
     "name": "msshives-gif"
   },

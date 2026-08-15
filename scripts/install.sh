@@ -39,8 +39,11 @@ hooks = settings.setdefault("hooks", {})
 for event, (matcher, script, timeout) in entries.items():
     script_path = os.path.join(repo, "hooks", script)
     q = shlex.quote(script_path)
-    # "|| python" covers Windows, where Python usually isn't named python3.
-    cmd = f"python3 {q} || python {q}"
+    # "|| python" covers Windows, where Python usually isn't named
+    # python3. "|| true" keeps the command exit 0 even when the script
+    # is missing or both interpreters fail — a reporting hook must
+    # never surface a blocking exit code (2 would deny the tool call).
+    cmd = f"python3 {q} || python {q} || true"
     groups = hooks.setdefault(event, [])
     # json.dumps escapes quotes/non-ASCII, so compare unescaped dumps.
     if any(script_path in json.dumps(g, ensure_ascii=False) for g in groups):

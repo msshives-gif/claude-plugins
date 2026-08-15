@@ -106,7 +106,27 @@ of presenting a stale number as current.
 **Peak and compaction:** after auto-compaction the current context
 shrinks, so a threshold on `current` alone can be defeated. The scan
 tracks `peak` (max terminal-row sum) and counts compaction summary rows;
-the guard and report treat any compaction as an overload signal.
+the guard and report escalate on compaction per the `compaction_action`
+knob (default `block`: re-tasking a compacted agent needs confirmation).
+
+**Guard fresh-read (0.4.0):** stored records are measured at the
+agent's last stop, so a re-tasked agent working for half an hour was
+judged on a long-stale number. The guard now re-scans the target's
+transcript at decision time (`measure(transcript, grace_ms=0)` — one
+bounded parse, no flush wait, capped at `FRESH_READ_MAX_BYTES` so a
+pathological file can't eat the 5s hook budget). Merge rules: the
+compaction count is a monotonic max; `current` takes the fresh value
+when the fresh scan saw a NEW compaction (the context genuinely reset —
+keeping the stale pre-compaction size would defeat
+`compaction_action: "off"`), otherwise the max. Any failure falls back
+to the stored numbers; the warn text says which reading it presents
+("is ~Nk" live vs "was ~Nk at its last stop").
+
+Two sub-choices deliberately not built: **no write-back** of the fresh
+reading to the state record (it would race the observer's lockless
+atomic write and corrupt the record's measured-at-last-stop semantics
+that `status.py` presents; the re-scan is cheap enough to re-derive per
+guard) and **no peak merge** (the guard never consults peak).
 
 **Identity:** from the transcript's `meta.json` sidecar (`name`,
 `agentType`, `model`, `spawnDepth`), falling back to the payload

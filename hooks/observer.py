@@ -79,11 +79,15 @@ def main():
 
     out = {"suppressOutput": True}
     delivered_to = "none"
-    # Compaction is itself an overload signal — it must not be filtered
-    # out just because the post-compaction context is small.
+    # Compaction is an overload signal (per compaction_action) — it must
+    # not be filtered out just because the post-compaction context is
+    # small.
     th = sg.thresholds(cfg, model)
-    if res["current"] >= th["report_min_tokens"] or res["compactions"]:
-        report = sg.fmt_report(name, model, res, th["warn_tokens"])
+    report_compaction = (res["compactions"]
+                         and th["compaction_action"] != "off")
+    if res["current"] >= th["report_min_tokens"] or report_compaction:
+        report = sg.fmt_report(name, model, res, th["warn_tokens"],
+                               th["compaction_action"])
         if agent_id and agent_id not in report:
             report += f" (id {sg.sanitize(agent_id, 40)})"
         # Reports about a nested agent go to its spawner; unknown or

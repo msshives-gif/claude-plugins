@@ -87,6 +87,20 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("echo user-hook", cmds)
         self.assertEqual(len(cmds), 2)  # all three of our own are gone
 
+    def test_hook_command_exits_zero_when_script_missing(self):
+        # The installed command shape must fail open at the SHELL level:
+        # a deleted clone or broken interpreter must not surface a
+        # nonzero exit (2 would deny a PreToolUse tool call).
+        missing = os.path.join(self.tmp.name, "gone", "guard.py")
+        cmd = f"python3 '{missing}' || python '{missing}' || true"
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True)
+        self.assertEqual(r.returncode, 0)
+
+    def test_installed_command_carries_fail_open_tail(self):
+        _run(INSTALL, self.settings)
+        for cmd in _hook_commands(self.read()):
+            self.assertTrue(cmd.endswith("|| true"), cmd)
+
     def test_uninstall_removes_legacy_gauge_paths(self):
         legacy = "/home/user/subagent-gauge/hooks/observer.py"
         with open(self.settings, "w") as fh:

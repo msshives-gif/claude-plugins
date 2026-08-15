@@ -29,6 +29,10 @@ _DEFAULTS = {
     # (permission "ask" — overridable at the prompt). 0 disables
     # blocking. Between warn_tokens and here, the guard only warns.
     "block_tokens": 350_000,
+    # How a compaction escalates. "off": ignore compaction as a trigger
+    # (size thresholds still apply). "warn": guard/report flag it.
+    # "block": also require confirmation before re-tasking (root-only).
+    "compaction_action": "block",
     # Also show each report to the human as a hook systemMessage.
     "system_message": True,
     # Max queued reports injected per drain (protects parent context).
@@ -48,13 +52,21 @@ _DEFAULTS = {
 _ENV_PREFIX = "SUBAGENT_CONTEXT_"
 
 # The knobs a per-model override (config key "models") may set.
-_PER_MODEL_KEYS = ("warn_tokens", "block_tokens", "report_min_tokens")
+_PER_MODEL_KEYS = ("warn_tokens", "block_tokens", "report_min_tokens",
+                   "compaction_action")
+
+# Enum-valued knobs: allowed values, compared case-insensitively.
+_CHOICES = {"compaction_action": ("off", "warn", "block")}
 
 
-def _coerce(default, value):
+def _coerce(default, value, choices=None):
     """Convert a raw config value (JSON value or env string) to the
     default's type. Returns None when the value can't be used — bool is
-    checked before int because bool subclasses int."""
+    checked before int because bool subclasses int. When choices is
+    given, the value must (case-insensitively) be one of them."""
+    if choices is not None:
+        v = value.strip().lower() if isinstance(value, str) else value
+        return v if v in choices else None
     if isinstance(default, bool):
         if isinstance(value, bool):
             return value
@@ -91,7 +103,8 @@ def _parse_models(raw):
             continue
         clean = {}
         for k, v in overrides.items():
-            c = _coerce(_DEFAULTS[k], v) if k in _PER_MODEL_KEYS else None
+            c = (_coerce(_DEFAULTS[k], v, _CHOICES.get(k))
+                 if k in _PER_MODEL_KEYS else None)
             if c is None:
                 _log_error(f"models[{pat!r}].{k}={v!r} is unusable; "
                            "ignoring it")
@@ -123,7 +136,7 @@ def load_config():
         for raw in (file_cfg.get(k), os.environ.get(_ENV_PREFIX + k.upper())):
             if raw is None:
                 continue
-            v = _coerce(dflt, raw)
+            v = _coerce(dflt, raw, _CHOICES.get(k))
             if v is None:
                 _log_error(f"config {k}={raw!r} is unusable; ignoring it")
             else:
@@ -609,8 +622,10 @@ def prune_stale(cfg):
         pass
 
 
-def fmt_report(name, model, res, warn_tokens):
-    """One-line report string shown to the orchestrator."""
+def fmt_report(name, model, res, warn_tokens, compaction_action="warn"):
+    """One-line report string shown to the orchestrator. The factual
+    COMPACTED xN part is unconditional; only the OVER-THRESHOLD
+    escalation keys on compaction_action."""
     parts = [f"~{res['current'] / 1000:.0f}k tokens"]
     if res["peak"] > res["current"] + 2000:
         parts.append(f"peak ~{res['peak'] / 1000:.0f}k")
@@ -622,7 +637,8 @@ def fmt_report(name, model, res, warn_tokens):
     line += ": " + ", ".join(parts)
     if res.get("stale") or not res.get("terminal", True):
         line += " [reading may lag: final transcript row not yet flushed]"
-    if res["current"] >= warn_tokens or res["compactions"]:
+    compacted_signal = res["compactions"] and compaction_action != "off"
+    if res["current"] >= warn_tokens or compacted_signal:
         line += (" — OVER THRESHOLD: prefer spawning a fresh agent over "
                  "re-tasking this one; long-context agents degrade.")
     return line

@@ -46,10 +46,13 @@ Three small hooks.
    > one; long-context agents degrade.`
 
 3. **Guard** (`PreToolUse` on `SendMessage`) — catches the moment
-   before the main session sends more work to a full agent. Past
-   `warn_tokens` it adds a warning to that tool call. Past
-   `block_tokens` (350k by default) it also asks you to confirm. You
-   can always say yes.
+   before the main session sends more work to a full agent, re-reading
+   the target's transcript right then so the number reflects what the
+   agent is NOW, not what it was at its last stop. Past `warn_tokens`
+   it adds a warning to that tool call. Past `block_tokens` (350k by
+   default) — or if the agent has ever been compacted (see
+   `compaction_action`) — it also asks you to confirm. You can always
+   say yes.
 
 This costs you nothing other than a few tokens on an existing message:
 no extra model calls.
@@ -102,6 +105,7 @@ or a key in `~/.claude/subagent-context.json` (env wins; point
 |---|---|---|
 | `warn_tokens` | `250000` | Above this, reports carry an OVER-THRESHOLD warning and the guard starts firing. |
 | `block_tokens` | `350000` | Above this, messaging the agent needs your confirmation. `0` turns this off. |
+| `compaction_action` | `block` | What a compacted agent triggers: `off` (nothing — size thresholds still apply), `warn`, or `block` (confirmation, root session only). |
 | `report_min_tokens` | `0` | Only report agents at least this big. `0` = report every stop. |
 | `models` | `{}` | Per-model overrides for the three knobs above — see below. |
 | `system_message` | `true` | Also show each report to you in the UI. |
@@ -120,7 +124,7 @@ the block acts as a refusal.
 ### Per-model thresholds
 
 `models` maps a model-ID substring to overrides for `warn_tokens`,
-`block_tokens`, and `report_min_tokens`. In
+`block_tokens`, `report_min_tokens`, and `compaction_action`. In
 `~/.claude/subagent-context.json`:
 
 ```json
@@ -160,14 +164,20 @@ script from the plugin's own directory — `/plugin` shows you the path.
   interface. If a Claude Code update changes those formats, this plugin
   stops producing reports. It will not break your session. Built and
   verified against Claude Code as of 2026-08-02.
-- **Numbers are minimums.** Reports are taken when an agent stops. In
-  practice that's often — `SubagentStop` fires every time an agent goes
-  idle, not only when it finishes for good (that's what we observed; it
-  isn't documented) — but an agent that's mid-task has already grown
-  past its last report.
+- **Report numbers are minimums.** Reports are taken when an agent
+  stops. In practice that's often — `SubagentStop` fires every time an
+  agent goes idle, not only when it finishes for good (that's what we
+  observed; it isn't documented) — but an agent that's mid-task has
+  already grown past its last report. The guard is fresher: it re-reads
+  the target's transcript at send time, so its number is current as of
+  the agent's last completed model call (an in-flight call is still
+  invisible).
 - **Compaction is treated as a warning sign.** After auto-compaction an
   agent's current context looks small again. Reports show the peak and
-  a `COMPACTED xN` flag, and the guard still fires for it.
+  a `COMPACTED xN` flag, and the guard escalates per
+  `compaction_action` — by default a compacted agent needs your
+  confirmation before it's re-tasked (set `"warn"` for the pre-0.4
+  behavior).
 - **The guard watches `SendMessage`.** That's how existing agents get
   more work in current Claude Code. Fresh `Agent` spawns start empty
   and need no guard. No `SendMessage` tool in your setup? The guard

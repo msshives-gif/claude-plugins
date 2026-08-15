@@ -436,11 +436,12 @@ class RunHookMixin:
     HOOKS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "..", "hooks")
 
-    def run_hook(self, script, payload, state_dir):
+    def run_hook(self, script, payload, state_dir, extra_env=None):
         import subprocess
         env = dict(os.environ,
                    SUBAGENT_CONTEXT_CONFIG="/nonexistent/subagent-context-test.json",
                    SUBAGENT_CONTEXT_STATE_DIR=state_dir)
+        env.update(extra_env or {})
         p = subprocess.run(
             [sys.executable, os.path.join(self.HOOKS_DIR, script)],
             input=json.dumps(payload), capture_output=True, text=True,
@@ -649,6 +650,204 @@ class PruneTests(unittest.TestCase):
                 ["fresh"])
 
 
+class GuardFreshReadTests(unittest.TestCase):
+    """Unit tests of guard.live_reading: the guard judges the target on
+    a live transcript re-scan, merged so it never weakens by accident."""
+
+    def setUp(self):
+        sys.path.insert(0, RunHookMixin.HOOKS_DIR)
+        import guard
+        self.guard = guard
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "t.jsonl")
+
+    def test_fresh_read_strengthens_current(self):
+        write_jsonl(self.path, [usage_row(10, 290_000, 9_000, 1_000,
+                                          "end_turn")])
+        rec = {"current": 10_000, "compactions": 0, "transcript": self.path}
+        current, compactions, live = self.guard.live_reading(rec)
+        self.assertEqual(current, 300_010)
+        self.assertEqual(compactions, 0)
+        self.assertTrue(live)
+
+    def test_fresh_read_never_weakens_without_compaction(self):
+        write_jsonl(self.path, [usage_row(10, 50_000, 9_000, 990,
+                                          "end_turn")])
+        rec = {"current": 380_000, "compactions": 1, "transcript": self.path}
+        current, compactions, live = self.guard.live_reading(rec)
+        self.assertEqual(current, 380_000)
+        self.assertEqual(compactions, 1)
+        self.assertTrue(live)
+
+    def test_compaction_advance_accepts_fresh_current(self):
+        # A compaction the stored record hasn't seen genuinely reset the
+        # context: the fresh (smaller) current must win, or a stale
+        # pre-compaction size keeps escalating even under
+        # compaction_action "off"/"warn".
+        write_jsonl(self.path, [
+            usage_row(10, 380_000, 9_000, 990, "end_turn"),
+            {"isCompactSummary": True},
+            usage_row(10, 50_000, 9_000, 990, "end_turn"),
+        ])
+        rec = {"current": 380_000, "compactions": 0, "transcript": self.path}
+        current, compactions, live = self.guard.live_reading(rec)
+        self.assertEqual(current, 60_000)
+        self.assertEqual(compactions, 1)
+        self.assertTrue(live)
+
+    def test_fresh_read_merges_new_compaction_count(self):
+        write_jsonl(self.path, [{"isCompactSummary": True},
+                                usage_row(10, 40_000, 0, 990, "end_turn")])
+        rec = {"current": 350_000, "compactions": 0, "transcript": self.path}
+        _, compactions, _ = self.guard.live_reading(rec)
+        self.assertEqual(compactions, 1)
+
+    def test_missing_transcript_file_falls_back(self):
+        rec = {"current": 123_000, "compactions": 2,
+               "transcript": os.path.join(self.dir.name, "gone.jsonl")}
+        self.assertEqual(self.guard.live_reading(rec), (123_000, 2, False))
+
+    def test_no_transcript_field_falls_back(self):
+        self.assertEqual(self.guard.live_reading({"current": 5_000}),
+                         (5_000, 0, False))
+
+    def test_oversized_transcript_falls_back(self):
+        write_jsonl(self.path, [usage_row(10, 500_000, 0, 990, "end_turn")])
+        rec = {"current": 7_000, "compactions": 0, "transcript": self.path}
+        old = self.guard.FRESH_READ_MAX_BYTES
+        self.guard.FRESH_READ_MAX_BYTES = 1
+        try:
+            self.assertEqual(self.guard.live_reading(rec), (7_000, 0, False))
+        finally:
+            self.guard.FRESH_READ_MAX_BYTES = old
+
+
+class GuardFreshReadHookTests(RunHookMixin, unittest.TestCase):
+    """End-to-end: a stale small stored record must not let a now-huge
+    agent through. Fails on pre-0.4.0 code (stored 10k is under every
+    threshold, so the old guard emitted nothing)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.cfg = dict(sg._DEFAULTS, state_dir=self.dir.name)
+
+    def test_guard_uses_fresh_reading_to_escalate(self):
+        transcript = os.path.join(self.dir.name, "worker.jsonl")
+        write_jsonl(transcript, [usage_row(10, 350_000, 10_000, 990,
+                                           "end_turn")])
+        sg.write_agent_state(self.cfg, "sessA", {
+            "agent_id": "aKid", "name": "worker", "model": "",
+            "parent_agent_id": "", "current": 10_000, "compactions": 0,
+            "transcript": transcript})
+        out = self.run_hook("guard.py", {
+            "hook_event_name": "PreToolUse", "session_id": "sessA",
+            "tool_name": "SendMessage",
+            "tool_input": {"to": "worker", "message": "more work"}},
+            self.dir.name)
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "ask")  # 361k >= 350k
+        self.assertIn("~361k", hso["additionalContext"])
+
+
+class GuardCompactionActionTests(RunHookMixin, unittest.TestCase):
+    """The compaction_action knob governs how a compacted target
+    escalates. Records carry no transcript field so live_reading falls
+    back and the knob's path is what's under test."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.cfg = dict(sg._DEFAULTS, state_dir=self.dir.name)
+        sg.write_agent_state(self.cfg, "sessA", {
+            "agent_id": "aKid", "name": "worker", "model": "",
+            "parent_agent_id": "", "current": 10_000, "compactions": 1})
+        self.payload = {
+            "hook_event_name": "PreToolUse", "session_id": "sessA",
+            "tool_name": "SendMessage",
+            "tool_input": {"to": "worker", "message": "again"}}
+
+    def run_guard(self, action):
+        return self.run_hook(
+            "guard.py", self.payload, self.dir.name,
+            extra_env={"SUBAGENT_CONTEXT_COMPACTION_ACTION": action})
+
+    def test_off_ignores_compaction(self):
+        self.assertEqual(self.run_guard("off"), {})
+
+    def test_warn_warns_without_ask(self):
+        out = self.run_guard("warn")
+        hso = out["hookSpecificOutput"]
+        self.assertIn("compacted x1", hso["additionalContext"])
+        self.assertNotIn("permissionDecision", hso)
+
+    def test_block_asks_for_root_sender(self):
+        out = self.run_guard("block")
+        self.assertEqual(
+            out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_block_no_ask_for_subagent_sender(self):
+        # A subagent owner gets the warning but never an unanswerable ask.
+        sg.write_agent_state(self.cfg, "sessA", {
+            "agent_id": "aNested", "name": "helper", "model": "",
+            "parent_agent_id": "aOuter", "current": 10_000,
+            "compactions": 1})
+        payload = dict(self.payload, agent_id="aOuter",
+                       tool_input={"to": "helper", "message": "x"})
+        out = self.run_hook(
+            "guard.py", payload, self.dir.name,
+            extra_env={"SUBAGENT_CONTEXT_COMPACTION_ACTION": "block"})
+        hso = out["hookSpecificOutput"]
+        self.assertIn("compacted x1", hso["additionalContext"])
+        self.assertNotIn("permissionDecision", hso)
+
+
+class CompactionActionConfigTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["SUBAGENT_CONTEXT_CONFIG"] = "/nonexistent/subagent-context-test.json"
+
+    def tearDown(self):
+        os.environ.pop("SUBAGENT_CONTEXT_CONFIG", None)
+        os.environ.pop("SUBAGENT_CONTEXT_COMPACTION_ACTION", None)
+
+    def test_default_is_block(self):
+        self.assertEqual(sg.load_config()["compaction_action"], "block")
+
+    def test_valid_file_value_kept(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as fh:
+            json.dump({"compaction_action": "warn"}, fh)
+        os.environ["SUBAGENT_CONTEXT_CONFIG"] = fh.name
+        try:
+            self.assertEqual(sg.load_config()["compaction_action"], "warn")
+        finally:
+            os.unlink(fh.name)
+
+    def test_invalid_value_falls_back_to_default(self):
+        os.environ["SUBAGENT_CONTEXT_COMPACTION_ACTION"] = "nope"
+        self.assertEqual(sg.load_config()["compaction_action"], "block")
+
+    def test_env_value_case_insensitive(self):
+        os.environ["SUBAGENT_CONTEXT_COMPACTION_ACTION"] = "OFF"
+        self.assertEqual(sg.load_config()["compaction_action"], "off")
+
+    def test_per_model_override(self):
+        cfg = dict(sg._DEFAULTS,
+                   models={"haiku": {"compaction_action": "off"}})
+        self.assertEqual(
+            sg.thresholds(cfg, "claude-haiku-4-5")["compaction_action"],
+            "off")
+        self.assertEqual(
+            sg.thresholds(cfg, "claude-opus-5")["compaction_action"],
+            "block")
+
+    def test_invalid_per_model_value_dropped(self):
+        models = sg._parse_models({"haiku": {"compaction_action": "loud",
+                                             "warn_tokens": 1000}})
+        self.assertEqual(models, {"haiku": {"warn_tokens": 1000}})
+
+
 class FormatTests(unittest.TestCase):
     def test_over_threshold_flagged(self):
         res = {"current": 200_000, "peak": 200_000, "compactions": 0}
@@ -660,6 +859,17 @@ class FormatTests(unittest.TestCase):
         res = {"current": 40_000, "peak": 41_000, "compactions": 0}
         line = sg.fmt_report("worker", "", res, 150_000)
         self.assertNotIn("OVER THRESHOLD", line)
+
+    def test_compaction_off_suppresses_over_threshold(self):
+        res = {"current": 40_000, "peak": 41_000, "compactions": 1}
+        line = sg.fmt_report("worker", "", res, 150_000, "off")
+        self.assertNotIn("OVER THRESHOLD", line)
+        self.assertIn("COMPACTED x1", line)  # the fact always shows
+
+    def test_compaction_block_flags_over_threshold(self):
+        res = {"current": 40_000, "peak": 41_000, "compactions": 1}
+        line = sg.fmt_report("worker", "", res, 150_000, "block")
+        self.assertIn("OVER THRESHOLD", line)
 
 
 if __name__ == "__main__":
