@@ -46,7 +46,7 @@ Three small hooks.
    > one; long-context agents degrade.`
 
 3. **Guard** (`PreToolUse` on `SendMessage`) — catches the moment
-   before the main session sends more work to a full agent, re-reading
+   before a session sends more work to a full agent, re-reading
    the target's transcript right then so the number reflects what the
    agent is NOW, not what it was at its last stop. Past `warn_tokens`
    it adds a warning to that tool call. Past `block_tokens` (350k by
@@ -113,7 +113,7 @@ or a key in `~/.claude/subagent-context.json` (env wins; point
 | `block_style` | `deny_once` | How the gate behaves. `deny_once`: denied once with a model-facing reason; a retry passes; re-arms after `deny_once_ttl_seconds`. `ask`: human confirmation dialog (root session only; hangs unattended sessions). |
 | `deny_once_ttl_seconds` | `900` | How long a deny-once challenge stays satisfied before it re-arms. |
 | `report_min_tokens` | `0` | Only report agents at least this big. `0` = report every stop. |
-| `models` | `{}` | Per-model overrides for the four knobs above — see below. |
+| `models` | `{}` | Per-model overrides for `warn_tokens`, `block_tokens`, `report_min_tokens`, `compaction_action` — see below. |
 | `system_message` | `true` | Also show each report to you in the UI. |
 | `drain_batch_max` | `20` | Max reports delivered per tool call. |
 | `flush_grace_ms` | `4000` | How long to wait for a stopping agent's transcript to finish being written. |
@@ -182,9 +182,8 @@ script from the plugin's own directory — `/plugin` shows you the path.
 - **Compaction is treated as a warning sign.** After auto-compaction an
   agent's current context looks small again. Reports show the peak and
   a `COMPACTED xN` flag, and the guard escalates per
-  `compaction_action` — by default a compacted agent needs your
-  confirmation before it's re-tasked (set `"warn"` for the pre-0.4
-  behavior).
+  `compaction_action` — by default re-tasking a compacted agent gets
+  the deny-once challenge (set `"warn"` for warnings only).
 - **The guard watches `SendMessage`.** That's how existing agents get
   more work in current Claude Code. Fresh `Agent` spawns start empty
   and need no guard. No `SendMessage` tool in your setup? The guard

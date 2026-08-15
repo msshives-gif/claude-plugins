@@ -158,17 +158,25 @@ def main():
             # written; otherwise every retry would be denied again.
             aid = rec.get("agent_id") or target
             ttl = cfg["deny_once_ttl_seconds"]
-            if not sg.deny_latch_active(cfg, session_id, sender, aid,
-                                        ttl) \
-                    and sg.write_deny_latch(cfg, session_id, sender,
-                                            aid, current, compactions):
+            latch = sg.deny_latch_state(cfg, session_id, sender, aid,
+                                        ttl)
+            # "fresh": challenge satisfied. "invalid": unreadable/
+            # corrupt latch — NEVER deny on state we can't read
+            # (could repeat forever). Deny only on absent/expired AND
+            # a durably recorded challenge.
+            if latch in ("absent", "expired") \
+                    and sg.write_deny_latch(
+                        cfg, session_id, sender, aid, current,
+                        compactions, expired=(latch == "expired")):
+                rearm = (f"{ttl} seconds" if ttl < 120
+                         else f"{ttl // 60} minutes")
                 out["hookSpecificOutput"]["permissionDecision"] = "deny"
                 out["hookSpecificOutput"]["permissionDecisionReason"] = (
                     warn + " This send was denied ONCE so you can weigh "
                     "spawning a fresh agent instead. If you have "
                     "considered that and still want to proceed, retry "
                     "the same SendMessage — it will go through (the "
-                    f"challenge re-arms after {ttl // 60} minutes).")
+                    f"challenge re-arms after {rearm}).")
     print(json.dumps(out))
 
 

@@ -930,6 +930,49 @@ class GuardDenyOnceTests(RunHookMixin, unittest.TestCase):
         self.assertIn("~400k", hso["additionalContext"])
         self.assertNotIn("permissionDecision", hso)
 
+    def test_corrupt_latch_never_denies(self):
+        # An unreadable/corrupt latch must FAIL OPEN: denying on state
+        # we can't read could repeat on every retry (audit finding).
+        self.guard()  # denied; latch written
+        latch = sg._latch_path(self.cfg, "sessA", "", "aBig")
+        with open(latch, "w") as fh:
+            fh.write("{not json")
+        out = self.guard()
+        self.assertNotIn("permissionDecision", out["hookSpecificOutput"])
+
+    def test_future_dated_latch_never_denies(self):
+        self.guard()
+        latch = sg._latch_path(self.cfg, "sessA", "", "aBig")
+        with open(latch, "w") as fh:
+            json.dump({"denied_at": time.time() + 9_999}, fh)
+        out = self.guard()
+        self.assertNotIn("permissionDecision", out["hookSpecificOutput"])
+
+    def test_latch_keys_collision_free(self):
+        # ("a", "b--c") and ("a--b", "c") must map to different latch
+        # files (digest keys; audit finding).
+        p1 = sg._latch_path(self.cfg, "s", "a", "b--c")
+        p2 = sg._latch_path(self.cfg, "s", "a--b", "c")
+        p3 = sg._latch_path(self.cfg, "s", "root", "x")
+        p4 = sg._latch_path(self.cfg, "s", "", "x")
+        self.assertNotEqual(p1, p2)
+        self.assertNotEqual(p3, p4)
+
+    def test_ttl_clamped_both_ends(self):
+        env = dict(os.environ)
+        try:
+            os.environ["SUBAGENT_CONTEXT_DENY_ONCE_TTL_SECONDS"] = "0"
+            os.environ["SUBAGENT_CONTEXT_CONFIG"] = "/nonexistent/x.json"
+            self.assertEqual(
+                sg.load_config()["deny_once_ttl_seconds"], 30)
+            os.environ["SUBAGENT_CONTEXT_DENY_ONCE_TTL_SECONDS"] = \
+                "9999999"
+            self.assertEqual(
+                sg.load_config()["deny_once_ttl_seconds"], 86_400)
+        finally:
+            os.environ.clear()
+            os.environ.update(env)
+
     def test_latches_scoped_per_sender_agent_pair(self):
         self.guard()  # root->worker challenged
         sg.write_agent_state(self.cfg, "sessA", {

@@ -107,7 +107,8 @@ of presenting a stale number as current.
 shrinks, so a threshold on `current` alone can be defeated. The scan
 tracks `peak` (max terminal-row sum) and counts compaction summary rows;
 the guard and report escalate on compaction per the `compaction_action`
-knob (default `block`: re-tasking a compacted agent needs confirmation).
+knob (default `block`: re-tasking a compacted agent gets the block
+tier's gate — deny-once by default, see below).
 
 **Guard fresh-read (0.4.0):** stored records are measured at the
 agent's last stop, so a re-tasked agent working for half an hour was
