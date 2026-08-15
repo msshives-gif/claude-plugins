@@ -58,7 +58,13 @@ def is_alive(entry, proc_root="/proc"):
     reg_start = entry.get("procStart")
     if reg_start is None:
         return True  # older registry versions: existence is best we have
-    return start == reg_start
+    try:
+        # The live registry stores procStart as a STRING (observed
+        # 2026-08-15); tolerate either form, but a malformed value is
+        # not proof of liveness.
+        return start == int(reg_start)
+    except (TypeError, ValueError):
+        return False
 
 
 def _slug(cwd):

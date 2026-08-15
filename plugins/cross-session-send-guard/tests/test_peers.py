@@ -57,10 +57,11 @@ class ResolveTests(unittest.TestCase):
     def add_session(self, pid, name, session_id, cwd="/home/u/proj",
                     proc_start=777, updated=1000, registry_start=None,
                     transcript=True):
+        # The real registry stores procStart as a string; mirror that.
+        start = proc_start if registry_start is None else registry_start
         entry = {"pid": pid, "name": name, "sessionId": session_id,
                  "cwd": cwd, "updatedAt": updated,
-                 "procStart": (proc_start if registry_start is None
-                               else registry_start)}
+                 "procStart": str(start) if start is not None else None}
         with open(os.path.join(self.sessions, f"{pid}.json"), "w") as fh:
             json.dump(entry, fh)
         if proc_start is not None:
