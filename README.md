@@ -51,8 +51,12 @@ Three small hooks.
    agent is NOW, not what it was at its last stop. Past `warn_tokens`
    it adds a warning to that tool call. Past `block_tokens` (350k by
    default) — or if the agent has ever been compacted (see
-   `compaction_action`) — it also asks you to confirm. You can always
-   say yes.
+   `compaction_action`) — the send is challenged: denied once with a
+   reason the model sees, and allowed if the model retries after
+   weighing it (`block_style: "deny_once"`, the default). Set
+   `block_style: "ask"` if you'd rather answer a confirmation dialog
+   yourself — but note an unattended session then hangs on that
+   dialog until you answer.
 
 This costs you nothing other than a few tokens on an existing message:
 no extra model calls.
@@ -104,8 +108,10 @@ or a key in `~/.claude/subagent-context.json` (env wins; point
 | Knob | Default | Meaning |
 |---|---|---|
 | `warn_tokens` | `250000` | Above this, reports carry an OVER-THRESHOLD warning and the guard starts firing. |
-| `block_tokens` | `350000` | Above this, messaging the agent needs your confirmation. `0` turns this off. |
-| `compaction_action` | `block` | What a compacted agent triggers: `off` (nothing — size thresholds still apply), `warn`, or `block` (confirmation, root session only). |
+| `block_tokens` | `350000` | Above this, messaging the agent is gated per `block_style`. `0` turns this off. |
+| `compaction_action` | `block` | What a compacted agent triggers: `off` (nothing — size thresholds still apply), `warn`, or `block` (gate per `block_style`). |
+| `block_style` | `deny_once` | How the gate behaves. `deny_once`: denied once with a model-facing reason; a retry passes; re-arms after `deny_once_ttl_seconds`. `ask`: human confirmation dialog (root session only; hangs unattended sessions). |
+| `deny_once_ttl_seconds` | `900` | How long a deny-once challenge stays satisfied before it re-arms. |
 | `report_min_tokens` | `0` | Only report agents at least this big. `0` = report every stop. |
 | `models` | `{}` | Per-model overrides for the four knobs above — see below. |
 | `system_message` | `true` | Also show each report to you in the UI. |
@@ -118,8 +124,9 @@ or a key in `~/.claude/subagent-context.json` (env wins; point
 The defaults assume long-context models. A model with a 200k window
 compacts before reaching 250k — compaction is itself reported and
 guarded, but if you mix model families, give each its own thresholds.
-The confirmation prompt can't be answered in a headless run, so there
-the block acts as a refusal.
+The default `deny_once` gate self-resolves in headless and unattended
+runs (the model just retries); with `block_style: "ask"` a headless
+run can't answer the dialog, so the block acts as a refusal there.
 
 ### Per-model thresholds
 

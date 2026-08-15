@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 — 2026-08-15
+
+- **BEHAVIOR CHANGE — the block tier now denies once instead of
+  asking.** New knob `block_style` (default `deny_once`): past
+  `block_tokens`, or on a compacted target with `compaction_action:
+  block`, the send is DENIED with a reason the model sees; an
+  immediate retry passes, and the challenge re-arms after
+  `deny_once_ttl_seconds` (default 900). Rationale: the old
+  confirmation dialog hung unattended/autonomous sessions waiting for
+  a human, and was an unanswerable refusal in headless runs.
+  Restore the old behavior with `"block_style": "ask"`.
+- Because deny-once is model-facing, the block tier now also applies
+  to subagent senders (ask remains root-only when selected).
+- The deny is only issued when the challenge latch is durably
+  recorded; an unwritable state dir degrades to warn-only rather
+  than an unbreakable deny loop.
+
 ## 0.4.0 — 2026-08-15
 
 - **Guard fresh-read.** The `SendMessage` guard now re-scans the

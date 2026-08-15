@@ -191,9 +191,24 @@ The guard follows the same ownership: a send's candidate states are
 those whose `parent_agent_id` equals the sender's `agent_id` ("" for
 the root session), so with current-format sidecars a reused name can't
 warn about another branch's agent (pre-2026-07-16 sidecars: see the
-fallback caveat above). Inside a subagent the guard only warns — `permissionDecision:
-"ask"` stays root-only, because a subagent may have nobody to answer
-the confirmation, and an unanswerable ask is a block.
+fallback caveat above).
+
+How the block tier gates (0.5.0): the default is `block_style:
+"deny_once"` — the send is denied with a model-facing reason, a
+retry passes, and the challenge re-arms after a TTL. Chosen as the
+default (2026-08-15) because a permission "ask" hangs an unattended
+autonomous session until a human answers, which broke real overnight
+runs; deny-once keeps the forced moment of reconsideration while
+staying self-resolving, and it works for subagent senders and
+headless runs where a dialog can't exist at all. The latch lives in a
+guard-owned `latches/` namespace precisely because the guard must not
+write the observer's records (see the no-write-back rule above); if
+the latch can't be durably written the guard degrades to warn-only
+rather than deny — a deny that can't be remembered would repeat on
+every retry, an unbreakable loop. Under `block_style: "ask"`,
+`permissionDecision: "ask"` stays root-only, because a subagent may
+have nobody to answer the confirmation, and an unanswerable ask is a
+block.
 
 Deliberately not built, until real use demands it: report rollups for
 large workflow fan-outs (the drain batch cap already bounds one

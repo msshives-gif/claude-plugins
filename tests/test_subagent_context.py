@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -785,7 +786,9 @@ class GuardFreshReadHookTests(RunHookMixin, unittest.TestCase):
             "tool_input": {"to": "worker", "message": "more work"}},
             self.dir.name)
         hso = out["hookSpecificOutput"]
-        self.assertEqual(hso["permissionDecision"], "ask")  # 361k >= 350k
+        # 361k >= 350k: the gate fires from the LIVE reading (default
+        # style deny_once -> a first-time deny).
+        self.assertEqual(hso["permissionDecision"], "deny")
         self.assertIn("~361k", hso["additionalContext"])
 
 
@@ -807,9 +810,12 @@ class GuardCompactionActionTests(RunHookMixin, unittest.TestCase):
             "tool_input": {"to": "worker", "message": "again"}}
 
     def run_guard(self, action):
+        # block_style=ask pins the pre-0.5 escalation path; the default
+        # deny_once path has its own test class.
         return self.run_hook(
             "guard.py", self.payload, self.dir.name,
-            extra_env={"SUBAGENT_CONTEXT_COMPACTION_ACTION": action})
+            extra_env={"SUBAGENT_CONTEXT_COMPACTION_ACTION": action,
+                       "SUBAGENT_CONTEXT_BLOCK_STYLE": "ask"})
 
     def test_off_ignores_compaction(self):
         self.assertEqual(self.run_guard("off"), {})
@@ -835,10 +841,105 @@ class GuardCompactionActionTests(RunHookMixin, unittest.TestCase):
                        tool_input={"to": "helper", "message": "x"})
         out = self.run_hook(
             "guard.py", payload, self.dir.name,
-            extra_env={"SUBAGENT_CONTEXT_COMPACTION_ACTION": "block"})
+            extra_env={"SUBAGENT_CONTEXT_COMPACTION_ACTION": "block",
+                       "SUBAGENT_CONTEXT_BLOCK_STYLE": "ask"})
         hso = out["hookSpecificOutput"]
         self.assertIn("compacted x1", hso["additionalContext"])
         self.assertNotIn("permissionDecision", hso)
+
+
+class GuardDenyOnceTests(RunHookMixin, unittest.TestCase):
+    """block_style=deny_once (the default): the gate denies ONCE with a
+    model-facing reason, an immediate retry passes, and the challenge
+    re-arms after the TTL. Chosen as default because "ask" hangs an
+    unattended session waiting for a human."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.cfg = dict(sg._DEFAULTS, state_dir=self.dir.name)
+        sg.write_agent_state(self.cfg, "sessA", {
+            "agent_id": "aBig", "name": "worker", "model": "",
+            "parent_agent_id": "", "current": 400_000, "compactions": 0})
+        self.payload = {
+            "hook_event_name": "PreToolUse", "session_id": "sessA",
+            "tool_name": "SendMessage",
+            "tool_input": {"to": "worker", "message": "more work"}}
+
+    def guard(self, payload=None, extra=None):
+        return self.run_hook("guard.py", payload or self.payload,
+                             self.dir.name, extra_env=extra)
+
+    def test_first_send_denied_retry_passes(self):
+        out = self.guard()
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertIn("retry the same SendMessage",
+                      hso["permissionDecisionReason"])
+        # Retry: warn text still attached, but no gate.
+        out = self.guard()
+        hso = out["hookSpecificOutput"]
+        self.assertIn("~400k", hso["additionalContext"])
+        self.assertNotIn("permissionDecision", hso)
+
+    def test_challenge_rearms_after_ttl(self):
+        self.guard()  # denied; latch written
+        latch = sg._latch_path(self.cfg, "sessA", "", "aBig")
+        with open(latch) as fh:
+            rec = json.load(fh)
+        rec["denied_at"] = time.time() - 10_000  # far past the TTL
+        with open(latch, "w") as fh:
+            json.dump(rec, fh)
+        out = self.guard()
+        self.assertEqual(
+            out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_subagent_sender_also_challenged(self):
+        # Unlike ask (root-only), deny_once is model-facing and safe
+        # for nested orchestrators.
+        sg.write_agent_state(self.cfg, "sessA", {
+            "agent_id": "aNested", "name": "helper", "model": "",
+            "parent_agent_id": "aOuter", "current": 400_000,
+            "compactions": 0})
+        payload = dict(self.payload, agent_id="aOuter",
+                       tool_input={"to": "helper", "message": "x"})
+        out = self.guard(payload)
+        self.assertEqual(
+            out["hookSpecificOutput"]["permissionDecision"], "deny")
+        out = self.guard(payload)
+        self.assertNotIn("permissionDecision", out["hookSpecificOutput"])
+
+    def test_compaction_gate_uses_deny_once_too(self):
+        sg.write_agent_state(self.cfg, "sessA", {
+            "agent_id": "aComp", "name": "veteran", "model": "",
+            "parent_agent_id": "", "current": 10_000, "compactions": 2})
+        payload = dict(self.payload,
+                       tool_input={"to": "veteran", "message": "x"})
+        out = self.guard(payload)
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertIn("compacted x2", hso["permissionDecisionReason"])
+
+    def test_unwritable_latch_never_denies(self):
+        # If the challenge can't be recorded, denying would repeat on
+        # every retry — an unbreakable loop. Degrade to warn-only.
+        os.chmod(self.dir.name, 0o500)
+        self.addCleanup(os.chmod, self.dir.name, 0o700)
+        out = self.guard()
+        hso = out["hookSpecificOutput"]
+        self.assertIn("~400k", hso["additionalContext"])
+        self.assertNotIn("permissionDecision", hso)
+
+    def test_latches_scoped_per_sender_agent_pair(self):
+        self.guard()  # root->worker challenged
+        sg.write_agent_state(self.cfg, "sessA", {
+            "agent_id": "aBig2", "name": "worker2", "model": "",
+            "parent_agent_id": "", "current": 400_000, "compactions": 0})
+        payload = dict(self.payload,
+                       tool_input={"to": "worker2", "message": "x"})
+        out = self.guard(payload)  # different agent: its own challenge
+        self.assertEqual(
+            out["hookSpecificOutput"]["permissionDecision"], "deny")
 
 
 class ObserverCompactionActionTests(RunHookMixin, unittest.TestCase):

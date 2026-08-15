@@ -4,8 +4,12 @@ orchestrator gives more work to an already-full agent.
 The target's transcript is re-scanned live at decision time (one
 bounded parse), so the judgment reflects the agent's current size, not
 its last stop. Below warn_tokens: silent. At warn_tokens: a warning is
-injected next to the tool call. At block_tokens (0 = off): the send
-also needs explicit confirmation — overridable, not absolute. A
+injected next to the tool call. At block_tokens (0 = off): the send is
+gated per block_style — "deny_once" (default) denies with a
+model-facing reason and lets an immediate retry pass (the model
+overrides by retrying; re-arms after deny_once_ttl_seconds), "ask"
+raises a human confirmation dialog (root session only; hangs
+unattended sessions, which is why it is no longer the default). A
 compacted target escalates per the compaction_action knob (off | warn |
 block, default block). Thresholds honor per-model "models" overrides
 for the target agent's recorded model. Rationale: docs/DESIGN.md.
@@ -135,14 +139,36 @@ def main():
             "additionalContext": warn,
         },
     }
-    # "ask" only for the root session: a subagent may have no one to
-    # answer the confirmation, and an unanswerable ask is a block —
-    # stronger than this tool's fail-open promise allows.
     size_block = th["block_tokens"] and current >= th["block_tokens"]
     compaction_block = th["compaction_action"] == "block" and compactions
-    if not sender and (size_block or compaction_block):
-        out["hookSpecificOutput"]["permissionDecision"] = "ask"
-        out["hookSpecificOutput"]["permissionDecisionReason"] = warn
+    if size_block or compaction_block:
+        if cfg["block_style"] == "ask":
+            # "ask" only for the root session: a subagent may have no
+            # one to answer the confirmation, and an unanswerable ask
+            # is a block — stronger than fail-open allows.
+            if not sender:
+                out["hookSpecificOutput"]["permissionDecision"] = "ask"
+                out["hookSpecificOutput"]["permissionDecisionReason"] = warn
+        else:
+            # deny_once: a model-facing challenge that the model
+            # overrides by simply retrying. Self-resolving, so it works
+            # for subagent senders and unattended/headless sessions —
+            # an "ask" there hangs waiting for a human (the reason
+            # this is the default). Deny ONLY if the latch was durably
+            # written; otherwise every retry would be denied again.
+            aid = rec.get("agent_id") or target
+            ttl = cfg["deny_once_ttl_seconds"]
+            if not sg.deny_latch_active(cfg, session_id, sender, aid,
+                                        ttl) \
+                    and sg.write_deny_latch(cfg, session_id, sender,
+                                            aid, current, compactions):
+                out["hookSpecificOutput"]["permissionDecision"] = "deny"
+                out["hookSpecificOutput"]["permissionDecisionReason"] = (
+                    warn + " This send was denied ONCE so you can weigh "
+                    "spawning a fresh agent instead. If you have "
+                    "considered that and still want to proceed, retry "
+                    "the same SendMessage — it will go through (the "
+                    f"challenge re-arms after {ttl // 60} minutes).")
     print(json.dumps(out))
 
 
