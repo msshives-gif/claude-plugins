@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""CLI for compact-manager managed mode."""
+import os
+import sys
+
+HOOKS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks"))
+sys.path.insert(0, HOOKS)
+
+try:
+    import managed
+except Exception as exc:
+    print("compact-manager: import failed: %r" % (exc,), file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(managed.cli_main())

@@ -42,8 +42,51 @@ Five thin hooks, all fail-open, all inert until you set a mode:
    At-most-once per packet; the SessionStart copy may duplicate it
    (harmless by design).
 
-`stop_marker` (`Stop`) exists for the future managed mode and is a
-no-op otherwise.
+`stop_marker` (`Stop`) is a reserved no-op (kept so the hook surface
+is stable across versions).
+
+## What it does (Layer 2 — managed)
+
+`managed` mode adds a per-session watcher daemon that restores what
+the advisory alone cannot: actually running `/compact` at the right
+time. Hooks cannot invoke `/compact`, so the watcher types it into
+the session's tmux pane — only after a six-rail safety ladder proves
+the pane is the right pane, the composer is empty and stable, and
+nothing changed underneath it between verification and the final
+Enter. Any doubt at any rail aborts before a keystroke; ambiguity
+after typing raises a persistent alert (`compact-manager status`)
+rather than guessing. The watcher never clears your composer and
+never restarts itself.
+
+```
+plugins/compact-manager/bin/compact-manager start -- claude [args…]
+plugins/compact-manager/bin/compact-manager adopt [-S socket] -t %pane --attended
+plugins/compact-manager/bin/compact-manager status | stop <sid> | resolve <sid>
+```
+
+- **start** launches claude in a fresh tmux session with no shell
+  underneath (tmux gets the command as an argument vector), so a
+  worst-case race has nowhere to land — the pane dies with claude.
+- **adopt** attaches a watcher to an EXISTING pane you point it at —
+  including an attended session you are typing into. That is why it
+  requires `--attended`: in a worst-case race the fixed `/compact …`
+  bytes and one Enter could reach the shell under claude, and
+  concurrent input can alter the executed line. The instruction text
+  is metacharacter-free by construction and enforced by test, but the
+  residual is real and adopt makes you acknowledge it.
+- Triggers: crossing `managed_trigger_pct` (defaults to `hard_pct`),
+  or the model writing a request file (the advisory tells it the
+  path), restoring model-chosen timing.
+- Compaction is confirmed end-to-end: a nonce in the injected text
+  round-trips through the PreCompact wake packet, and completion
+  requires the transcript's compaction boundary. Missing either
+  raises a safety latch that never re-injects; `resolve <sid>` clears
+  it after you have checked (and cleared) the composer yourself.
+- Ownership is leased (session + pane) under one lock file with
+  heartbeats, so two watchers can never share a pane; a crashed
+  watcher's journal is recovered conservatively on the next adopt.
+- Bounded lifetime: `managed_deadline_hours` (default 24) retires the
+  watcher unconditionally.
 
 ## Modes
 
@@ -51,7 +94,7 @@ no-op otherwise.
 |---|---|
 | `off` (default) | Installing changes nothing. |
 | `advisory` | Everything described above. Cross-platform (pure Python hooks). |
-| `managed` | Reserved for Layer 2 (a watcher that types `/compact` into your tmux pane at safe moments). NOT BUILT YET — currently behaves as `advisory` plus an activity marker written at each Stop (nothing reads it yet). |
+| `managed` | Everything above, plus an opt-in per-session watcher (started explicitly via the CLI below) that types `/compact` into your tmux pane at verified-idle moments. Linux/WSL only in this release. |
 
 Enable per config (`~/.claude/compact-manager.json`) or env:
 `COMPACT_MANAGER_MODE=advisory`.
@@ -87,14 +130,29 @@ Env `COMPACT_MANAGER_<NAME>` or `~/.claude/compact-manager.json`
 | `ledger` / `ledger_max_bytes` | `true` / 5MB | Audit log of injections and packets, rotated at the size limit. |
 | `state_ttl_days` | `7` | Per-session files older than this are cleaned up (checked at most once a day). |
 
+Managed-mode knobs (same file/env, all clamped to safe ranges):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `managed_trigger_pct` | `hard_pct` | Watcher injects at this fraction of the window; must be above `soft_pct`. |
+| `managed_stable_ms` | `300` | Pane must be byte-identical across this window before typing (min 200). |
+| `managed_poll_s` | `15` | Watcher tick (min 5; backs off to 60 far from threshold). |
+| `managed_ack_timeout_s` | `120` | No PreCompact ack within this → exactly one retry, then a safety latch (min 30). |
+| `managed_completion_timeout_s` | `300` | Ack but no transcript boundary within this → safety latch (min: the ack timeout). |
+| `managed_deadline_hours` | `24` | Unconditional watcher lifetime cap (1–72). |
+| `managed_pane_commands` | `["claude"]` | `pane_current_command` whitelist; anything else defers. |
+
 ## Limitations
 
 - Built on undocumented transcript internals (measured shapes pinned in
   `docs/spikes/compact-manager.md`); format drift degrades to silence.
 - Measurement reflects the last completed model call.
 - The advisory can only *advise*: neither hooks nor the model can
-  invoke `/compact` in current Claude Code. The model can ask you, or
-  wrap up cleanly and let native compaction hit a prepared session.
+  invoke `/compact` in current Claude Code. `managed` mode closes that
+  gap via tmux; outside managed mode the model can ask you, or wrap up
+  cleanly and let native compaction hit a prepared session.
+- Managed mode is Linux/WSL + tmux only (it reads `/proc` to bind the
+  pane to the exact claude process). Advisory mode is unaffected.
 - Headless (`-p`) sessions never see the SessionStart copy; the
   durable drain covers them on their next prompt.
 

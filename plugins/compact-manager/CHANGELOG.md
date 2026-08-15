@@ -1,5 +1,34 @@
 # Changelog — compact-manager
 
+## 0.2.0 — 2026-08-15
+
+Layer 2: `managed` mode. A per-session watcher daemon (started
+explicitly with `bin/compact-manager start|adopt`; installing the
+plugin alone still changes nothing) tails the session transcript with
+its own durable cursor and types `/compact` into the session's tmux
+pane at verified-idle moments — behind a six-rail ladder (identity
+conjunction on the pane/tty/foreground-process walk, empty-composer
+signature, stability window, type-without-Enter, exact composer
+verify, full revalidation before Enter) that aborts on any doubt and
+never clears the composer. Injection is confirmed end-to-end: a nonce
+round-trips through the PreCompact wake packet and completion
+requires the transcript's compaction boundary; a missing ack gets
+exactly one retry, then a safety latch that never re-injects and
+clears only via operator `resolve` or a real compaction. Ownership is
+a session+pane lease pair under one flock'd transaction file with
+10s heartbeats (two watchers can never share a pane; reclaim needs a
+stale heartbeat AND a dead pid+starttime); every action is journaled
+fsync-first, and crash recovery maps each journal tail to its
+conservative state (typed-but-unconfirmed → SUBMISSION_UNCERTAIN /
+CLEANUP_REQUIRED, resolved only by a human). Triggers: threshold
+(`managed_trigger_pct`, default `hard_pct`) or a model-written
+request file advertised by the advisory. `start` runs claude with no
+shell under the pane; `adopt` targets an existing (even attended)
+pane and requires `--attended` acknowledging the worst-case-race
+residual. Linux/WSL only; advisory mode unaffected. New `managed_*`
+config knobs, all clamped. Hooks, install scripts, and the plugin's
+hook surface are unchanged.
+
 ## 0.1.1 — 2026-08-15
 
 Post-release audit round (live M2 verification + two fresh-context
