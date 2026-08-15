@@ -35,10 +35,10 @@ Unresolvable targets are silent; every path fails open. Address forms
 understood: the peer's registry name, `name [ref]`, and
 `uds:/…/cc-socks/<pid>.sock`. Liveness requires the registry's recorded
 process start time to match the live process (a recycled pid never
-counts); name collisions resolve to the newest entry — unless the send
-carried a `[ref]` disambiguator, in which case ambiguity means silence
-(the ref isn't derivable from disk, and gating a guessed session would
-be worse than no warning).
+counts). If two DIFFERENT live sessions share the target name, the
+guard stays silent — with or without a `[ref]` disambiguator (the ref
+isn't derivable from disk, and gating a guessed session would be worse
+than no warning); two pids for one resumed session are fine.
 
 ## Install
 
