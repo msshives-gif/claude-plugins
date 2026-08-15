@@ -452,6 +452,10 @@ def _registry_entry(pid, sessions_dir):
 
 
 def derive_transcript(cwd, session_id, projects_dir=None):
+    """Derive the transcript PATH (containment-checked). The file may not
+    exist yet — a virgin session writes it on its first turn, and start
+    binds before any turn; the watcher waits (transcript_pending, bounded
+    by its deadline) and can never inject until a real scan catches up."""
     projects = os.path.realpath(projects_dir or
                                 os.path.expanduser("~/.claude/projects"))
     # Claude Code's project slug maps every non-alphanumeric character to
@@ -460,7 +464,7 @@ def derive_transcript(cwd, session_id, projects_dir=None):
     slug = re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
     target = os.path.realpath(os.path.join(projects, slug,
                                            "%s.jsonl" % session_id))
-    if not target.startswith(projects + os.sep) or not os.path.isfile(target):
+    if not target.startswith(projects + os.sep):
         return None
     return target
 
@@ -537,7 +541,7 @@ def default_cursor():
             "current": 0, "boundary_count": 0, "last_boundary": None,
             "anchor": None, "model": "", "discard_to_newline": False,
             "trailing_fragment": False, "caught_up": False,
-            "_scan_error": False}
+            "_scan_error": False, "_scan_missing": False}
 
 
 def load_cursor(path):
@@ -602,11 +606,15 @@ def _reset_cursor(old, st):
 
 def scan_cursor(cursor, transcript, cap=SCAN_MAX_BYTES):
     """Scan complete rows against one stat snapshot and re-stat at end."""
-    cursor = dict(cursor, _scan_error=False)
+    cursor = dict(cursor, _scan_error=False, _scan_missing=False)
     try:
         snapshot = os.stat(transcript)
         if not stat.S_ISREG(snapshot.st_mode):
             return dict(cursor, caught_up=False, _scan_error=True)
+    except FileNotFoundError:
+        # Not-yet-created (virgin session) is a WAIT, not a failure.
+        return dict(cursor, caught_up=False, _scan_error=True,
+                    _scan_missing=True)
     except OSError:
         return dict(cursor, caught_up=False, _scan_error=True)
     initialized = cursor.get("device") is not None
@@ -1339,7 +1347,10 @@ class Watcher:
                     old_generation, request["request_id"]),
                 receipt_mtime=request["receipt_mtime"])
         self.cursor = scan_cursor(self.cursor, self.binding["transcript_path"])
+        if self.cursor.get("_scan_missing"):
+            return True, "transcript_pending"
         if self.cursor.get("_scan_error"):
+            self._journal_typed_hazard("transcript_unavailable")
             return False, "transcript_unavailable"
         save_cursor(self.paths["scan"], self.cursor)
         current_generation = generation(self.cursor)
@@ -1516,6 +1527,13 @@ class Watcher:
             before = (self.cursor.get("file_epoch"), self.cursor.get("offset"))
             self.cursor = scan_cursor(
                 self.cursor, self.binding["transcript_path"], SCAN_MAX_BYTES)
+            if self.cursor.get("_scan_missing"):
+                # Virgin session: wait for the first turn to create the
+                # transcript (deadline-bounded; claude death retires).
+                if not self._heartbeat_due(self.monotonic()):
+                    return
+                self.wait(min(self.cfg["managed_poll_s"], HEARTBEAT_S))
+                continue
             if self.cursor.get("_scan_error"):
                 self._journal_typed_hazard("transcript_unavailable")
                 return

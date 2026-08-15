@@ -155,8 +155,8 @@ accept_trust $SES
 wait_idle $SES 120 || { row launch fail "claude never idle: $(tmux capture-pane -t $SES -p | tail -3 | tr '\n' ' ')"; exit 1; }
 PANE="$(pane_of $SES)"
 row launch info "pane=$PANE"
-# A fresh session has no transcript file until its first turn; adopt
-# correctly refuses (transcript_missing) until one exists.
+# First turn creates the transcript; the suite's scenarios need real
+# content anyway (a virgin session would just bind transcript-pending).
 send_turn $SES "Reply with exactly one word: ready" 120 || row first_turn fail "turn timeout"
 
 # --- s01: adopt without --attended
@@ -248,7 +248,7 @@ else
   row s08_half_typed fail "composer: $CAP"
 fi
 tmux send-keys -t $SES C-u; sleep 1   # harness clears; the watcher may not
-boundary2_done() { [ "$(jstates "$SID" | grep -c BOUNDARY_CONFIRMED)" -ge 2 ]; }
+boundary2_done() { [ "$(jstates "$SID" | tr ',' '\n' | grep -c BOUNDARY_CONFIRMED)" -ge 2 ]; }
 wait_for 360 boundary2_done && row s08_resume pass "injected after clear" \
   || row s08_resume fail "states=$(jstates "$SID")"
 
@@ -283,12 +283,21 @@ sleep 10
 python3 - "$STATE" "$SID" <<'EOF'
 import json, os, sys, time
 state, sid = sys.argv[1], sys.argv[2]
+# The synthetic crash record must carry the CURRENT generation (from
+# the watcher's scan file) - with a stale generation the next watcher
+# correctly COMPLETES it via generation advance instead of recovering
+# it (run-10 lesson).
+scan = json.load(open(os.path.join(state, "managed", "watchers",
+                                   f"{sid}.scan.json")))
+boundary = scan.get("last_boundary") or {}
+generation = {"file_epoch": scan.get("file_epoch", 0),
+              "last_boundary_offset": boundary.get("offset"),
+              "last_boundary_sha256": boundary.get("sha256_of_row")}
 path = os.path.join(state, "managed", "watchers", f"{sid}.journal.jsonl")
 rec = {"schema": 1, "ts": time.time(), "state": "TYPED_VERIFIED",
        "attempt_id": "deadattempt", "run_token": "dead000000000000",
        "nonce": "d" * 16, "nonces": ["d" * 16],
-       "generation": {"file_epoch": 0, "last_boundary_offset": None,
-                       "last_boundary_sha256": None},
+       "generation": generation,
        "retry_n": 0, "packet_seq_at_prepare": 0,
        "attempt_packet_seq_floor": 0,
        "timers": {"boot_id": "dead-boot"}}

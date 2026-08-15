@@ -110,6 +110,16 @@ class BindingTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(binding["transcript_path"], transcript)
 
+    def test_virgin_session_binds_with_pending_transcript(self):
+        # start spawns claude BEFORE any turn exists; the path derives
+        # (containment-checked) even though the file does not exist yet.
+        os.unlink(self.transcript)
+        binding, error = managed.build_binding(
+            "", "%1", True, self.runner, self.proc, self.sessions,
+            self.projects)
+        self.assertIsNone(error)
+        self.assertEqual(binding["transcript_path"], self.transcript)
+
     def test_rejects_registry_procstart_mismatch(self):
         with open(os.path.join(self.sessions, "20.json"), "w") as fh:
             json.dump({"procStart": "9", "sessionId": "session-1234",
@@ -977,6 +987,15 @@ class TickWiringTests(unittest.TestCase):
         return managed.Watcher(self.binding, self.cfg, self.paths,
                                run_tmux=tmux, proc_root=self.proc,
                                wait=lambda seconds: None)
+
+    def test_missing_transcript_is_pending_not_retire(self):
+        # A virgin session's watcher waits for the first turn to create
+        # the transcript; it must not retire (deadline bounds the wait).
+        watcher = self.make_watcher([], LadderTmux([IDLE]))
+        if os.path.exists(self.transcript):
+            os.unlink(self.transcript)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "transcript_pending"))
 
     def test_copy_mode_is_transient_not_retire(self):
         tmux = LadderTmux([IDLE])
