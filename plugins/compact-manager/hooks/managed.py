@@ -1617,6 +1617,15 @@ def spawn_watcher(binding, timeout=10.0):
             child = os.fork()
             if child > 0:
                 os._exit(0)
+            # Daemon fd hygiene: the watcher must NOT inherit the CLI's
+            # stdio — a caller capturing our output (command substitution,
+            # a pipe) would otherwise block until the watcher exits, hours
+            # later. The handshake uses its own dedicated pipe fds.
+            devnull = os.open(os.devnull, os.O_RDWR)
+            for stdio in (0, 1, 2):
+                os.dup2(devnull, stdio)
+            if devnull > 2:
+                os.close(devnull)
             argv = [sys.executable, os.path.abspath(__file__), "watch",
                     "--binding-json", json.dumps(binding),
                     "--cancel-fd", str(cancel_r), "--ready-fd", str(ready_w)]
