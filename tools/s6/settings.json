@@ -1,0 +1,8 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {"matcher": "manual", "hooks": [{"type": "command", "command": "python3 REPLACE_WITH_HARNESS_DIR/log_hook.py || true", "timeout": 5}]},
+      {"matcher": "auto", "hooks": [{"type": "command", "command": "python3 REPLACE_WITH_HARNESS_DIR/log_hook.py || true", "timeout": 5}]}
+    ]
+  }
+}

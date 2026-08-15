@@ -1,0 +1,10 @@
+{"ts": 1786783438, "scenario": "launch", "ok": true, "pane_cmd_live": "claude", "clients": 0}
+{"ts": 1786783443, "scenario": "b_busy", "verdict": {"sent": false, "aborted_at": "R3_pane_changed", "detail": ""}}
+{"ts": 1786783444, "scenario": "f_half_typed", "verdict": {"sent": false, "aborted_at": "R2_composer_not_empty", "detail": "❯ rm -rf /tmp/half-typed-do-not-run"}, "composer_after": "\u276f\u00a0rm -rf /tmp/half-typed-do-not-run\n"}
+{"ts": 1786783446, "scenario": "c_race", "verdict": {"sent": false, "aborted_at": "R3_pane_changed", "detail": ""}, "composer_after": "\u276f\u00a0USERRACE\n"}
+{"ts": 1786783450, "scenario": "a_happy", "nonce": "cm-s6-23175560", "verdict": {"sent": true, "aborted_at": null, "detail": ""}}
+{"ts": 1786783450, "scenario": "a_ack", "nonce_in_precompact": 1}
+{"ts": 1786783452, "scenario": "e_clients", "clients_seen": 0}
+{"ts": 1786783459, "scenario": "d_shell", "pane_cmd": "", "verdict": {"sent": false, "aborted_at": "R1_no_pane", "detail": ""}, "pane_tail": ""}
+{"ts": 1786783510, "scenario": "d2_real_shell", "pane_cmd": "bash", "verdict": {"sent": false, "aborted_at": "R1_shell", "detail": "bash"}}
+{"ts": 1786783511, "scenario": "d3_shell_halftyped", "verdict": {"sent": false, "aborted_at": "R1_shell", "detail": "bash"}, "danger_file_exists": false}
