@@ -41,6 +41,17 @@ def run(payload, cfg):
                                     cfg["rearm_band_pct"])
         if advisory:
             st["armed_at_ts"] = time.time()
+            if cfg["mode"] == "managed":
+                req = os.path.join(
+                    cfg["state_dir"], "managed", "requests",
+                    f"{cm.path_component(session_id)}.json")
+                advisory += (
+                    f" (managed mode: when you are AT the natural "
+                    f"boundary, you may instead request compaction "
+                    f"yourself by writing "
+                    f'{{"request_id": "<8-64 letters/digits/dashes>"}} '
+                    f"to {req} — the watcher compacts at the next "
+                    f"safe idle moment.)")
             parts.append(advisory)
         st["advisory_level"] = level
         cm.save_state(cfg, paths, st)

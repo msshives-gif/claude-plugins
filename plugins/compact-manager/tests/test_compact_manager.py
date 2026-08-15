@@ -329,6 +329,40 @@ class PacketTests(unittest.TestCase):
         self.assertGreater(len(text), 19_000)
 
 
+class ManagedIntegrationTests(unittest.TestCase):
+    """Layer-1 pieces the managed mode relies on."""
+
+    def test_reorientation_strips_nonce_prefix(self):
+        p = {"pre_current": 1000, "pre_peak": 1000,
+             "custom_instructions": "[cm-a1b2c3d4] keep the plan",
+             "handoff_fresh": False, "handoff_excerpt": "",
+             "handoff_path": "/h.md"}
+        text = cm.reorientation_text(p)
+        self.assertIn('"keep the plan"', text)
+        self.assertNotIn("cm-a1b2c3d4", text)
+        # A plain user instruction is untouched.
+        p["custom_instructions"] = "keep the plan"
+        self.assertIn('"keep the plan"', cm.reorientation_text(p))
+
+    def test_stop_marker_is_pure_noop_even_managed(self):
+        import subprocess
+        hooks = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "hooks")
+        with tempfile.TemporaryDirectory() as d:
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith("COMPACT_MANAGER_")}
+            env.update(COMPACT_MANAGER_MODE="managed",
+                       COMPACT_MANAGER_STATE_DIR=d,
+                       COMPACT_MANAGER_CONFIG="/nonexistent/x.json")
+            p = subprocess.run(
+                [sys.executable, os.path.join(hooks, "stop_marker.py")],
+                input=json.dumps({"session_id": "s1"}),
+                capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stdout.strip(), "")
+            self.assertEqual(os.listdir(d), [])  # writes nothing
+
+
 class StateValidationTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

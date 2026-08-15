@@ -15,6 +15,7 @@ Everything fails open; hooks exit 0 on every path.
 import json
 import math
 import os
+import re
 import stat as stat_module
 import sys
 import time
@@ -578,7 +579,13 @@ def reorientation_text(packet, cap=6000):
     parts = [f"[compact-manager] Reorientation after compaction "
              f"(context was ~{packet.get('pre_current', 0) / 1000:.0f}k, "
              f"peak ~{packet.get('pre_peak', 0) / 1000:.0f}k)."]
-    ci = packet.get("custom_instructions")
+    ci = packet.get("custom_instructions") or ""
+    # A managed-mode injection prefixes a correlation nonce
+    # ("[cm-…] …"); it is watcher plumbing, not instructions — strip
+    # it from the display (the raw value stays in the packet).
+    m = re.match(r"\[cm-[0-9a-f]{4,32}\]\s*", ci)
+    if m:
+        ci = ci[m.end():]
     if ci:
         parts.append(f'Compact instructions in effect: "{ci}".')
     if packet.get("handoff_fresh") and packet.get("handoff_excerpt"):

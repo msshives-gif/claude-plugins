@@ -1,11 +1,10 @@
-"""Stop: idle-epoch stamp for the Layer-2 watcher. Managed mode is not
-built yet, so this is a documented no-op unless mode == "managed" —
-and even then it only writes a timestamp file. Exists now so the
-hooks.json surface is stable across Layer 2's arrival."""
-import json
+"""Stop: reserved no-op. The rev-2 activity write was cut by the M3
+plan audits (stale-by-construction — nothing marks "busy" again — and
+the watcher's ladder must not trust it; the composer and
+foreground-process checks are the load-bearing idle signals). The
+hook stays wired so the hooks.json surface is stable."""
 import os
 import sys
-import time
 
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -17,20 +16,7 @@ except Exception as e:
 
 
 def main():
-    payload = cm.read_payload()
-    cfg = cm.load_config()
-    if cfg["mode"] != "managed":
-        return
-    session_id = payload.get("session_id") or ""
-    if not session_id:
-        return
-    d = os.path.join(cfg["state_dir"], "activity")
-    cm._private_makedirs(d)
-    tmp = os.path.join(d, f".{os.getpid()}.tmp")
-    with open(tmp, "w") as fh:
-        json.dump({"state": "idle", "epoch": time.time_ns()}, fh)
-    os.replace(tmp, os.path.join(
-        d, f"{cm.path_component(session_id)}.json"))
+    cm.read_payload()  # drain stdin; deliberately nothing else
 
 
 if __name__ == "__main__":
