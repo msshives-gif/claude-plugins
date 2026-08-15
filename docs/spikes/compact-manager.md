@@ -95,3 +95,37 @@ Observed:
   n=2). Fix: a boundary row resets `current` to
   `compactMetadata.postTokens` (0 if absent); any later usage row
   overrides. Regression-pinned in ScanTests.
+
+## S6 — destructive-safety ladder for tmux injection (2026-08-15)
+
+Harness: a six-rail injector (R1 pane_current_command whitelist, R2
+idle-composer signature, R3 stability window + command re-check, R4
+type WITHOUT Enter, R5 exact-composer verify, R6 Enter + submission
+verify; never clears the line) run adversarially against a live haiku
+session. Results:
+
+- Half-typed user text in the composer (incl. an rm -rf string):
+  aborted at R2, ZERO keystrokes typed, user text untouched.
+- User typing 150ms into the ladder: aborted at R3, zero pollution.
+- Busy/streaming model: aborted at R3 (R2 catches the spinner case).
+- Real shell pane (bash): aborted at R1; with a half-typed dangerous
+  command in the shell, nothing was typed and nothing executed
+  (canary file never created).
+- Happy path: full ladder passed and the nonce round-tripped into
+  PreCompact(manual).custom_instructions — authenticated ack works
+  through the ladder, closing the loop S5 opened.
+- Live claude reports pane_current_command == "claude" exactly ->
+  R1 can be a strict whitelist. A claude-as-pane-command session
+  DIES on exit (no shell beneath), which R1 reports as no-pane.
+- Multi-client count via list-clients: not exercisable from inside
+  tmux (0 seen); needs a real second terminal to verify — M3 keeps
+  it as an advisory signal, not a load-bearing rail.
+
+Residual windows, for the M3 plan: (1) keystrokes landing between the
+R5 verify and R6 Enter (~sub-400ms) — pane is verifiably claude's
+composer at that point, so the worst case is a /compact with a
+garbage suffix, not shell execution; (2) claude exiting to an
+underlying shell mid-ladder after R3's re-check (~1s window) — M3
+adds a pane_current_command re-check immediately before Enter to
+shrink this to milliseconds. Verdict: attended-session injection is
+viable with the ladder as primary defense.
