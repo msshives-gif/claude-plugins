@@ -1,28 +1,47 @@
 #!/bin/bash
 # Remove every subagent-context hook entry from ~/.claude/settings.json
 # (or a settings file given as $1). Backs up first. Removes individual
-# hook entries (not whole groups), matching this clone's hook scripts by
-# basename — so it works whatever the clone directory is named, and
-# never removes a user's own hooks that share a group.
+# hook entries (not whole groups), never a user's own hooks that share
+# a group.
+#
+# Matching is deliberately narrow: (a) THIS clone's exact hook paths,
+# so an oddly-named clone uninstalls what its own install.sh wrote; and
+# (b) standard-directory paths (…/subagent-context/hooks/<script> and
+# the pre-rename …/subagent-gauge/hooks/<script>), so installs from a
+# default-named clone elsewhere are cleaned too. A bare basename or
+# repo-name match would also remove sibling plugins under plugins/ or
+# unrelated hooks that happen to be named hooks/guard.py — never do
+# that. Known edge: an install made from a RENAMED clone at another
+# path must be uninstalled from that clone.
 set -euo pipefail
 
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SETTINGS="${1:-$HOME/.claude/settings.json}"
 
-python3 - "$SETTINGS" <<'PY'
+python3 - "$SETTINGS" "$REPO_DIR" <<'PY'
 import json, os, shutil, sys, time
 
-settings_path = sys.argv[1]
+settings_path, repo = sys.argv[1], sys.argv[2]
 if not os.path.isfile(settings_path):
     print(f"{settings_path} does not exist; nothing to do")
     sys.exit(0)
 
-# Match ONLY this plugin's hook scripts by path suffix. A bare
-# "subagent-context" marker would also match sibling plugins installed
-# from plugins/<name>/ in this repo (their absolute paths contain the
-# repo directory name) and rip their hooks out. "subagent-gauge" stays
-# for pre-rename installs; no sibling can live under that path.
-MARKERS = ("/hooks/observer.py", "/hooks/drain.py", "/hooks/guard.py",
-           "subagent-gauge")
+SCRIPTS = ("observer.py", "drain.py", "guard.py")
+EXACT = tuple(os.path.join(repo, "hooks", s).replace("\\", "/")
+              for s in SCRIPTS)
+HISTORICAL = tuple(f"/{name}/hooks/{s}"
+                   for name in ("subagent-context", "subagent-gauge")
+                   for s in SCRIPTS)
+
+
+def is_ours(command):
+    # Normalize Windows separators so manual installs with backslash
+    # paths still match.
+    c = command.replace("\\", "/")
+    if "/plugins/" in c:
+        return False  # sibling plugins live under plugins/, never ours
+    return any(p in c for p in EXACT) or any(h in c for h in HISTORICAL)
+
 
 with open(settings_path) as fh:
     settings = json.load(fh)
@@ -35,8 +54,7 @@ for event, groups in list(settings.get("hooks", {}).items()):
     new_groups = []
     for g in groups:
         entries = g.get("hooks", [])
-        kept = [e for e in entries
-                if not any(m in e.get("command", "") for m in MARKERS)]
+        kept = [e for e in entries if not is_ours(e.get("command", ""))]
         removed += len(entries) - len(kept)
         if kept:
             g = dict(g, hooks=kept)

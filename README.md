@@ -107,7 +107,7 @@ or a key in `~/.claude/subagent-context.json` (env wins; point
 | `block_tokens` | `350000` | Above this, messaging the agent needs your confirmation. `0` turns this off. |
 | `compaction_action` | `block` | What a compacted agent triggers: `off` (nothing — size thresholds still apply), `warn`, or `block` (confirmation, root session only). |
 | `report_min_tokens` | `0` | Only report agents at least this big. `0` = report every stop. |
-| `models` | `{}` | Per-model overrides for the three knobs above — see below. |
+| `models` | `{}` | Per-model overrides for the four knobs above — see below. |
 | `system_message` | `true` | Also show each report to you in the UI. |
 | `drain_batch_max` | `20` | Max reports delivered per tool call. |
 | `flush_grace_ms` | `4000` | How long to wait for a stopping agent's transcript to finish being written. |

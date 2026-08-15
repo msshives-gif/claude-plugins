@@ -438,9 +438,13 @@ class RunHookMixin:
 
     def run_hook(self, script, payload, state_dir, extra_env=None):
         import subprocess
-        env = dict(os.environ,
-                   SUBAGENT_CONTEXT_CONFIG="/nonexistent/subagent-context-test.json",
-                   SUBAGENT_CONTEXT_STATE_DIR=state_dir)
+        # Scrub ambient SUBAGENT_CONTEXT_* so a developer's own config
+        # can't leak into subprocess assertions.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("SUBAGENT_CONTEXT_")}
+        env.update(
+            SUBAGENT_CONTEXT_CONFIG="/nonexistent/subagent-context-test.json",
+            SUBAGENT_CONTEXT_STATE_DIR=state_dir)
         env.update(extra_env or {})
         p = subprocess.run(
             [sys.executable, os.path.join(self.HOOKS_DIR, script)],
@@ -671,12 +675,32 @@ class GuardFreshReadTests(unittest.TestCase):
         self.assertEqual(compactions, 0)
         self.assertTrue(live)
 
-    def test_fresh_read_never_weakens_without_compaction(self):
+    def test_truncated_transcript_never_weakens(self):
+        # The fresh scan's peak (60k) can't contain the stored 380k, so
+        # the file was truncated/replaced: fall back to the max, and the
+        # wording must not claim the stored number is live.
         write_jsonl(self.path, [usage_row(10, 50_000, 9_000, 990,
                                           "end_turn")])
         rec = {"current": 380_000, "compactions": 1, "transcript": self.path}
         current, compactions, live = self.guard.live_reading(rec)
         self.assertEqual(current, 380_000)
+        self.assertEqual(compactions, 1)
+        self.assertFalse(live)
+
+    def test_equal_count_stale_current_resets(self):
+        # Flush-order hazard: the observer stored the PRE-compaction
+        # current (380k) together with the NEW compaction count (the
+        # summary row flushed before the post-compaction terminal row).
+        # A fresh scan with equal counts must still win: its peak
+        # contains the stored reading, proving it saw the same history.
+        write_jsonl(self.path, [
+            usage_row(10, 370_000, 9_000, 990, "end_turn"),
+            {"isCompactSummary": True},
+            usage_row(10, 50_000, 9_000, 990, "end_turn"),
+        ])
+        rec = {"current": 380_000, "compactions": 1, "transcript": self.path}
+        current, compactions, live = self.guard.live_reading(rec)
+        self.assertEqual(current, 60_000)
         self.assertEqual(compactions, 1)
         self.assertTrue(live)
 
@@ -803,13 +827,55 @@ class GuardCompactionActionTests(RunHookMixin, unittest.TestCase):
         self.assertNotIn("permissionDecision", hso)
 
 
+class ObserverCompactionActionTests(RunHookMixin, unittest.TestCase):
+    """compaction_action must reach the observer's report filter: under
+    "off" a small compacted agent no longer forces a report past
+    report_min_tokens; under "warn" it still does."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.state = os.path.join(self.dir.name, "state")
+
+    def _stop_compacted_agent(self, action):
+        payload = fixture("subagent_stop_nested.json")
+        meta = fixture("meta_nested.json")
+        d = os.path.join(self.dir.name, "sess", "subagents")
+        os.makedirs(d, exist_ok=True)
+        atp = os.path.join(d, f"agent-{payload['agent_id']}.jsonl")
+        write_jsonl(atp, [{"isCompactSummary": True},
+                          usage_row(10_000, 0, 0, 500, "end_turn")])
+        with open(atp[:-6] + ".meta.json", "w") as fh:
+            json.dump(meta, fh)
+        payload["agent_transcript_path"] = atp
+        self.run_hook("observer.py", payload, self.state, extra_env={
+            "SUBAGENT_CONTEXT_COMPACTION_ACTION": action,
+            "SUBAGENT_CONTEXT_REPORT_MIN_TOKENS": "50000"})
+        cfg = dict(sg._DEFAULTS, state_dir=self.state)
+        return sg.drain_queue(cfg, payload["session_id"], 10,
+                              consumer_agent=meta["parentAgentId"])
+
+    def test_off_suppresses_small_compacted_report(self):
+        self.assertEqual(self._stop_compacted_agent("off"), [])
+
+    def test_warn_still_reports_small_compacted_agent(self):
+        q = self._stop_compacted_agent("warn")
+        self.assertEqual(len(q), 1)
+        self.assertIn("COMPACTED x1", q[0])
+
+
 class CompactionActionConfigTests(unittest.TestCase):
     def setUp(self):
+        # Scrub ambient values so a developer's own env can't leak in.
+        self._saved = {k: os.environ.pop(k) for k in list(os.environ)
+                       if k.startswith("SUBAGENT_CONTEXT_")}
         os.environ["SUBAGENT_CONTEXT_CONFIG"] = "/nonexistent/subagent-context-test.json"
 
     def tearDown(self):
-        os.environ.pop("SUBAGENT_CONTEXT_CONFIG", None)
-        os.environ.pop("SUBAGENT_CONTEXT_COMPACTION_ACTION", None)
+        for k in list(os.environ):
+            if k.startswith("SUBAGENT_CONTEXT_"):
+                del os.environ[k]
+        os.environ.update(self._saved)
 
     def test_default_is_block(self):
         self.assertEqual(sg.load_config()["compaction_action"], "block")
@@ -859,6 +925,13 @@ class FormatTests(unittest.TestCase):
         res = {"current": 40_000, "peak": 41_000, "compactions": 0}
         line = sg.fmt_report("worker", "", res, 150_000)
         self.assertNotIn("OVER THRESHOLD", line)
+
+    def test_default_arg_treats_compaction_as_warn(self):
+        # Callers that predate the compaction_action parameter must keep
+        # the pre-0.4.0 behavior: a compacted result escalates.
+        res = {"current": 40_000, "peak": 41_000, "compactions": 1}
+        line = sg.fmt_report("worker", "", res, 150_000)
+        self.assertIn("OVER THRESHOLD", line)
 
     def test_compaction_off_suppresses_over_threshold(self):
         res = {"current": 40_000, "peak": 41_000, "compactions": 1}

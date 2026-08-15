@@ -52,18 +52,23 @@ def live_reading(rec):
     transcript, so the guard judges the agent on what it is NOW rather
     than what it was at its last stop.
 
-    Merge rules (never weaken the guard by accident):
-    - compactions: max of stored and fresh (a monotonic count).
-    - current: if the fresh scan shows MORE compactions than stored, a
-      real compaction reset the context — accept the fresh current (a
-      stale pre-compaction size must not keep blocking under
-      compaction_action "off"/"warn"). Otherwise take the max.
+    Merge rule: the transcript is append-only, so a fresh full scan
+    whose peak contains the stored reading (fresh peak >= stored
+    current) has seen every row the observer saw — it is simply
+    authoritative, including a LOWER post-compaction current. (The
+    stored record can pair a pre-compaction current with the new
+    compaction count when the summary row flushed before the
+    post-compaction terminal row; a containment-proven fresh scan is
+    the only stale-proof answer.) If containment fails, the file was
+    truncated or replaced — never weaken on partial data: take the max.
+    compactions is a monotonic max either way.
+
     Falls back to the stored numbers on any error (no transcript field,
     unreadable/oversized file) — the guard stays fail-open and inside
     its 5s budget: grace_ms=0 means exactly one bounded parse.
 
-    Returns (current, compactions, live) where live says whether a
-    fresh scan succeeded (for honest warn wording).
+    Returns (current, compactions, live) where live says whether the
+    presented number reflects the fresh scan (for honest warn wording).
     """
     current = rec.get("current", 0)
     compactions = rec.get("compactions", 0)
@@ -77,11 +82,11 @@ def live_reading(rec):
             fresh = None
     if not fresh:
         return current, compactions, False
-    if fresh["compactions"] > compactions:
-        current = fresh["current"]
-    else:
-        current = max(current, fresh["current"])
-    return current, max(compactions, fresh["compactions"]), True
+    compactions = max(compactions, fresh["compactions"])
+    if fresh["peak"] >= current:
+        return fresh["current"], compactions, True
+    return (max(current, fresh["current"]), compactions,
+            fresh["current"] >= current)
 
 
 def main():

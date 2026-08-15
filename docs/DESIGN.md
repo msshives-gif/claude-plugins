@@ -114,13 +114,18 @@ agent's last stop, so a re-tasked agent working for half an hour was
 judged on a long-stale number. The guard now re-scans the target's
 transcript at decision time (`measure(transcript, grace_ms=0)` — one
 bounded parse, no flush wait, capped at `FRESH_READ_MAX_BYTES` so a
-pathological file can't eat the 5s hook budget). Merge rules: the
-compaction count is a monotonic max; `current` takes the fresh value
-when the fresh scan saw a NEW compaction (the context genuinely reset —
-keeping the stale pre-compaction size would defeat
-`compaction_action: "off"`), otherwise the max. Any failure falls back
-to the stored numbers; the warn text says which reading it presents
-("is ~Nk" live vs "was ~Nk at its last stop").
+pathological file can't eat the 5s hook budget). Merge rule
+(containment): the transcript is append-only, so a fresh scan whose
+`peak` >= the stored `current` has provably seen every row the observer
+saw and is authoritative — including a LOWER post-compaction current.
+This survives the flush-order hazard where the observer stored a
+pre-compaction current together with the new compaction count (summary
+row flushed before the post-compaction terminal row): equal counts,
+but the fresh scan still wins on containment. If containment fails the
+file was truncated or replaced — fall back to the max, never weakening
+on partial data. The compaction count is a monotonic max either way.
+Any failure falls back to the stored numbers; the warn text says which
+reading it presents ("is ~Nk" live vs "was ~Nk at its last stop").
 
 Two sub-choices deliberately not built: **no write-back** of the fresh
 reading to the state record (it would race the observer's lockless
