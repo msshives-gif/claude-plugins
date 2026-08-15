@@ -205,10 +205,11 @@ def read_json_inode(path):
 
 
 def parse_proc_stat(text):
-    """Return proc(5) tpgid(field 8) and starttime(field 22)."""
+    """Return proc(5) state(3), tpgid(field 8) and starttime(field 22)."""
     try:
         fields = text[text.rindex(")") + 2:].split()
-        return {"tpgid": int(fields[5]), "starttime": int(fields[19])}
+        return {"state": fields[0], "tpgid": int(fields[5]),
+                "starttime": int(fields[19])}
     except Exception:
         return None
 
@@ -569,6 +570,12 @@ def _hash_at(path, row):
     try:
         with open(path, "rb") as fh:
             fh.seek(int(row["offset"]))
+            if "sha256_of_prefix" in row:
+                # Prefix anchor from the oversized-row escape: no complete
+                # row exists to hash, so identity is a bounded prefix.
+                raw = fh.read(int(row.get("prefix_len", 4096)))
+                return (hashlib.sha256(raw).hexdigest() ==
+                        row["sha256_of_prefix"])
             raw = fh.readline()
         expected = row.get("sha256_of_row", row.get("sha256_of_first_row"))
         return bool(raw.endswith(b"\n")) and _row_hash(raw) == expected
@@ -630,6 +637,10 @@ def scan_cursor(cursor, transcript, cap=SCAN_MAX_BYTES):
     if cursor.get("discard_to_newline"):
         # Mid-skip of a row larger than the budget: drop bytes to the
         # next newline, then resume normal parsing (Layer 1's escape).
+        if cursor.get("anchor") is None and data:
+            cursor["anchor"] = {"offset": start, "prefix_len": min(4096, len(data)),
+                                "sha256_of_prefix":
+                                    hashlib.sha256(data[:4096]).hexdigest()}
         nl = data.find(b"\n")
         if nl < 0:
             cursor["offset"] = start + len(data)
@@ -645,6 +656,12 @@ def scan_cursor(cursor, transcript, cap=SCAN_MAX_BYTES):
         # A single row larger than the whole budget can never complete;
         # without this escape the offset would never advance and the
         # cursor would stay uncaught-up forever (managed mode disabled).
+        # A skipped span still needs an identity anchor, or a same-size
+        # truncate-and-regrow behind the offset would go undetected.
+        if cursor.get("anchor") is None:
+            cursor["anchor"] = {"offset": start, "prefix_len": min(4096, len(data)),
+                                "sha256_of_prefix":
+                                    hashlib.sha256(data[:4096]).hexdigest()}
         cursor["offset"] = start + len(data)
         cursor["observed_size"] = snapshot.st_size
         cursor["discard_to_newline"] = True
@@ -715,8 +732,14 @@ def initial_scan(cursor, transcript):
 def journal_append(path, record):
     cm._private_makedirs(os.path.dirname(path))
     data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_APPEND, 0o600)
     try:
+        # A previously torn tail (no trailing newline) would swallow THIS
+        # record into one unparseable line; delimit it first. The torn
+        # fragment stays ignored as invalid JSON.
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            os.write(fd, b"\n")
         # A short write would leave a torn record that recovery ignores,
         # making the durable tail LESS conservative than the action about
         # to be taken; write must complete fully or raise.
@@ -741,6 +764,7 @@ def journal_record(path, state, attempt, now_wall=None, **extra):
         "packet_seq_at_prepare": attempt.get("attempt_packet_seq_floor", 0),
         "attempt_packet_seq_floor": attempt.get("attempt_packet_seq_floor", 0),
         "nonces": list(attempt.get("nonces", [])),
+        "latch_kind": attempt.get("latch_kind"),
         "timers": dict(attempt.get("timers", {})),
     }
     record.update(extra)
@@ -1030,7 +1054,11 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
     # is unprovable — same abort.
     classification = packet_classification(attempt, packet)
     fresh = scan_cursor(dict(cursor), binding["transcript_path"])
+    # The rescan must COMPLETE: caught_up=False means bytes beyond the
+    # budget were not examined and could hold a boundary — an explicitly
+    # incomplete view must not authorize Enter.
     generation_unchanged = (not fresh.get("_scan_error") and
+                            fresh.get("caught_up") and
                             generation_key(generation(fresh)) ==
                             generation_key(attempt["generation"]))
     if (not ok or capture is None or not composer_exact(capture, text) or
@@ -1045,6 +1073,8 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
             detail = "foreign_packet"
         elif fresh.get("_scan_error"):
             detail = "scan_unavailable"
+        elif not fresh.get("caught_up"):
+            detail = "scan_incomplete"
         else:
             detail = "boundary_advanced"
         attempt.update(state="CLEANUP_REQUIRED", reason="R6_prime_%s" % detail)
@@ -1199,10 +1229,39 @@ class Watcher:
         suspends, tmux copy-mode, and a pane hiccup while the bound
         claude is provably still alive. Everything else (tty change,
         command change, claude death, lease loss) retires."""
-        return (reason in ("foreground_lost", "pane_in_mode") or
-                (reason == "pane_missing" and proc_matches(
-                    self.binding["claude_pid"], self.binding["claude_start"],
-                    self.proc_root)))
+        if reason in ("foreground_lost", "pane_in_mode"):
+            return True
+        if reason != "pane_missing":
+            return False
+        # A zombie claude is dead for this purpose — hot-waiting on an
+        # exited-but-unreaped process would spin until the deadline.
+        live = proc_stat(self.binding["claude_pid"], self.proc_root)
+        try:
+            return (live is not None and live.get("state") != "Z" and
+                    live["starttime"] == int(self.binding["claude_start"]))
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def _defer_triggered(self, reason, now):
+        """A pending pre-typing attempt must not stay durably TRIGGERED
+        across a transient: journal the defer once."""
+        if self.attempt and self.attempt.get("state") == "TRIGGERED":
+            self.attempt["state"] = "DEFERRED"
+            self.attempt["reason"] = reason
+            self.attempt.setdefault("timers", {})["next_attempt_at"] = (
+                now + self.backoff)
+            journal_record(self.paths["journal"], "DEFERRED",
+                           self.attempt, reason=reason)
+
+    def _journal_typed_hazard(self, reason):
+        """Retiring with a typed-state attempt leaves bytes of unproven
+        disposition; the durable tail must say so and alert."""
+        if self.attempt and self.attempt.get("state") in (
+                "PREPARED", "TYPED_VERIFIED", "SUBMITTED", "ACKED"):
+            self.attempt.update(state="CLEANUP_REQUIRED", reason=reason)
+            journal_record(self.paths["journal"], "CLEANUP_REQUIRED",
+                           self.attempt, reason=reason)
+            self.alert_if_needed()
 
     def _heartbeat_due(self, now):
         """Beat both leases if due; False means ownership was lost."""
@@ -1230,13 +1289,7 @@ class Watcher:
                     latest.get("packet_seq_at_prepare", 0))
                 self.attempt = latest
         if now >= self.deadline:
-            if self.attempt and self.attempt.get("state") in (
-                    "PREPARED", "TYPED_VERIFIED", "SUBMITTED", "ACKED"):
-                self.attempt.update(state="CLEANUP_REQUIRED",
-                                    reason="watcher_deadline")
-                journal_record(self.paths["journal"], "CLEANUP_REQUIRED",
-                               self.attempt, reason="watcher_deadline")
-                self.alert_if_needed()
+            self._journal_typed_hazard("watcher_deadline")
             return False, "deadline"
         ok, reason = validate_binding(self.binding, self.cfg, self.paths,
                                       self.run_tmux, self.proc_root)
@@ -1244,21 +1297,13 @@ class Watcher:
             typed = (self.attempt and self.attempt.get("state") in
                      ("PREPARED", "TYPED_VERIFIED", "SUBMITTED", "ACKED"))
             if self._transient(reason) and not typed:
-                # A pending pre-typing attempt must not stay durably
-                # TRIGGERED across the transient: journal the defer once.
-                if self.attempt and self.attempt.get("state") == "TRIGGERED":
-                    self.attempt["state"] = "DEFERRED"
-                    self.attempt["reason"] = reason
-                    self.attempt.setdefault("timers", {})["next_attempt_at"] = (
-                        now + self.backoff)
-                    journal_record(self.paths["journal"], "DEFERRED",
-                                   self.attempt, reason=reason)
+                # Heartbeats must survive a long transient (copy mode can
+                # last minutes); a starved lease invites reclaim races.
+                if not self._heartbeat_due(now):
+                    return False, "lease_lost"
+                self._defer_triggered(reason, now)
                 return True, reason
-            if typed:
-                self.attempt.update(state="CLEANUP_REQUIRED", reason=reason)
-                journal_record(self.paths["journal"], "CLEANUP_REQUIRED",
-                               self.attempt, reason=reason)
-                self.alert_if_needed()
+            self._journal_typed_hazard(reason)
             return False, reason
         if not self._heartbeat_due(now):
             return False, "lease_lost"
@@ -1416,22 +1461,31 @@ class Watcher:
         # "Uncapped" means no total budget: process as many bounded chunks as
         # necessary, keeping the fixed heartbeat alive between chunks.
         while not self.cursor.get("caught_up"):
-            if self.stop_requested or self.monotonic() >= self.deadline:
+            if self.stop_requested:
+                return
+            now = self.monotonic()
+            if now >= self.deadline:
+                self._journal_typed_hazard("watcher_deadline")
                 return
             valid, why = validate_binding(
                 self.binding, self.cfg, self.paths, self.run_tmux,
                 self.proc_root)
             if not valid:
                 if not self._transient(why):
+                    # Same contract as tick(): retiring with a recovered
+                    # typed-state attempt must leave a durable hazard.
+                    self._journal_typed_hazard(why)
                     return
-                if not self._heartbeat_due(self.monotonic()):
+                if not self._heartbeat_due(now):
                     return
+                self._defer_triggered(why, now)
                 self.wait(min(self.cfg["managed_poll_s"], HEARTBEAT_S))
                 continue
             before = (self.cursor.get("file_epoch"), self.cursor.get("offset"))
             self.cursor = scan_cursor(
                 self.cursor, self.binding["transcript_path"], SCAN_MAX_BYTES)
             if self.cursor.get("_scan_error"):
+                self._journal_typed_hazard("transcript_unavailable")
                 return
             save_cursor(self.paths["scan"], self.cursor)
             if not self._heartbeat_due(self.monotonic()):
@@ -1453,7 +1507,9 @@ class Watcher:
             interval = self.cfg["managed_poll_s"]
             if pct < self.cfg["managed_trigger_pct"] - 0.20:
                 interval = 60
-            self.wait(max(0.0, min(interval, self.next_heartbeat - now)))
+            # Floor keeps an overdue heartbeat from degenerating into a
+            # zero-sleep hot loop.
+            self.wait(max(0.5, min(interval, self.next_heartbeat - now)))
 
 
 def _write_handshake(fd, value):

@@ -37,12 +37,12 @@ def append_rows(path, rows):
             fh.write(raw + b"\n")
 
 
-def write_proc(root, pid, tpgid, start):
+def write_proc(root, pid, tpgid, start, state="S"):
     directory = os.path.join(root, str(pid))
     os.makedirs(directory, exist_ok=True)
     # After comm: state(3), ppid(4), pgrp(5), session(6), tty_nr(7),
     # tpgid(8), then fields through starttime(22).
-    tail = ["S", "1", str(tpgid), "1", "1", str(tpgid)]
+    tail = [state, "1", str(tpgid), "1", "1", str(tpgid)]
     tail += ["0"] * 13 + [str(start)]
     with open(os.path.join(directory, "stat"), "w") as fh:
         fh.write("%s (odd ) comm) %s\n" % (pid, " ".join(tail)))
@@ -80,7 +80,8 @@ class BindingTests(unittest.TestCase):
 
     def test_proc_field_arithmetic_uses_last_paren(self):
         parsed = managed.proc_stat(10, self.proc)
-        self.assertEqual(parsed, {"tpgid": 20, "starttime": 1010})
+        self.assertEqual(parsed, {"state": "S", "tpgid": 20,
+                                  "starttime": 1010})
 
     def test_binding_walk_and_derived_transcript(self):
         binding, error = managed.build_binding(
@@ -321,10 +322,17 @@ class CursorTests(unittest.TestCase):
     def test_giant_row_discard_keeps_advancing(self):
         # A single row larger than the scan budget must not stall the
         # cursor forever; the discard escape skips to the next newline
-        # and later rows (including boundaries) still parse.
+        # and later rows (including boundaries) still parse. The flag
+        # must survive a save/load round-trip mid-discard.
         append_rows(self.path, [b"x" * 1000, usage_row(42),
                                 boundary_row(post=7)])
-        cursor = managed.default_cursor()
+        saved = os.path.join(self.temp.name, "scan.json")
+        cursor = managed.scan_cursor(managed.default_cursor(), self.path,
+                                     cap=300)
+        self.assertTrue(cursor["discard_to_newline"])
+        managed.save_cursor(saved, cursor)
+        cursor = managed.load_cursor(saved)
+        self.assertTrue(cursor["discard_to_newline"])
         for _ in range(40):
             cursor = managed.scan_cursor(cursor, self.path, cap=300)
             if cursor.get("caught_up"):
@@ -333,6 +341,24 @@ class CursorTests(unittest.TestCase):
         self.assertEqual(cursor["current"], 7)
         self.assertEqual(cursor["boundary_count"], 1)
         self.assertFalse(cursor["discard_to_newline"])
+
+    def test_giant_first_row_gets_prefix_anchor_detecting_regrow(self):
+        # Even an all-skipped file must carry an identity anchor, or a
+        # same-size truncate-and-regrow behind the offset goes unseen.
+        append_rows(self.path, [b"y" * 1000])
+        cursor = managed.default_cursor()
+        for _ in range(20):
+            cursor = managed.scan_cursor(cursor, self.path, cap=300)
+            if cursor.get("caught_up") or not cursor.get("trailing_fragment"):
+                break
+        self.assertIsNotNone(cursor["anchor"])
+        self.assertIn("sha256_of_prefix", cursor["anchor"])
+        epoch = cursor["file_epoch"]
+        with open(self.path, "r+b") as fh:  # same inode, same size
+            fh.seek(0)
+            fh.write(b"z" * 1000)
+        cursor = managed.scan_cursor(cursor, self.path, cap=300)
+        self.assertEqual(cursor["file_epoch"], epoch + 1)
 
     def test_missing_transcript_cannot_remain_caught_up(self):
         append_rows(self.path, [usage_row(10)])
@@ -534,6 +560,19 @@ class JournalRecoveryTests(unittest.TestCase):
         out = managed.recover_attempt(self.path, "new-boot")
         self.assertEqual((out["state"], out["latch_kind"]),
                          ("LATCHED", "SAFETY"))
+
+    def test_torn_tail_is_delimited_before_next_append(self):
+        # A mid-loop write failure leaves a non-newline tail; the NEXT
+        # append must not be swallowed into the same unparseable line.
+        with open(self.path, "wb") as fh:
+            fh.write(b'{"schema": 1, "state": "TRUNC')
+        managed.journal_record(self.path, "LATCHED",
+                               {"run_token": "t" * 16,
+                                "latch_kind": "SAFETY"},
+                               reason="operator_resolved")
+        records = managed.read_journal(self.path)
+        self.assertEqual(records[-1]["state"], "LATCHED")
+        self.assertEqual(records[-1]["latch_kind"], "SAFETY")
 
     def test_unknown_boot_id_is_unproven_and_latches(self):
         # "unknown" == "unknown" must NOT count as proven same-boot: a
@@ -882,6 +921,17 @@ class RunLadderTests(unittest.TestCase):
         self.assertEqual(out["state"], "SUBMISSION_UNCERTAIN")
         self.assertEqual(out["reason"], "composer_not_cleared")
 
+    def test_r6_incomplete_rescan_aborts_before_enter(self):
+        # An explicitly incomplete rescan (trailing fragment appears
+        # mid-ladder) must not authorize Enter.
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text])
+        with open(self.transcript, "ab") as fh:
+            fh.write(b'{"torn": tr')
+        out = self.run_ladder(tmux)
+        self.assertEqual(out["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(out["reason"], "R6_prime_scan_incomplete")
+        self.assertEqual(tmux.enters(), [])
+
 
 class TickWiringTests(unittest.TestCase):
     """Watcher.tick() driven end-to-end through the injectable seams."""
@@ -935,6 +985,42 @@ class TickWiringTests(unittest.TestCase):
         shutil.rmtree(os.path.join(self.proc, "20"))
         keep, reason = watcher.tick()
         self.assertEqual((keep, reason), (False, "pane_missing"))
+
+    def test_pane_missing_with_zombie_claude_retires(self):
+        # An exited-but-unreaped claude must not sustain a transient wait.
+        tmux = LadderTmux([IDLE])
+        tmux.display_rc = 1
+        watcher = self.make_watcher([usage_row(50)], tmux)
+        write_proc(self.proc, 20, 20, 2020, state="Z")
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (False, "pane_missing"))
+
+    def test_transient_still_heartbeats(self):
+        # Copy mode lasting past the cadence must not starve the leases.
+        tmux = LadderTmux([IDLE])
+        tmux.facts = "%1\t/dev/pts/7\t10\tclaude\t1\t120\t40\t$1\n"
+        watcher = self.make_watcher([usage_row(50)], tmux)
+        watcher.next_heartbeat = 0.0
+        before, _ = managed.read_json_inode(self.paths["session_lease"])
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "pane_in_mode"))
+        after, _ = managed.read_json_inode(self.paths["session_lease"])
+        self.assertGreater(after["heartbeat_at"], before["heartbeat_at"])
+
+    def test_catchup_retire_journals_typed_hazard(self):
+        # A recovered SUBMITTED attempt must not vanish silently when the
+        # catch-up loop retires on a non-transient failure (tty change).
+        tmux = LadderTmux([IDLE])
+        tmux.facts = "%1\t/dev/pts/9\t10\tclaude\t0\t120\t40\t$1\n"
+        watcher = self.make_watcher([usage_row(50)], tmux)
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(managed.default_cursor()),
+            0, 0.0, "boot")
+        watcher.attempt["state"] = "SUBMITTED"
+        watcher.run()
+        states = [r["state"] for r in
+                  managed.read_journal(self.paths["journal"])]
+        self.assertIn("CLEANUP_REQUIRED", states)
 
     def test_boundary_confirmed_latches_threshold_when_still_full(self):
         rows = [usage_row(170000), boundary_row(post=170000)]
