@@ -131,6 +131,43 @@ class ScanTests(unittest.TestCase):
         st = cm.load_state({"state": "/nonexistent"})
         self.assertEqual(cm.incremental_scan(st, "/nope.jsonl"), st)
 
+    def test_partial_line_offset_not_advanced(self):
+        append_jsonl(self.path, [usage_row(10, 40_000, 0, 500)])
+        st = self.scan()
+        before = st["offset"]
+        with open(self.path, "a") as fh:
+            fh.write('{"half": "no newline')
+        st = cm.incremental_scan(st, self.path)
+        self.assertEqual(st["offset"], before)  # fragment unconsumed
+
+    def test_same_inode_shrink_resets(self):
+        append_jsonl(self.path, [usage_row(10, 80_000, 0, 500),
+                                 usage_row(10, 90_000, 0, 500)])
+        st = self.scan()
+        with open(self.path, "w"):
+            pass  # truncate IN PLACE: same inode, smaller size
+        append_jsonl(self.path, [usage_row(10, 20_000, 0, 500)])
+        st = cm.incremental_scan(st, self.path)
+        self.assertEqual(st["current"], 20_510)
+
+    def test_giant_line_skipped_within_budget(self):
+        # A single line larger than the read budget must be skipped
+        # (discard_to_newline), not reread forever.
+        saved = cm.SCAN_MAX_BYTES
+        cm.SCAN_MAX_BYTES = 400
+        try:
+            with open(self.path, "w") as fh:
+                fh.write("g" * 1000 + "\n")
+            append_jsonl(self.path, [usage_row(10, 30_000, 0, 500)])
+            st = cm.load_state({"state": "/nonexistent"})
+            for _ in range(10):
+                st = cm.incremental_scan(st, self.path)
+                if st.get("current"):
+                    break
+            self.assertEqual(st["current"], 30_510)
+        finally:
+            cm.SCAN_MAX_BYTES = saved
+
 
 class AdviseTests(unittest.TestCase):
     EFF = {"soft_pct": 0.70, "hard_pct": 0.80, "context_window": 100_000}
@@ -165,6 +202,24 @@ class AdviseTests(unittest.TestCase):
 
     def test_straight_to_hard_from_none(self):
         level, text = self.advise(90_000)
+        self.assertEqual(level, "hard")
+        self.assertIn("imminent", text)
+
+    def test_hard_rearm_steps_to_soft_not_none(self):
+        # hard at 85% -> drop to 71%: below the hard re-arm point but
+        # still above soft. A straight reset to none would emit a fresh
+        # soft advisory on a purely DOWNWARD move (audit finding).
+        self.assertEqual(self.advise(71_000, level="hard"),
+                         ("soft", None))
+
+    def test_hard_rearm_all_the_way_down(self):
+        self.assertEqual(self.advise(60_000, level="hard"),
+                         ("none", None))
+
+    def test_recross_after_stepdown_fires_hard(self):
+        level, text = self.advise(71_000, level="hard")  # silent stepdown
+        self.assertIsNone(text)
+        level, text = self.advise(85_000, level=level)
         self.assertEqual(level, "hard")
         self.assertIn("imminent", text)
 
@@ -219,6 +274,95 @@ class PacketTests(unittest.TestCase):
         self.assertLessEqual(len(p["handoff_excerpt"]),
                              self.cfg["handoff_excerpt_bytes"])
 
+    def test_excerpt_cap_is_bytes_not_chars(self):
+        cm._private_makedirs(os.path.dirname(self.paths["handoff"]))
+        with open(self.paths["handoff"], "w", encoding="utf-8") as fh:
+            fh.write("\U0001F680" * 4000)  # 4000 chars, 16k UTF-8 bytes
+        st = {"current": 1, "peak": 1, "boundaries": 0, "packet_seq": 0,
+              "armed_at_ts": 0}
+        cm.write_packet(self.cfg, self.paths, st, "auto", "", "/w")
+        p = cm.load_packet(self.paths)
+        self.assertLessEqual(
+            len(p["handoff_excerpt"].encode("utf-8")),
+            self.cfg["handoff_excerpt_bytes"] + 4)
+
+    def test_drain_once_survives_save_reload(self):
+        st = dict(cm._STATE_DEFAULTS, current=1, peak=1)
+        seq = cm.write_packet(self.cfg, self.paths, st, "manual", "", "/w")
+        st["packet_seq"] = seq
+        st["boundaries"] = 1
+        self.assertIsNotNone(cm.drain_packet(self.cfg, self.paths, st))
+        cm.save_state(self.cfg, self.paths, st)
+        st2 = cm.load_state(self.paths)
+        self.assertIsNone(cm.drain_packet(self.cfg, self.paths, st2))
+
+    def test_delivery_cap_tracks_excerpt_knob(self):
+        # Raising handoff_excerpt_bytes must not be silently undone by
+        # a fixed cap at delivery time (audit finding).
+        cfg = dict(self.cfg, handoff_excerpt_bytes=20_000)
+        cm._private_makedirs(os.path.dirname(self.paths["handoff"]))
+        with open(self.paths["handoff"], "w") as fh:
+            fh.write("y" * 20_000)
+        st = dict(cm._STATE_DEFAULTS, current=1, peak=1)
+        seq = cm.write_packet(cfg, self.paths, st, "manual", "", "/w")
+        st.update(packet_seq=seq, boundaries=1)
+        text = cm.drain_packet(cfg, self.paths, st)
+        self.assertGreater(len(text), 19_000)
+
+
+class StateValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.paths = {"state": os.path.join(self.dir.name, "s.json")}
+
+    def test_corrupt_fields_reset_individually(self):
+        with open(self.paths["state"], "w") as fh:
+            json.dump({"offset": "bad", "advisory_level": "sideways",
+                       "current": True, "inode": "x", "peak": 7,
+                       "last_drained_packet_seq": 3}, fh)
+        st = cm.load_state(self.paths)
+        self.assertEqual(st["offset"], 0)
+        self.assertEqual(st["advisory_level"], "none")
+        self.assertEqual(st["current"], 0)
+        self.assertIsNone(st["inode"])
+        self.assertEqual(st["peak"], 7)  # valid values survive
+        self.assertEqual(st["last_drained_packet_seq"], 3)
+
+    def test_non_dict_state_resets(self):
+        with open(self.paths["state"], "w") as fh:
+            fh.write('["not", "a", "dict"]')
+        self.assertEqual(cm.load_state(self.paths)["offset"], 0)
+
+
+class LockTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.lock = os.path.join(self.dir.name, "x.lock")
+
+    def test_stale_lock_broken_and_released(self):
+        with open(self.lock, "w") as fh:
+            fh.write("dead-owner")
+        old = time.time() - 60
+        os.utime(self.lock, (old, old))
+        release = cm._locked_open(self.lock, timeout=1.0)
+        self.assertTrue(os.path.exists(self.lock))
+        release()
+        self.assertFalse(os.path.exists(self.lock))
+
+    def test_release_leaves_successor_lock(self):
+        release = cm._locked_open(self.lock, timeout=1.0)
+        with open(self.lock, "w") as fh:
+            fh.write("someone-else")  # peer stale-broke and re-took it
+        release()
+        self.assertTrue(os.path.exists(self.lock))
+
+    def test_live_lock_contention_times_out(self):
+        cm._locked_open(self.lock, timeout=1.0)  # held, fresh mtime
+        with self.assertRaises(cm.LockTimeout):
+            cm._locked_open(self.lock, timeout=0.2)
+
 
 class ConfigTests(unittest.TestCase):
     def setUp(self):
@@ -264,6 +408,28 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             cm.window_for(cfg, "claude-haiku-4-5")["context_window"],
             200_000)
+
+    def test_bool_garbage_keeps_default(self):
+        os.environ["COMPACT_MANAGER_SYSTEM_MESSAGE"] = "garbage"
+        self.assertTrue(cm.load_config()["system_message"])
+        os.environ["COMPACT_MANAGER_SYSTEM_MESSAGE"] = "off"
+        self.assertFalse(cm.load_config()["system_message"])
+
+    def test_zero_pcts_restore_defaults(self):
+        os.environ["COMPACT_MANAGER_SOFT_PCT"] = "0"
+        os.environ["COMPACT_MANAGER_HARD_PCT"] = "0"
+        c = cm.load_config()
+        self.assertEqual(c["soft_pct"], cm._DEFAULTS["soft_pct"])
+        self.assertEqual(c["hard_pct"], cm._DEFAULTS["hard_pct"])
+
+    def test_per_model_insane_overrides_degrade(self):
+        os.environ["COMPACT_MANAGER_MODELS"] = json.dumps(
+            {"opus": {"context_window": 0, "hard_pct": 9,
+                      "soft_pct": 0}})
+        eff = cm.window_for(cm.load_config(), "claude-opus-9")
+        self.assertEqual(eff["context_window"], 10_000)
+        self.assertEqual(eff["hard_pct"], 1.0)
+        self.assertEqual(eff["soft_pct"], cm._DEFAULTS["soft_pct"])
 
 
 class HookShellTests(unittest.TestCase):
@@ -348,6 +514,46 @@ class HookShellTests(unittest.TestCase):
                             {"hook_event_name": "UserPromptSubmit",
                              "session_id": "sC", "transcript_path": t})
         self.assertIn("75%", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_boundary_without_usage_row_stays_silent(self):
+        # The M2-live regression at hook level: right after a boundary,
+        # with no post-compaction usage row yet, the advisor must NOT
+        # warn that context is still full.
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 165_000, 0, 500)])
+        base = {"session_id": "sF", "transcript_path": t}
+        self.run_hook("advisor.py",
+                      dict(base, hook_event_name="PostToolUse"))
+        append_jsonl(t, [boundary_row("manual", 165_510, 20_000)])
+        out = self.run_hook("advisor.py",
+                            dict(base, hook_event_name="PostToolUse"))
+        ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
+        self.assertNotIn("full", ctx)
+
+    def test_corrupt_state_self_heals(self):
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 150_000, 0, 500)])
+        sd = os.path.join(self.dir.name, "state")
+        os.makedirs(sd, exist_ok=True)
+        with open(os.path.join(sd, "sD.json"), "w") as fh:
+            json.dump({"offset": "bad", "current": None,
+                       "advisory_level": 42}, fh)
+        out = self.run_hook("advisor.py",
+                            {"hook_event_name": "PostToolUse",
+                             "session_id": "sD", "transcript_path": t})
+        self.assertIn("75%",
+                      out["hookSpecificOutput"]["additionalContext"])
+
+    def test_unwritable_state_dir_fails_open(self):
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 150_000, 0, 500)])
+        ro = os.path.join(self.dir.name, "ro")
+        os.makedirs(ro, mode=0o500)
+        self.addCleanup(os.chmod, ro, 0o700)
+        self.run_hook("advisor.py",  # asserts exit 0 internally
+                      {"hook_event_name": "PostToolUse",
+                       "session_id": "sE", "transcript_path": t},
+                      extra_env={"COMPACT_MANAGER_STATE_DIR": ro})
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ except Exception as e:
 
 
 def main():
-    payload = json.loads(sys.stdin.read(1_000_000))
+    payload = cm.read_payload()
     cfg = cm.load_config()
     if cfg["mode"] == "off":
         return
@@ -38,7 +38,8 @@ def main():
         "suppressOutput": not cfg["system_message"],
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": cm.reorientation_text(packet),
+            "additionalContext": cm.reorientation_text(
+                packet, cm.delivery_cap(cfg)),
         },
     }))
 

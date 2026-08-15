@@ -20,7 +20,8 @@ afterward.
 Five thin hooks, all fail-open, all inert until you set a mode:
 
 1. **advisor** (`PostToolUse`) — incrementally measures the session's
-   own transcript (byte-offset resume, never a full reparse). Crossing
+   own transcript (normally a byte-offset resume; a replaced or
+   shrunken file triggers one full reparse). Crossing
    `soft_pct` (default 70%) injects ONE advisory telling the model to
    write its task state to a session-specific handoff file and wrap up
    / compact at a natural boundary; crossing `hard_pct` (80%) injects a
@@ -50,7 +51,7 @@ no-op otherwise.
 |---|---|
 | `off` (default) | Installing changes nothing. |
 | `advisory` | Everything described above. Cross-platform (pure Python hooks). |
-| `managed` | Reserved for Layer 2 (a watcher that types `/compact` into your tmux pane at safe moments). NOT BUILT YET — currently behaves as `advisory`. |
+| `managed` | Reserved for Layer 2 (a watcher that types `/compact` into your tmux pane at safe moments). NOT BUILT YET — currently behaves as `advisory` plus an activity marker written at each Stop (nothing reads it yet). |
 
 Enable per config (`~/.claude/compact-manager.json`) or env:
 `COMPACT_MANAGER_MODE=advisory`.
@@ -61,6 +62,11 @@ Enable per config (`~/.claude/compact-manager.json`) or env:
 /plugin marketplace add msshives-gif/subagent-context
 /plugin install compact-manager@subagent-context
 ```
+
+Manual (no plugin system): `./scripts/install.sh` merges the five
+hooks into `~/.claude/settings.json` (backup taken;
+`./scripts/uninstall.sh` reverses it, touching only this plugin's
+entries). Either way the hooks stay inert until you set a mode.
 
 ## Configuration
 
@@ -76,8 +82,10 @@ Env `COMPACT_MANAGER_<NAME>` or `~/.claude/compact-manager.json`
 | `context_window` | `200000` | Window tokens; per-model via `models` (e.g. `{"[1m]": {"context_window": 1000000}}`). |
 | `models` | `{}` | Per-model overrides for `soft_pct`/`hard_pct`/`context_window`. |
 | `system_message` | `true` | Show injections to the human too. |
-| `handoff_excerpt_bytes` | `4000` | Cap on the handoff excerpt embedded in the wake packet. |
+| `handoff_excerpt_bytes` | `4000` | Byte cap on the handoff excerpt embedded in the wake packet (delivery is capped to match). |
 | `state_dir` | `~/.claude/compact-manager` | Measurements, packets, handoff files. |
+| `ledger` / `ledger_max_bytes` | `true` / 5MB | Audit log of injections and packets, rotated at the size limit. |
+| `state_ttl_days` | `7` | Per-session files older than this are cleaned up (checked at most once a day). |
 
 ## Limitations
 

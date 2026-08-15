@@ -53,10 +53,11 @@ def run(payload, cfg):
         return None
     finally:
         release()
+        cm.prune_state(cfg)
 
 
 def main():
-    payload = json.loads(sys.stdin.read(1_000_000))
+    payload = cm.read_payload()
     cfg = cm.load_config()
     if cfg["mode"] == "off":
         return

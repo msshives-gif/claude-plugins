@@ -63,8 +63,12 @@ def _coerce(default, value, choices=None):
         if isinstance(value, bool):
             return value
         if isinstance(value, str):
-            return value.strip().lower() in ("1", "true", "yes", "on")
-        return None
+            v = value.strip().lower()
+            if v in ("1", "true", "yes", "on"):
+                return True
+            if v in ("0", "false", "no", "off"):
+                return False
+        return None  # garbage keeps the default, not False
     if isinstance(default, float):
         if isinstance(value, bool):
             return None
@@ -137,9 +141,13 @@ def load_config():
                 if kept:
                     clean[pat] = kept
             cfg["models"] = clean
-    # Sanity: percentages in (0, 1], soft below hard.
-    for k in ("soft_pct", "hard_pct", "rearm_band_pct"):
+    # Sanity: percentages in (0, 1], soft below hard. Zero would make
+    # every reading an instant advisory — restore the default instead.
+    for k in ("soft_pct", "hard_pct"):
+        if cfg[k] <= 0:
+            cfg[k] = _DEFAULTS[k]
         cfg[k] = min(cfg[k], 1.0)
+    cfg["rearm_band_pct"] = min(cfg["rearm_band_pct"], 1.0)
     if cfg["soft_pct"] > cfg["hard_pct"]:
         cfg["soft_pct"] = cfg["hard_pct"]
     cfg["context_window"] = max(10_000, cfg["context_window"])
@@ -160,6 +168,13 @@ def window_for(cfg, model):
             best = pat
     if best:
         eff.update(cfg["models"][best])
+    # Same sanity clamps load_config applies to the globals — a typo'd
+    # per-model override must degrade, not silence advisories forever.
+    for k in ("soft_pct", "hard_pct"):
+        if eff[k] <= 0:
+            eff[k] = cfg[k]  # globals are already validated
+        eff[k] = min(eff[k], 1.0)
+    eff["context_window"] = max(10_000, eff["context_window"])
     if eff["soft_pct"] > eff["hard_pct"]:
         eff["soft_pct"] = eff["hard_pct"]
     return eff
@@ -192,17 +207,23 @@ def _locked_open(lock_path, timeout=2.0):
     Stale locks older than 10s are broken (a crashed hook must not
     wedge the session's state forever)."""
     deadline = time.monotonic() + timeout
+    token = f"{os.getpid()}.{time.monotonic_ns()}"
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
                          0o600)
-            os.write(fd, str(os.getpid()).encode())
+            os.write(fd, token.encode())
             os.close(fd)
             break
         except FileExistsError:
             try:
                 if time.time() - os.path.getmtime(lock_path) > 10:
-                    os.unlink(lock_path)
+                    # Break via atomic rename: of two racers, exactly one
+                    # replace() succeeds, so nobody can unlink a lock a
+                    # peer just freshly created (TOCTOU, audit finding).
+                    stale = f"{lock_path}.stale.{os.getpid()}"
+                    os.replace(lock_path, stale)
+                    os.unlink(stale)
                     continue
             except OSError:
                 pass
@@ -211,7 +232,13 @@ def _locked_open(lock_path, timeout=2.0):
             time.sleep(0.05)
 
     def release():
+        # Owner-aware: if a peer stale-broke this lock and re-took it,
+        # the file now holds THEIR token — leave it alone (audit
+        # finding: unconditional unlink could free a successor's lock).
         try:
+            with open(lock_path) as fh:
+                if fh.read(64) != token:
+                    return
             os.unlink(lock_path)
         except OSError:
             pass
@@ -244,19 +271,38 @@ def state_paths(cfg, session_id):
     }
 
 
+_STATE_DEFAULTS = {"schema": SCHEMA_VERSION, "inode": None, "size": 0,
+                   "offset": 0, "current": 0, "peak": 0, "boundaries": 0,
+                   "auto_boundaries": 0, "model": "",
+                   "advisory_level": "none", "armed_at_ts": 0,
+                   "packet_seq": 0, "last_drained_packet_seq": -1}
+
+
 def load_state(paths):
+    """Field-validated load: a corrupt value resets THAT field to its
+    default (self-recovery) instead of making every later hook raise
+    on the same bad file forever (audit finding)."""
+    st = dict(_STATE_DEFAULTS)
     try:
         with open(paths["state"]) as fh:
-            st = json.load(fh)
-        if isinstance(st, dict):
-            return st
+            raw = json.load(fh)
     except Exception:
-        pass
-    return {"schema": SCHEMA_VERSION, "inode": None, "size": 0,
-            "offset": 0, "current": 0, "peak": 0, "boundaries": 0,
-            "auto_boundaries": 0, "model": "", "advisory_level": "none",
-            "armed_at_tokens": 0, "packet_seq": 0,
-            "last_drained_packet_seq": -1}
+        return st
+    if not isinstance(raw, dict):
+        return st
+    for k, dflt in _STATE_DEFAULTS.items():
+        v = raw.get(k, dflt)
+        if k == "inode":
+            st[k] = v if (v is None or isinstance(v, int)) else None
+        elif k == "advisory_level":
+            st[k] = v if v in ("none", "soft", "hard") else "none"
+        elif k == "model":
+            st[k] = v if isinstance(v, str) else ""
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            st[k] = v
+        else:
+            st[k] = dflt
+    return st
 
 
 def save_state(cfg, paths, st):
@@ -273,6 +319,12 @@ def save_state(cfg, paths, st):
 
 _USAGE_KEYS = ("input_tokens", "cache_read_input_tokens",
                "cache_creation_input_tokens", "output_tokens")
+
+# Per-invocation read budget. A tail bigger than this is processed
+# across successive hook invocations; a single LINE bigger than this
+# is skipped via discard_to_newline (otherwise every invocation would
+# reread it and stall against the 5s hook deadline — audit finding).
+SCAN_MAX_BYTES = 16_000_000
 
 
 def incremental_scan(st, transcript):
@@ -295,11 +347,24 @@ def incremental_scan(st, transcript):
     try:
         with open(transcript, "rb") as fh:
             fh.seek(st.get("offset", 0))
-            chunk = fh.read()
+            chunk = fh.read(SCAN_MAX_BYTES)
     except OSError:
         return st
+    if st.get("discard_to_newline"):
+        nl = chunk.find(b"\n")
+        if nl == -1:
+            st["offset"] = st.get("offset", 0) + len(chunk)
+            st["size"] = stat.st_size
+            return st
+        st["offset"] = st.get("offset", 0) + nl + 1
+        st["discard_to_newline"] = False
+        chunk = chunk[nl + 1:]
     end = chunk.rfind(b"\n")
     if end == -1:
+        if len(chunk) >= SCAN_MAX_BYTES:
+            st["offset"] = st.get("offset", 0) + len(chunk)
+            st["discard_to_newline"] = True
+            st["size"] = stat.st_size
         return st
     for raw in chunk[:end].split(b"\n"):
         if not raw.strip():
@@ -330,10 +395,12 @@ def incremental_scan(st, transcript):
         u = m.get("usage")
         if not isinstance(u, dict):
             continue
-        if not any(isinstance(u.get(k), int) for k in _USAGE_KEYS):
+        counts = [u.get(k) for k in _USAGE_KEYS
+                  if isinstance(u.get(k), int)
+                  and not isinstance(u.get(k), bool)]
+        if not counts:
             continue
-        total = sum(u.get(k) for k in _USAGE_KEYS
-                    if isinstance(u.get(k), int))
+        total = sum(counts)
         if m.get("stop_reason") is not None:
             st["current"] = total
             st["peak"] = max(st.get("peak", 0), total)
@@ -358,9 +425,12 @@ def advise(st, eff, handoff_path, rearm_band=0.08):
     order = {"none": 0, "soft": 1, "hard": 2}
     thresholds = {"soft": eff["soft_pct"], "hard": eff["hard_pct"]}
 
-    # Re-arm downward.
-    if level != "none" and pct < thresholds.get(level, 1) - rearm_band:
-        level = "none"
+    # Re-arm downward STEPWISE: hard drops to an armed soft first, and
+    # only to none below the soft re-arm point. A straight reset to
+    # none would emit a fresh soft advisory on a purely downward move
+    # (audit finding: hard at 85% -> drop to 71% must stay silent).
+    while level != "none" and pct < thresholds[level] - rearm_band:
+        level = "soft" if level == "hard" else "none"
 
     target = "none"
     if pct >= eff["hard_pct"]:
@@ -387,6 +457,21 @@ def advise(st, eff, handoff_path, rearm_band=0.08):
     return target, text
 
 
+# The most a hook reads from stdin. PostToolUse payloads embed the
+# tool_response, which can be huge; a truncated payload fails open to
+# a skipped scan, so keep the cap generous.
+STDIN_MAX_BYTES = 10_000_000
+
+
+def read_payload():
+    return json.loads(sys.stdin.read(STDIN_MAX_BYTES))
+
+
+def delivery_cap(cfg):
+    """Reorientation-text budget: the configured excerpt plus framing."""
+    return cfg["handoff_excerpt_bytes"] + 2_000
+
+
 # -------------------------------------------------------------- packet
 
 def write_packet(cfg, paths, st, trigger, custom_instructions, cwd):
@@ -397,8 +482,12 @@ def write_packet(cfg, paths, st, trigger, custom_instructions, cwd):
     try:
         mtime = os.path.getmtime(paths["handoff"])
         fresh = mtime >= st.get("armed_at_ts", 0)
-        with open(paths["handoff"], "r", errors="replace") as fh:
-            excerpt = fh.read(cfg["handoff_excerpt_bytes"])
+        # Binary read so the knob really caps BYTES — a text-mode
+        # read(n) counts characters, and a multibyte handoff could
+        # blow the cap several times over (audit finding).
+        with open(paths["handoff"], "rb") as fh:
+            excerpt = fh.read(cfg["handoff_excerpt_bytes"]).decode(
+                "utf-8", errors="replace")
     except OSError:
         pass
     seq = st.get("packet_seq", 0) + 1
@@ -433,7 +522,10 @@ def load_packet(paths):
         return None
 
 
-def reorientation_text(packet, cap=4000):
+def reorientation_text(packet, cap=6000):
+    """cap covers excerpt + framing; callers derive it from
+    handoff_excerpt_bytes so raising that knob isn't silently undone
+    at delivery (audit finding)."""
     parts = [f"[compact-manager] Reorientation after compaction "
              f"(context was ~{packet.get('pre_current', 0) / 1000:.0f}k, "
              f"peak ~{packet.get('pre_peak', 0) / 1000:.0f}k)."]
@@ -466,7 +558,47 @@ def drain_packet(cfg, paths, st):
     if st.get("boundaries", 0) <= packet.get("base_compaction_count", 0):
         return None  # the compaction it precedes hasn't landed yet
     st["last_drained_packet_seq"] = packet["seq"]
-    return reorientation_text(packet)
+    return reorientation_text(packet, delivery_cap(cfg))
+
+
+# --------------------------------------------------------------- prune
+
+_PRUNE_MARKER = ".last-prune"
+
+
+def prune_state(cfg):
+    """Best-effort TTL reaper for per-session files (state/packets/
+    handoff/locks). Runs at most once per day; age-based, so a live
+    session's freshly-written files are never touched. Errors ignored —
+    housekeeping must never cost a hook its deadline."""
+    try:
+        base = cfg["state_dir"]
+        marker = os.path.join(base, _PRUNE_MARKER)
+        now = time.time()
+        try:
+            if now - os.path.getmtime(marker) < 86_400:
+                return
+        except OSError:
+            pass
+        _private_makedirs(base)
+        with open(marker, "w") as fh:
+            fh.write(str(now))
+        cutoff = now - cfg["state_ttl_days"] * 86_400
+        for sub in ("state", "packets", "handoff", "locks"):
+            d = os.path.join(base, sub)
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            for name in names:
+                p = os.path.join(d, name)
+                try:
+                    if os.path.getmtime(p) < cutoff:
+                        os.unlink(p)
+                except OSError:
+                    pass
+    except Exception:
+        pass
 
 
 # -------------------------------------------------------------- ledger
