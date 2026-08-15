@@ -1220,9 +1220,16 @@ class Watcher:
                 self.request_history[request_id] = key
 
     def alert_if_needed(self, previous=None):
-        if self.attempt and self.attempt.get("state") in ALERT_STATES and \
-                self.attempt.get("state") != previous:
-            notify(self.binding, self.cfg, self.paths, self.attempt, self.run_tmux)
+        if not (self.attempt and self.attempt.get("state") in ALERT_STATES and
+                self.attempt.get("state") != previous):
+            return
+        # THRESHOLD latches are informational hysteresis, not operator
+        # hazards; alerting them would re-fire on every native boundary
+        # while pct stays above the re-arm band.
+        if (self.attempt.get("state") == "LATCHED" and
+                self.attempt.get("latch_kind") == "THRESHOLD"):
+            return
+        notify(self.binding, self.cfg, self.paths, self.attempt, self.run_tmux)
 
     def _transient(self, reason):
         """Validation failures that mean WAIT, not retire: job-control
@@ -1744,13 +1751,22 @@ def resolve_session(cfg, sid):
         # Judge resolvability on the conservative recovery mapping, not
         # the raw tail: a crashed watcher's PREPARED/TYPED_VERIFIED tail
         # IS the hazard the operator is resolving.
-        tail = recover_attempt(paths["journal"], boot_id())
+        current_boot = boot_id()
+        tail = recover_attempt(paths["journal"], current_boot)
         if tail is None or tail.get("state") not in ALERT_STATES:
             return False, "nothing resolvable"
         token = tail.get("run_token")
         lease, _ = read_json_inode(paths["session_lease"])
         if lease is None:
             return False, "session lease is unreadable"
+        raw = attempt_tail(paths["journal"])
+        if (current_boot == "unknown" and raw is not None and
+                raw.get("state") != tail.get("state") and
+                lease and lease_is_live(lease)):
+            # The escalation to a resolvable state rests on an UNPROVEN
+            # boot identity while a watcher may be live and mid-attempt;
+            # resolving over it could clear a real in-flight submission.
+            return False, "boot identity unproven; stop the watcher first"
         lease_dir = os.path.dirname(paths["session_lease"])
         matching_panes = []
         try:

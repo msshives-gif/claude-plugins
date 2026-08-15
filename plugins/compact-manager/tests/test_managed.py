@@ -1057,6 +1057,25 @@ class TickWiringTests(unittest.TestCase):
         for want in ("TRIGGERED", "PREPARED", "TYPED_VERIFIED", "SUBMITTED"):
             self.assertIn(want, states)
 
+    def test_notify_escapes_tmux_format_expansion(self):
+        shown = []
+
+        def tmux(argv, timeout=5):
+            argv = list(argv)
+            cmd = argv[2] if argv[:1] == ["-S"] else argv[0]
+            if cmd == "list-clients":
+                return Result("client0\n")
+            if cmd == "display-message":
+                shown.append(argv[-1])
+            return Result("")
+        attempt = {"state": "CLEANUP_REQUIRED",
+                   "reason": "bad #{pane_id} #(cmd) input",
+                   "run_token": self.token}
+        managed.notify(self.binding, self.cfg, self.paths, attempt, tmux)
+        self.assertEqual(len(shown), 1)
+        self.assertNotIn("#{", shown[0].replace("##", ""))
+        self.assertIn("##{pane_id}", shown[0])
+
     def test_request_triggers_below_threshold_with_fingerprint(self):
         watcher = self.make_watcher([usage_row(50)], EchoTmux())
         cm._private_makedirs(os.path.dirname(self.paths["request"]))
