@@ -29,6 +29,11 @@ def _matches(c, path):
     i = c.find(path)
     while i != -1:
         j = i + len(path)
+        # EXACT paths start at a token boundary; STANDARD suffixes may
+        # sit mid-path, so only the right boundary applies to them —
+        # callers pass absolute EXACT paths and "/…" STANDARD markers,
+        # and both are safe with a right-boundary check plus the
+        # leading "/" they carry. Keep right-boundary semantics here.
         if j == len(c) or c[j] in " \t'\"":
             return True
         i = c.find(path, i + 1)

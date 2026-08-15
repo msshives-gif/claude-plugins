@@ -33,13 +33,14 @@ def cmd_for(script):
 
 
 def _matches(c, path):
-    # Boundary-safe: the path must be followed by a delimiter or EOL,
-    # so "advisor.py.backup" or metadata mentioning the path in a
-    # longer token never counts as installed (audit finding).
+    # Boundary-safe on BOTH sides: the path must start at a token
+    # boundary and end at a delimiter/EOL, so "advisor.py.backup" or
+    # "/shadow<path>" never counts as installed (audit findings).
     i = c.find(path)
     while i != -1:
         j = i + len(path)
-        if j == len(c) or c[j] in " \t'\"":
+        left_ok = i == 0 or c[i - 1] in " \t'\"="
+        if left_ok and (j == len(c) or c[j] in " \t'\""):
             return True
         i = c.find(path, i + 1)
     return False

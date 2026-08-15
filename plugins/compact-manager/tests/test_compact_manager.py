@@ -370,6 +370,25 @@ class StateValidationTests(unittest.TestCase):
         self.assertEqual(st["last_drained_packet_seq"], -1)  # -1 legal
         self.assertEqual(st["armed_at_ts"], 12.5)  # finite float legal
 
+    def test_huge_int_timestamp_does_not_wedge(self):
+        # math.isfinite(10**309) raises OverflowError; that must not
+        # escape load_state and leave the plugin permanently inert.
+        with open(self.paths["state"], "w") as fh:
+            fh.write('{"armed_at_ts": %d, "offset": 5}' % 10**309)
+        st = cm.load_state(self.paths)
+        self.assertEqual(st["armed_at_ts"], 10**309)  # huge int accepted
+        self.assertEqual(st["offset"], 5)
+        with open(self.paths["state"], "w") as fh:
+            fh.write('{"armed_at_ts": 1e309}')  # inf float -> default
+        self.assertEqual(cm.load_state(self.paths)["armed_at_ts"], 0)
+
+    def test_discard_flag_survives_save_reload(self):
+        cfg = dict(cm._DEFAULTS, state_dir=self.dir.name)
+        paths = cm.state_paths(cfg, "sH")
+        st = dict(cm._STATE_DEFAULTS, discard_to_newline=True)
+        cm.save_state(cfg, paths, st)
+        self.assertTrue(cm.load_state(paths)["discard_to_newline"])
+
 
 class PruneTests(unittest.TestCase):
     def setUp(self):
@@ -400,6 +419,12 @@ class PruneTests(unittest.TestCase):
         self.assertFalse(os.path.exists(own))      # aged, matching name
         self.assertTrue(os.path.exists(foreign))   # pattern-protected
 
+    def _symlink(self, src, dst):
+        try:
+            os.symlink(src, dst)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable on this platform")
+
     def test_prune_skips_symlinked_subdir(self):
         base = self.dir.name
         victim_dir = os.path.join(base, "victims")
@@ -408,10 +433,33 @@ class PruneTests(unittest.TestCase):
         with open(victim, "w") as fh:
             fh.write("x")
         self._old(victim)
-        os.symlink(victim_dir, os.path.join(base, "state"))
+        self._symlink(victim_dir, os.path.join(base, "state"))
         cm._write_sentinel(self.cfg)
         cm.prune_state(self.cfg)
         self.assertTrue(os.path.exists(victim))
+
+    def test_prune_skips_symlinked_file(self):
+        base = self.dir.name
+        os.makedirs(os.path.join(base, "state"))
+        target = os.path.join(base, "target.json")
+        with open(target, "w") as fh:
+            fh.write("x")
+        self._old(target)
+        self._symlink(target, os.path.join(base, "state", "link.json"))
+        cm._write_sentinel(self.cfg)
+        cm.prune_state(self.cfg)
+        self.assertTrue(os.path.exists(target))
+
+    def test_prune_skips_names_the_plugin_cannot_generate(self):
+        base = self.dir.name
+        os.makedirs(os.path.join(base, "state"))
+        odd = os.path.join(base, "state", "annual report.json")
+        with open(odd, "w") as fh:
+            fh.write("x")
+        self._old(odd)
+        cm._write_sentinel(self.cfg)
+        cm.prune_state(self.cfg)
+        self.assertTrue(os.path.exists(odd))
 
     def test_fresh_files_survive(self):
         base = self.dir.name
@@ -451,6 +499,24 @@ class LockTests(unittest.TestCase):
         cm._locked_open(self.lock, timeout=1.0)  # held, fresh mtime
         with self.assertRaises(cm.LockTimeout):
             cm._locked_open(self.lock, timeout=0.2)
+
+    def test_stale_break_restores_displaced_live_lock(self):
+        # Interleave: the lock looks stale at the first check, but by
+        # rename time a peer has re-acquired (the displaced copy is
+        # fresh). The recheck must restore the peer's lock — same
+        # token, file still present — and this racer must time out.
+        from unittest import mock
+        with open(self.lock, "w") as fh:
+            fh.write("peer-token")
+
+        def fake_getmtime(p):
+            return (time.time() - 60) if p == self.lock else time.time()
+
+        with mock.patch("os.path.getmtime", side_effect=fake_getmtime):
+            with self.assertRaises(cm.LockTimeout):
+                cm._locked_open(self.lock, timeout=0.3)
+        with open(self.lock) as fh:
+            self.assertEqual(fh.read(), "peer-token")
 
 
 class ConfigTests(unittest.TestCase):
@@ -632,6 +698,11 @@ class HookShellTests(unittest.TestCase):
                              "session_id": "sD", "transcript_path": t})
         self.assertIn("75%",
                       out["hookSpecificOutput"]["additionalContext"])
+
+    def test_oversized_stdin_fails_open(self):
+        big = ('{"session_id": "x", "pad": "'
+               + "a" * (cm.STDIN_MAX_BYTES + 100) + '"}')
+        self.assertEqual(self.run_hook("advisor.py", big), {})
 
     def test_unwritable_state_dir_fails_open(self):
         t = os.path.join(self.dir.name, "sess.jsonl")

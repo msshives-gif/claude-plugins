@@ -82,6 +82,31 @@ class CompactManagerInstallTests(unittest.TestCase):
         self.assertTrue(any(advisor in c and ".backup" not in c
                             for c in cmds))
 
+    def test_shadow_prefix_path_does_not_block_install(self):
+        # A command whose path merely CONTAINS ours as a suffix
+        # ("/shadow<our path>") must not count as installed.
+        advisor = os.path.join(PLUGIN, "hooks", "advisor.py")
+        with open(self.settings, "w") as fh:
+            json.dump({"hooks": {"PostToolUse": [
+                {"matcher": "*", "hooks": [
+                    {"type": "command",
+                     "command": f"python3 /shadow{advisor} || true",
+                     "timeout": 5}]}]}}, fh)
+        r = _run(INSTALL, self.settings)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(_hook_commands(self.read())), 7)
+
+    def test_backups_do_not_collide(self):
+        # install (no file yet: no backup) -> uninstall -> install can
+        # all run within one second; the pid suffix keeps each backup
+        # distinct so nothing is overwritten.
+        _run(INSTALL, self.settings)
+        _run(UNINSTALL, self.settings)
+        _run(INSTALL, self.settings)
+        baks = [f for f in os.listdir(self.tmp.name)
+                if ".bak-compact-manager-" in f]
+        self.assertEqual(len(baks), 2)
+
     def test_uninstall_spares_sibling_and_root_plugin_hooks(self):
         # Both siblings' absolute paths contain the repo dir name; a
         # repo-name marker would remove them all.

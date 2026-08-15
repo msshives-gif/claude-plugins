@@ -228,16 +228,31 @@ def _locked_open(lock_path, timeout=2.0):
                     # exactly one replace() succeeds), then RE-CHECK the
                     # displaced file: a peer may have finished its own
                     # break and re-acquired between our staleness check
-                    # and the rename — if what we displaced is fresh,
-                    # put it back. Narrows the TOCTOU window to a
-                    # sub-millisecond triple interleave (not eliminated;
-                    # blast radius is one lost advisory update).
+                    # and the rename. A displaced FRESH lock is restored
+                    # via O_EXCL so a third acquirer is never clobbered;
+                    # if the path was retaken meanwhile, the displaced
+                    # owner simply loses its lock file (its token-checked
+                    # release stays safe). This mutual-exclusion is
+                    # best-effort, not perfect: overlapping holders
+                    # remain possible after a >10s-stale break, costing
+                    # at worst one lost state update or a duplicate
+                    # reorientation — both harmless by design.
                     stale = f"{lock_path}.stale.{os.getpid()}"
                     os.replace(lock_path, stale)
                     if time.time() - os.path.getmtime(stale) > 10:
                         os.unlink(stale)
                         continue
-                    os.replace(stale, lock_path)
+                    try:
+                        with open(stale) as sfh:
+                            displaced = sfh.read(64)
+                        rfd = os.open(lock_path,
+                                      os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                                      0o600)
+                        os.write(rfd, displaced.encode())
+                        os.close(rfd)
+                    except OSError:
+                        pass
+                    os.unlink(stale)
             except OSError:
                 pass
             if time.monotonic() >= deadline:
@@ -316,10 +331,14 @@ def load_state(paths):
         elif k == "discard_to_newline":
             st[k] = v if isinstance(v, bool) else False
         elif k == "armed_at_ts":
-            # Timestamp: any finite non-negative number.
-            st[k] = v if (isinstance(v, (int, float))
-                          and not isinstance(v, bool)
-                          and math.isfinite(v) and v >= 0) else dflt
+            # Timestamp: non-negative int of any size, or finite
+            # non-negative float. math.isfinite(huge_int) raises
+            # OverflowError, which would wedge every hook (audit
+            # finding) — so ints skip the finiteness check.
+            ok = (isinstance(v, int) and not isinstance(v, bool)
+                  and v >= 0) or \
+                 (isinstance(v, float) and math.isfinite(v) and v >= 0)
+            st[k] = v if ok else dflt
         else:
             # Counters/offsets/seqs: exact ints only — a float offset
             # would make fh.seek() raise on EVERY invocation, leaving
@@ -618,10 +637,11 @@ def prune_state(cfg):
         with open(marker, "w") as fh:
             fh.write(str(now))
         cutoff = now - cfg["state_ttl_days"] * 86_400
+        is_junction = getattr(os.path, "isjunction", lambda p: False)
         for sub, ext in (("state", ".json"), ("packets", ".json"),
                          ("handoff", ".md"), ("locks", ".lock")):
             d = os.path.join(base, sub)
-            if os.path.islink(d):
+            if os.path.islink(d) or is_junction(d):
                 continue
             try:
                 names = os.listdir(d)
@@ -629,6 +649,11 @@ def prune_state(cfg):
                 continue
             for name in names:
                 if not name.endswith(ext):
+                    continue
+                # Only stems this plugin can have generated
+                # (path_component output is a fixed point).
+                stem = name[:-len(ext)]
+                if not stem or stem != path_component(stem):
                     continue
                 p = os.path.join(d, name)
                 try:

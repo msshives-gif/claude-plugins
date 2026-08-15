@@ -27,7 +27,15 @@ subdirs, and deletes only plugin-named regular files (lstat ages);
 installer presence-detection is boundary-safe (a `.backup` lookalike
 no longer blocks the real install); backups get collision-proof
 names; the stdin cap is a true byte cap; the lock stale-break
-re-checks what it displaced. 58 tests.
+re-checks what it displaced (restoring a displaced live lock via
+O_EXCL, never clobbering a later acquirer; residual overlap after a
+>10s-stale break is documented, worst case one lost advisory
+update); huge-int timestamps no longer wedge state via
+math.isfinite's OverflowError; the pruner only deletes stems
+path_component could generate and skips junctions/symlinked files;
+installer matching is boundary-safe on both sides. A third
+two-family pass on the fix diff found no production defect. 66
+tests.
 
 ## 0.1.0 — 2026-08-15
 
