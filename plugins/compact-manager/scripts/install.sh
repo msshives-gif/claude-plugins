@@ -32,10 +32,23 @@ def cmd_for(script):
     return f"python3 {q} || python {q} || true"
 
 
+def _matches(c, path):
+    # Boundary-safe: the path must be followed by a delimiter or EOL,
+    # so "advisor.py.backup" or metadata mentioning the path in a
+    # longer token never counts as installed (audit finding).
+    i = c.find(path)
+    while i != -1:
+        j = i + len(path)
+        if j == len(c) or c[j] in " \t'\"":
+            return True
+        i = c.find(path, i + 1)
+    return False
+
+
 settings = {}
 if os.path.isfile(settings_path):
     backup = (f"{settings_path}.bak-compact-manager-"
-              f"{time.strftime('%Y%m%d%H%M%S')}")
+              f"{time.strftime('%Y%m%d%H%M%S')}-{os.getpid()}")
     shutil.copy2(settings_path, backup)
     print(f"backup: {backup}")
     try:
@@ -50,9 +63,12 @@ added = 0
 for event, matcher, script in WIRING:
     groups = hooks.setdefault(event, [])
     script_path = os.path.join(plugin, "hooks", script)
+    norm = script_path.replace("\\", "/")
     present = any(
-        script_path in json.dumps(g, ensure_ascii=False)
-        and g.get("matcher") == matcher
+        g.get("matcher") == matcher
+        and any(_matches(str(e.get("command", "")).replace("\\", "/"),
+                         norm)
+                for e in g.get("hooks", []))
         for g in groups)
     if present:
         continue

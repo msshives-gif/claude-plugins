@@ -152,21 +152,36 @@ class ScanTests(unittest.TestCase):
 
     def test_giant_line_skipped_within_budget(self):
         # A single line larger than the read budget must be skipped
-        # (discard_to_newline), not reread forever.
+        # (discard_to_newline), not reread forever. Round-trip the
+        # state through save/load each pass: real hooks are separate
+        # processes, so the discard flag must survive persistence
+        # (audit finding — an in-memory-only loop masks the drop).
         saved = cm.SCAN_MAX_BYTES
         cm.SCAN_MAX_BYTES = 400
+        cfg = dict(cm._DEFAULTS, state_dir=self.dir.name)
+        paths = cm.state_paths(cfg, "sG")
         try:
             with open(self.path, "w") as fh:
                 fh.write("g" * 1000 + "\n")
             append_jsonl(self.path, [usage_row(10, 30_000, 0, 500)])
-            st = cm.load_state({"state": "/nonexistent"})
+            st = cm.load_state(paths)
             for _ in range(10):
                 st = cm.incremental_scan(st, self.path)
+                cm.save_state(cfg, paths, st)
+                st = cm.load_state(paths)
                 if st.get("current"):
                     break
             self.assertEqual(st["current"], 30_510)
         finally:
             cm.SCAN_MAX_BYTES = saved
+
+    def test_reset_clears_discard_flag(self):
+        # A replaced file must not inherit the old file's skip mode.
+        append_jsonl(self.path, [usage_row(10, 20_000, 0, 500)])
+        st = dict(cm._STATE_DEFAULTS, inode=-1, discard_to_newline=True)
+        st = cm.incremental_scan(st, self.path)
+        self.assertFalse(st["discard_to_newline"])
+        self.assertEqual(st["current"], 20_510)
 
 
 class AdviseTests(unittest.TestCase):
@@ -275,16 +290,20 @@ class PacketTests(unittest.TestCase):
                              self.cfg["handoff_excerpt_bytes"])
 
     def test_excerpt_cap_is_bytes_not_chars(self):
+        # Cap 3999 deliberately splits a 4-byte emoji so the
+        # decode(errors=replace) path is actually exercised.
+        cfg = dict(self.cfg, handoff_excerpt_bytes=3_999)
         cm._private_makedirs(os.path.dirname(self.paths["handoff"]))
         with open(self.paths["handoff"], "w", encoding="utf-8") as fh:
-            fh.write("\U0001F680" * 4000)  # 4000 chars, 16k UTF-8 bytes
+            fh.write("\U0001F680" * 4000)  # 16k UTF-8 bytes
         st = {"current": 1, "peak": 1, "boundaries": 0, "packet_seq": 0,
               "armed_at_ts": 0}
-        cm.write_packet(self.cfg, self.paths, st, "auto", "", "/w")
+        cm.write_packet(cfg, self.paths, st, "auto", "", "/w")
         p = cm.load_packet(self.paths)
         self.assertLessEqual(
             len(p["handoff_excerpt"].encode("utf-8")),
-            self.cfg["handoff_excerpt_bytes"] + 4)
+            cfg["handoff_excerpt_bytes"] + 4)
+        self.assertIn("�", p["handoff_excerpt"][-2:])
 
     def test_drain_once_survives_save_reload(self):
         st = dict(cm._STATE_DEFAULTS, current=1, peak=1)
@@ -333,6 +352,76 @@ class StateValidationTests(unittest.TestCase):
         with open(self.paths["state"], "w") as fh:
             fh.write('["not", "a", "dict"]')
         self.assertEqual(cm.load_state(self.paths)["offset"], 0)
+
+    def test_numeric_fields_require_exact_ints(self):
+        # A float offset would make fh.seek() raise on every scan,
+        # leaving the hook permanently inert (audit finding).
+        with open(self.paths["state"], "w") as fh:
+            json.dump({"offset": 1.5, "current": -3, "peak": float("nan"),
+                       "boundaries": 2.0, "packet_seq": 1e308,
+                       "last_drained_packet_seq": -1,
+                       "armed_at_ts": 12.5}, fh)
+        st = cm.load_state(self.paths)
+        self.assertEqual(st["offset"], 0)
+        self.assertEqual(st["current"], 0)
+        self.assertEqual(st["peak"], 0)
+        self.assertEqual(st["boundaries"], 0)
+        self.assertEqual(st["packet_seq"], 0)
+        self.assertEqual(st["last_drained_packet_seq"], -1)  # -1 legal
+        self.assertEqual(st["armed_at_ts"], 12.5)  # finite float legal
+
+
+class PruneTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.cfg = dict(cm._DEFAULTS, state_dir=self.dir.name,
+                        state_ttl_days=7)
+
+    def _old(self, path):
+        t = time.time() - 30 * 86_400
+        os.utime(path, (t, t))
+
+    def test_prunes_only_marked_dirs_and_own_patterns(self):
+        base = self.dir.name
+        for sub in ("state", "packets", "handoff", "locks"):
+            os.makedirs(os.path.join(base, sub))
+        own = os.path.join(base, "state", "dead.json")
+        foreign = os.path.join(base, "state", "notes.txt")
+        for p in (own, foreign):
+            with open(p, "w") as fh:
+                fh.write("x")
+            self._old(p)
+        # No sentinel yet: nothing may be deleted.
+        cm.prune_state(self.cfg)
+        self.assertTrue(os.path.exists(own))
+        cm._write_sentinel(self.cfg)
+        cm.prune_state(self.cfg)
+        self.assertFalse(os.path.exists(own))      # aged, matching name
+        self.assertTrue(os.path.exists(foreign))   # pattern-protected
+
+    def test_prune_skips_symlinked_subdir(self):
+        base = self.dir.name
+        victim_dir = os.path.join(base, "victims")
+        os.makedirs(victim_dir)
+        victim = os.path.join(victim_dir, "precious.json")
+        with open(victim, "w") as fh:
+            fh.write("x")
+        self._old(victim)
+        os.symlink(victim_dir, os.path.join(base, "state"))
+        cm._write_sentinel(self.cfg)
+        cm.prune_state(self.cfg)
+        self.assertTrue(os.path.exists(victim))
+
+    def test_fresh_files_survive(self):
+        base = self.dir.name
+        os.makedirs(os.path.join(base, "state"))
+        live = os.path.join(base, "state", "live.json")
+        with open(live, "w") as fh:
+            fh.write("x")
+        cm._write_sentinel(self.cfg)
+        cm.prune_state(self.cfg)
+        self.assertTrue(os.path.exists(live))
 
 
 class LockTests(unittest.TestCase):

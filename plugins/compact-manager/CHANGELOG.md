@@ -16,7 +16,18 @@ delivery cap tracks the knob; the state file is field-validated on
 load (self-recovery from corruption); lock stale-break is
 rename-atomic and release is owner-aware; `state_ttl_days` is now
 real (daily best-effort reaper). New: manual `scripts/install.sh` /
-`uninstall.sh` (boundary-safe, sibling-sparing, tested). 52 tests.
+`uninstall.sh` (boundary-safe, sibling-sparing, tested).
+
+Re-verify round (two fresh auditors, two families) hardened the fixes
+themselves: `discard_to_newline` persists across hook processes and
+clears on file replacement; numeric state fields require exact
+non-negative ints (a float offset used to wedge scanning for good);
+the reaper only touches sentinel-marked dirs, skips symlinked
+subdirs, and deletes only plugin-named regular files (lstat ages);
+installer presence-detection is boundary-safe (a `.backup` lookalike
+no longer blocks the real install); backups get collision-proof
+names; the stdin cap is a true byte cap; the lock stale-break
+re-checks what it displaced. 58 tests.
 
 ## 0.1.0 — 2026-08-15
 

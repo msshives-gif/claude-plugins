@@ -15,6 +15,7 @@ Everything fails open; hooks exit 0 on every path.
 import json
 import math
 import os
+import stat as stat_module
 import sys
 import time
 
@@ -203,9 +204,14 @@ class LockTimeout(Exception):
 
 
 def _locked_open(lock_path, timeout=2.0):
-    """O_EXCL sidecar lock (portable). Returns a release callable.
-    Stale locks older than 10s are broken (a crashed hook must not
-    wedge the session's state forever)."""
+    """O_EXCL sidecar lock (portable — deliberately not fcntl/msvcrt,
+    which don't share semantics across platforms). Returns a release
+    callable. Stale locks older than 10s are broken (a crashed hook
+    must not wedge the session's state forever). Residual races
+    (re-checked rename break; token-checked release) need a >10s-stale
+    lock plus a sub-ms interleave; hooks die at their 5s timeout, so a
+    LIVE owner can never look stale. Worst case is one lost state
+    update or duplicate reorientation — both harmless by design."""
     deadline = time.monotonic() + timeout
     token = f"{os.getpid()}.{time.monotonic_ns()}"
     while True:
@@ -218,13 +224,20 @@ def _locked_open(lock_path, timeout=2.0):
         except FileExistsError:
             try:
                 if time.time() - os.path.getmtime(lock_path) > 10:
-                    # Break via atomic rename: of two racers, exactly one
-                    # replace() succeeds, so nobody can unlink a lock a
-                    # peer just freshly created (TOCTOU, audit finding).
+                    # Break via atomic rename (of concurrent racers,
+                    # exactly one replace() succeeds), then RE-CHECK the
+                    # displaced file: a peer may have finished its own
+                    # break and re-acquired between our staleness check
+                    # and the rename — if what we displaced is fresh,
+                    # put it back. Narrows the TOCTOU window to a
+                    # sub-millisecond triple interleave (not eliminated;
+                    # blast radius is one lost advisory update).
                     stale = f"{lock_path}.stale.{os.getpid()}"
                     os.replace(lock_path, stale)
-                    os.unlink(stale)
-                    continue
+                    if time.time() - os.path.getmtime(stale) > 10:
+                        os.unlink(stale)
+                        continue
+                    os.replace(stale, lock_path)
             except OSError:
                 pass
             if time.monotonic() >= deadline:
@@ -275,7 +288,8 @@ _STATE_DEFAULTS = {"schema": SCHEMA_VERSION, "inode": None, "size": 0,
                    "offset": 0, "current": 0, "peak": 0, "boundaries": 0,
                    "auto_boundaries": 0, "model": "",
                    "advisory_level": "none", "armed_at_ts": 0,
-                   "packet_seq": 0, "last_drained_packet_seq": -1}
+                   "packet_seq": 0, "last_drained_packet_seq": -1,
+                   "discard_to_newline": False}
 
 
 def load_state(paths):
@@ -293,15 +307,28 @@ def load_state(paths):
     for k, dflt in _STATE_DEFAULTS.items():
         v = raw.get(k, dflt)
         if k == "inode":
-            st[k] = v if (v is None or isinstance(v, int)) else None
+            st[k] = v if (v is None or isinstance(v, int)
+                          and not isinstance(v, bool)) else None
         elif k == "advisory_level":
             st[k] = v if v in ("none", "soft", "hard") else "none"
         elif k == "model":
             st[k] = v if isinstance(v, str) else ""
-        elif isinstance(v, (int, float)) and not isinstance(v, bool):
-            st[k] = v
+        elif k == "discard_to_newline":
+            st[k] = v if isinstance(v, bool) else False
+        elif k == "armed_at_ts":
+            # Timestamp: any finite non-negative number.
+            st[k] = v if (isinstance(v, (int, float))
+                          and not isinstance(v, bool)
+                          and math.isfinite(v) and v >= 0) else dflt
         else:
-            st[k] = dflt
+            # Counters/offsets/seqs: exact ints only — a float offset
+            # would make fh.seek() raise on EVERY invocation, leaving
+            # the hook permanently inert (audit finding). Floor is -1
+            # for last_drained_packet_seq, 0 for everything else.
+            floor = -1 if k == "last_drained_packet_seq" else 0
+            st[k] = v if (isinstance(v, int)
+                          and not isinstance(v, bool)
+                          and v >= floor) else dflt
     return st
 
 
@@ -340,7 +367,8 @@ def incremental_scan(st, transcript):
         return st
     if st.get("inode") != stat.st_ino or stat.st_size < st.get("size", 0):
         st = dict(st, inode=stat.st_ino, size=0, offset=0, current=0,
-                  peak=0, boundaries=0, auto_boundaries=0)
+                  peak=0, boundaries=0, auto_boundaries=0,
+                  discard_to_newline=False)
     if stat.st_size == st.get("offset", 0):
         st["size"] = stat.st_size
         return st
@@ -464,7 +492,9 @@ STDIN_MAX_BYTES = 10_000_000
 
 
 def read_payload():
-    return json.loads(sys.stdin.read(STDIN_MAX_BYTES))
+    # buffer.read so the cap is BYTES (a str read counts characters
+    # and could pull ~4x the bytes); json.loads accepts bytes.
+    return json.loads(sys.stdin.buffer.read(STDIN_MAX_BYTES))
 
 
 def delivery_cap(cfg):
@@ -569,10 +599,15 @@ _PRUNE_MARKER = ".last-prune"
 def prune_state(cfg):
     """Best-effort TTL reaper for per-session files (state/packets/
     handoff/locks). Runs at most once per day; age-based, so a live
-    session's freshly-written files are never touched. Errors ignored —
-    housekeeping must never cost a hook its deadline."""
+    session's freshly-written files are never touched. Deletion is
+    deliberately narrow (audit finding): only inside a dir carrying our
+    sentinel, never through symlinked subdirs, only regular files whose
+    names match what this plugin generates, ages via lstat. Errors
+    ignored — housekeeping must never cost a hook its deadline."""
     try:
         base = cfg["state_dir"]
+        if not os.path.isfile(os.path.join(base, _SENTINEL)):
+            return  # never reap a dir this plugin didn't mark
         marker = os.path.join(base, _PRUNE_MARKER)
         now = time.time()
         try:
@@ -580,20 +615,27 @@ def prune_state(cfg):
                 return
         except OSError:
             pass
-        _private_makedirs(base)
         with open(marker, "w") as fh:
             fh.write(str(now))
         cutoff = now - cfg["state_ttl_days"] * 86_400
-        for sub in ("state", "packets", "handoff", "locks"):
+        for sub, ext in (("state", ".json"), ("packets", ".json"),
+                         ("handoff", ".md"), ("locks", ".lock")):
             d = os.path.join(base, sub)
+            if os.path.islink(d):
+                continue
             try:
                 names = os.listdir(d)
             except OSError:
                 continue
             for name in names:
+                if not name.endswith(ext):
+                    continue
                 p = os.path.join(d, name)
                 try:
-                    if os.path.getmtime(p) < cutoff:
+                    stt = os.lstat(p)
+                    if not stat_module.S_ISREG(stt.st_mode):
+                        continue
+                    if stt.st_mtime < cutoff:
                         os.unlink(p)
                 except OSError:
                     pass

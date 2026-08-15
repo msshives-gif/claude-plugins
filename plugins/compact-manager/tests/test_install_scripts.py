@@ -59,9 +59,28 @@ class CompactManagerInstallTests(unittest.TestCase):
         self.assertEqual(_hook_commands(self.read()), [])
 
     def test_install_is_idempotent(self):
-        _run(INSTALL, self.settings)
-        _run(INSTALL, self.settings)
+        r1 = _run(INSTALL, self.settings)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        r2 = _run(INSTALL, self.settings)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(len(_hook_commands(self.read())), 6)
+
+    def test_backup_suffix_lookalike_does_not_block_install(self):
+        # A command referencing "<our advisor path>.backup" must not
+        # make the installer think the real hook is already present.
+        advisor = os.path.join(PLUGIN, "hooks", "advisor.py")
+        with open(self.settings, "w") as fh:
+            json.dump({"hooks": {"PostToolUse": [
+                {"matcher": "*", "hooks": [
+                    {"type": "command",
+                     "command": f"python3 {advisor}.backup || true",
+                     "timeout": 5}]}]}}, fh)
+        r = _run(INSTALL, self.settings)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cmds = _hook_commands(self.read())
+        self.assertEqual(len(cmds), 7)  # lookalike survives + our six
+        self.assertTrue(any(advisor in c and ".backup" not in c
+                            for c in cmds))
 
     def test_uninstall_spares_sibling_and_root_plugin_hooks(self):
         # Both siblings' absolute paths contain the repo dir name; a

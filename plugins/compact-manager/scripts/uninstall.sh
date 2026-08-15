@@ -43,7 +43,7 @@ def is_ours(command):
 with open(settings_path) as fh:
     settings = json.load(fh)
 backup = (f"{settings_path}.bak-compact-manager-"
-          f"{time.strftime('%Y%m%d%H%M%S')}")
+          f"{time.strftime('%Y%m%d%H%M%S')}-{os.getpid()}")
 shutil.copy2(settings_path, backup)
 print(f"backup: {backup}")
 
