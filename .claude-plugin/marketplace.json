@@ -14,6 +14,11 @@
       "name": "cross-session-send-guard",
       "source": "./plugins/cross-session-send-guard",
       "description": "Warns before, and can gate, a SendMessage to a large idle peer session — a cold wake replays the peer's whole transcript at full price."
+    },
+    {
+      "name": "compact-manager",
+      "source": "./plugins/compact-manager",
+      "description": "Warns the main session as its own context fills, captures a wake packet before compaction, and reorients the session after it."
     }
   ]
 }

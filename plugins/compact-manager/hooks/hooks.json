@@ -1,0 +1,72 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/advisor.py\" || python \"${CLAUDE_PLUGIN_ROOT}/hooks/advisor.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/reorient.py\" || python \"${CLAUDE_PLUGIN_ROOT}/hooks/reorient.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/stop_marker.py\" || python \"${CLAUDE_PLUGIN_ROOT}/hooks/stop_marker.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/precompact.py\" || python \"${CLAUDE_PLUGIN_ROOT}/hooks/precompact.py\" || true",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/precompact.py\" || python \"${CLAUDE_PLUGIN_ROOT}/hooks/precompact.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py\" || python \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
