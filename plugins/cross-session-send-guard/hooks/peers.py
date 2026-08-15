@@ -76,7 +76,10 @@ def is_alive(entry, proc_root="/proc"):
 
 
 def _slug(cwd):
-    return cwd.replace("/", "-")
+    # Claude Code's project slug maps every non-alphanumeric character to
+    # "-" (verified live 2026-08-15: /tmp/cm_slug.test -> -tmp-cm-slug-test);
+    # separator-only replacement misses dotted/underscored cwds.
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
 
 def _read_entry(path):

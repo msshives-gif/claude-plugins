@@ -5,6 +5,7 @@ the pid-recycle case — is testable without real processes.
 """
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -70,7 +71,10 @@ class ResolveTests(unittest.TestCase):
         if proc_start is not None:
             make_proc(self.proc, pid, proc_start)
         if transcript:
-            d = os.path.join(self.projects, cwd.replace("/", "-"))
+            # Claude Code slugs every non-alphanumeric to "-" (verified
+            # live 2026-08-15); mirror the real layout here.
+            d = os.path.join(self.projects,
+                             re.sub(r"[^A-Za-z0-9]", "-", cwd))
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, f"{session_id}.jsonl"), "w") as fh:
                 fh.write("{}\n")
@@ -88,6 +92,13 @@ class ResolveTests(unittest.TestCase):
     def test_main_and_empty_are_none(self):
         self.assertIsNone(self.resolve("main"))
         self.assertIsNone(self.resolve(""))
+
+    def test_resolves_dotted_underscored_cwd(self):
+        self.add_session(101, "peer-a", "sess-aaaa-1111",
+                         cwd="/home/u/.cache/some_proj.v2")
+        got = self.resolve("peer-a")
+        self.assertIsNotNone(got)
+        self.assertIn("-home-u--cache-some-proj-v2", got["transcript"])
 
     def test_unknown_name_is_none(self):
         self.add_session(101, "peer-a", "sess-aaaa-1111")

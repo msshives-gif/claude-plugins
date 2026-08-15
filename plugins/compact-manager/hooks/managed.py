@@ -453,7 +453,10 @@ def _registry_entry(pid, sessions_dir):
 def derive_transcript(cwd, session_id, projects_dir=None):
     projects = os.path.realpath(projects_dir or
                                 os.path.expanduser("~/.claude/projects"))
-    slug = str(cwd).replace("/", "-")
+    # Claude Code's project slug maps every non-alphanumeric character to
+    # "-" (verified live: /tmp/cm_slug.test -> -tmp-cm-slug-test), not just
+    # the path separators.
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
     target = os.path.realpath(os.path.join(projects, slug,
                                            "%s.jsonl" % session_id))
     if not target.startswith(projects + os.sep) or not os.path.isfile(target):
@@ -531,8 +534,9 @@ def default_cursor():
     return {"schema": SCHEMA, "device": None, "inode": None,
             "observed_size": 0, "offset": 0, "file_epoch": 0,
             "current": 0, "boundary_count": 0, "last_boundary": None,
-            "anchor": None, "model": "", "trailing_fragment": False,
-            "caught_up": False, "_scan_error": False}
+            "anchor": None, "model": "", "discard_to_newline": False,
+            "trailing_fragment": False, "caught_up": False,
+            "_scan_error": False}
 
 
 def load_cursor(path):
@@ -552,7 +556,8 @@ def save_cursor(path, cursor):
     # Keep the durable shape exactly as pinned.  caught_up and the trailing
     # fragment bit are per-scan scheduling facts, not durable identity.
     keys = ("device", "inode", "observed_size", "offset", "file_epoch",
-            "current", "boundary_count", "last_boundary", "anchor", "model")
+            "current", "boundary_count", "last_boundary", "anchor", "model",
+            "discard_to_newline")
     _atomic_json(path, {key: cursor.get(key) for key in keys})
 
 
@@ -622,7 +627,30 @@ def scan_cursor(cursor, transcript, cap=SCAN_MAX_BYTES):
             data = fh.read(min(budget, max(0, snapshot.st_size - start)))
     except OSError:
         return dict(cursor, caught_up=False, _scan_error=True)
+    if cursor.get("discard_to_newline"):
+        # Mid-skip of a row larger than the budget: drop bytes to the
+        # next newline, then resume normal parsing (Layer 1's escape).
+        nl = data.find(b"\n")
+        if nl < 0:
+            cursor["offset"] = start + len(data)
+            cursor["observed_size"] = snapshot.st_size
+            cursor["trailing_fragment"] = True
+            cursor["caught_up"] = False
+            return cursor
+        cursor["discard_to_newline"] = False
+        start += nl + 1
+        data = data[nl + 1:]
     last_nl = data.rfind(b"\n")
+    if last_nl < 0 and len(data) >= budget:
+        # A single row larger than the whole budget can never complete;
+        # without this escape the offset would never advance and the
+        # cursor would stay uncaught-up forever (managed mode disabled).
+        cursor["offset"] = start + len(data)
+        cursor["observed_size"] = snapshot.st_size
+        cursor["discard_to_newline"] = True
+        cursor["trailing_fragment"] = True
+        cursor["caught_up"] = False
+        return cursor
     complete = data[:last_nl + 1] if last_nl >= 0 else b""
     pos = start
     for raw in complete.splitlines(keepends=True):
@@ -689,7 +717,15 @@ def journal_append(path, record):
     data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
     fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
     try:
-        os.write(fd, data)
+        # A short write would leave a torn record that recovery ignores,
+        # making the durable tail LESS conservative than the action about
+        # to be taken; write must complete fully or raise.
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short journal write")
+            view = view[written:]
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -764,10 +800,17 @@ def recover_attempt(path, current_boot_id):
         recovered["reason"] = "recovered_typed_verified"
     elif state in ("TRIGGERED", "SUBMITTED", "ACKED", "DEFERRED"):
         timers = recovered.get("timers") or {}
-        if timers.get("boot_id") != current_boot_id:
+        stored = timers.get("boot_id")
+        # "unknown" is the boot_id() failure sentinel: an unproven boot
+        # identity must never count as proven same-boot ("unknown" ==
+        # "unknown" would continue stale monotonic timers post-reboot).
+        unproven = (not stored or stored == "unknown" or
+                    not current_boot_id or current_boot_id == "unknown")
+        if unproven or stored != current_boot_id:
             recovered["state"] = "LATCHED"
             recovered["latch_kind"] = "SAFETY"
-            recovered["reason"] = "cross_boot_timer"
+            recovered["reason"] = ("unproven_boot_timer" if unproven
+                                   else "cross_boot_timer")
     return recovered
 
 
@@ -978,15 +1021,30 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
     ok, why = validate_binding(binding, cfg, paths, run_tmux, proc_root)
     capture = capture_pane(binding, run_tmux)
     packet = packet_loader()
+    # R6' re-OBSERVES the transcript rather than trusting the tick's
+    # cursor (which is stale by the whole ladder duration), and uses the
+    # full packet classification: an auto-trigger packet is foreign even
+    # after a Layer-1 seq reset, and a late own-nonce packet also means
+    # do-not-press-Enter (our retry text is typed but the first
+    # submission already landed). A scan error means the boundary state
+    # is unprovable — same abort.
+    classification = packet_classification(attempt, packet)
+    fresh = scan_cursor(dict(cursor), binding["transcript_path"])
+    generation_unchanged = (not fresh.get("_scan_error") and
+                            generation_key(generation(fresh)) ==
+                            generation_key(attempt["generation"]))
     if (not ok or capture is None or not composer_exact(capture, text) or
-            packet_seq(packet) > attempt["attempt_packet_seq_floor"] or
-            generation_key(generation(cursor)) != generation_key(attempt["generation"])):
+            classification != "NONE" or not generation_unchanged):
         if not ok:
             detail = str(why)
         elif capture is None or not composer_exact(capture, text):
             detail = "composer_mismatch"
-        elif packet_seq(packet) > attempt["attempt_packet_seq_floor"]:
-            detail = "new_packet"
+        elif classification == "OWN":
+            detail = "own_packet_late"
+        elif classification == "FOREIGN":
+            detail = "foreign_packet"
+        elif fresh.get("_scan_error"):
+            detail = "scan_unavailable"
         else:
             detail = "boundary_advanced"
         attempt.update(state="CLEANUP_REQUIRED", reason="R6_prime_%s" % detail)
@@ -1073,6 +1131,8 @@ def notify(binding, cfg, paths, attempt, run_tmux=default_run_tmux):
     message = ("compact-manager %s for %s: %s; run compact-manager status"
                % (attempt["state"], binding["session_id"],
                   cm.sanitize(attempt.get("reason", "operator action required"), 120)))
+    # display-message expands #{...} formats; "##" renders a literal "#".
+    message = message.replace("#", "##")
     cm.ledger_append(cfg, {"event": "managed_alert", "state": attempt["state"],
                            "session_id": binding["session_id"],
                            "run_token": binding["run_token"],
@@ -1134,6 +1194,29 @@ class Watcher:
                 self.attempt.get("state") != previous:
             notify(self.binding, self.cfg, self.paths, self.attempt, self.run_tmux)
 
+    def _transient(self, reason):
+        """Validation failures that mean WAIT, not retire: job-control
+        suspends, tmux copy-mode, and a pane hiccup while the bound
+        claude is provably still alive. Everything else (tty change,
+        command change, claude death, lease loss) retires."""
+        return (reason in ("foreground_lost", "pane_in_mode") or
+                (reason == "pane_missing" and proc_matches(
+                    self.binding["claude_pid"], self.binding["claude_start"],
+                    self.proc_root)))
+
+    def _heartbeat_due(self, now):
+        """Beat both leases if due; False means ownership was lost."""
+        if now >= self.next_heartbeat:
+            try:
+                if not heartbeat_leases(self.paths, self.binding["run_token"],
+                                        self.wall()):
+                    return False
+            except Exception as exc:
+                cm.ledger_append(self.cfg, {"event": "managed_heartbeat_error",
+                                            "error": cm.sanitize(repr(exc), 200)})
+            self.next_heartbeat = now + HEARTBEAT_S
+        return True
+
     def tick(self):
         now = self.monotonic()
         if self.attempt and self.attempt.get("state") in ALERT_STATES:
@@ -1158,26 +1241,27 @@ class Watcher:
         ok, reason = validate_binding(self.binding, self.cfg, self.paths,
                                       self.run_tmux, self.proc_root)
         if not ok:
-            if reason == "foreground_lost" and not (self.attempt and
-                    self.attempt.get("state") in
-                    ("PREPARED", "TYPED_VERIFIED", "SUBMITTED", "ACKED")):
-                return True, "foreground_lost"
-            if self.attempt and self.attempt.get("state") in (
-                    "PREPARED", "TYPED_VERIFIED", "SUBMITTED", "ACKED"):
+            typed = (self.attempt and self.attempt.get("state") in
+                     ("PREPARED", "TYPED_VERIFIED", "SUBMITTED", "ACKED"))
+            if self._transient(reason) and not typed:
+                # A pending pre-typing attempt must not stay durably
+                # TRIGGERED across the transient: journal the defer once.
+                if self.attempt and self.attempt.get("state") == "TRIGGERED":
+                    self.attempt["state"] = "DEFERRED"
+                    self.attempt["reason"] = reason
+                    self.attempt.setdefault("timers", {})["next_attempt_at"] = (
+                        now + self.backoff)
+                    journal_record(self.paths["journal"], "DEFERRED",
+                                   self.attempt, reason=reason)
+                return True, reason
+            if typed:
                 self.attempt.update(state="CLEANUP_REQUIRED", reason=reason)
                 journal_record(self.paths["journal"], "CLEANUP_REQUIRED",
                                self.attempt, reason=reason)
                 self.alert_if_needed()
             return False, reason
-        if now >= self.next_heartbeat:
-            try:
-                if not heartbeat_leases(self.paths, self.binding["run_token"],
-                                        self.wall()):
-                    return False, "lease_lost"
-            except Exception as exc:
-                cm.ledger_append(self.cfg, {"event": "managed_heartbeat_error",
-                                           "error": cm.sanitize(repr(exc), 200)})
-            self.next_heartbeat = now + HEARTBEAT_S
+        if not self._heartbeat_due(now):
+            return False, "lease_lost"
         old_generation = generation(self.cursor)
         request = validate_request(self.paths["request"], self.wall())
         if request is not None and request["request_id"] not in self.request_history:
@@ -1213,8 +1297,24 @@ class Watcher:
                     "CLEANUP_REQUIRED", "SUBMISSION_UNCERTAIN"):
                 return True, self.attempt["state"]
             if self.attempt.get("state") == "BOUNDARY_CONFIRMED":
-                self.attempt = None
                 self.backoff = BACKOFF_INITIAL_S
+                eff = cm.window_for(self.cfg, self.cursor.get("model"))
+                pct = self.cursor.get("current", 0) / eff["context_window"]
+                if pct >= (self.cfg["managed_trigger_pct"] -
+                           self.cfg["rearm_band_pct"]):
+                    # The completed compaction left the session at/near the
+                    # trigger; re-firing immediately would loop. THRESHOLD
+                    # latch until pct re-arms below the band (the LATCHED
+                    # branch above clears it).
+                    self.attempt = transition_attempt(
+                        self.attempt, "threshold_latch", now, self.cfg)
+                    self.attempt["generation"] = current_generation
+                    journal_record(self.paths["journal"], "LATCHED",
+                                   self.attempt, latch_kind="THRESHOLD",
+                                   reason="still_above_rearm_band")
+                    self.alert_if_needed("BOUNDARY_CONFIRMED")
+                    return True, "latched"
+                self.attempt = None
             elif self.attempt.get("state") == "LATCHED":
                 if self.attempt.get("latch_kind") == "THRESHOLD":
                     eff = cm.window_for(self.cfg, self.cursor.get("model"))
@@ -1318,28 +1418,24 @@ class Watcher:
         while not self.cursor.get("caught_up"):
             if self.stop_requested or self.monotonic() >= self.deadline:
                 return
-            valid, _ = validate_binding(
+            valid, why = validate_binding(
                 self.binding, self.cfg, self.paths, self.run_tmux,
                 self.proc_root)
             if not valid:
-                return
+                if not self._transient(why):
+                    return
+                if not self._heartbeat_due(self.monotonic()):
+                    return
+                self.wait(min(self.cfg["managed_poll_s"], HEARTBEAT_S))
+                continue
             before = (self.cursor.get("file_epoch"), self.cursor.get("offset"))
             self.cursor = scan_cursor(
                 self.cursor, self.binding["transcript_path"], SCAN_MAX_BYTES)
             if self.cursor.get("_scan_error"):
                 return
             save_cursor(self.paths["scan"], self.cursor)
-            now = self.monotonic()
-            if now >= self.next_heartbeat:
-                try:
-                    if not heartbeat_leases(
-                            self.paths, self.binding["run_token"], self.wall()):
-                        return
-                except Exception as exc:
-                    cm.ledger_append(
-                        self.cfg, {"event": "managed_heartbeat_error",
-                                   "error": cm.sanitize(repr(exc), 200)})
-                self.next_heartbeat = now + HEARTBEAT_S
+            if not self._heartbeat_due(self.monotonic()):
+                return
             after = (self.cursor.get("file_epoch"), self.cursor.get("offset"))
             if after == before:
                 break
@@ -1370,7 +1466,12 @@ def _write_handshake(fd, value):
 def watcher_entry(args):
     cfg = load_config()
     binding = json.loads(args.binding_json)
-    run_token = os.urandom(8).hex()
+    # The parent generated the token before the spawn so that its
+    # handshake-timeout cleanup can conditionally remove exactly this
+    # child's leases and no other watcher's. Fall back only if absent.
+    run_token = binding.get("run_token") or ""
+    if not re.match(r"^[0-9a-f]{16}$", run_token):
+        run_token = os.urandom(8).hex()
     binding["run_token"] = run_token
     paths = managed_paths(cfg, binding["session_id"], binding["socket"],
                           binding["pane_id"])
@@ -1394,6 +1495,16 @@ def watcher_entry(args):
             release_leases(paths, run_token)
             return 1
         recovered = recover_attempt(paths["journal"], boot_id())
+        # A synthesized conservative mapping (PREPARED->CLEANUP_REQUIRED,
+        # TYPED_VERIFIED->SUBMISSION_UNCERTAIN, unproven/cross-boot->
+        # LATCHED) must be DURABLE before readiness: otherwise the raw
+        # tail keeps claiming the less conservative state to status,
+        # resolve, and any later recovery.
+        raw_tail = attempt_tail(paths["journal"])
+        if (recovered is not None and raw_tail is not None and
+                recovered.get("state") != raw_tail.get("state")):
+            journal_record(paths["journal"], recovered["state"], recovered,
+                           reason=recovered.get("reason"))
         ready_attempt = {"run_token": run_token,
                          "generation": generation(default_cursor())}
         journal_record(paths["journal"], "WATCHER_READY", ready_attempt,
@@ -1429,6 +1540,7 @@ def watcher_entry(args):
 
 def spawn_watcher(binding, timeout=10.0):
     """setsid + double fork + exec, with a two-way cancellable handshake."""
+    binding = dict(binding, run_token=os.urandom(8).hex())
     cancel_r, cancel_w = os.pipe()
     ready_r, ready_w = os.pipe()
     for fd in (cancel_r, ready_w):
@@ -1471,21 +1583,16 @@ def spawn_watcher(binding, timeout=10.0):
                 except OSError:
                     break
                 time.sleep(0.05)
-            # The parent knows the binding and can conditionally clean only a
-            # lease whose recorded watcher is now dead.  Token and inode are
-            # re-read under the transaction by release_leases.
+            # Cleanup may remove ONLY the token this parent generated for
+            # its own child — never a token it merely observed in a lease
+            # file, which could belong to a live successor (the
+            # loser-deletes-successor hole). release_leases re-verifies
+            # the token under the transaction; any other lease is left
+            # for conservative staleness-based reclaim.
             cfg = load_config()
             paths = managed_paths(cfg, binding["session_id"],
                                   binding["socket"], binding["pane_id"])
-            cleanup_deadline = time.monotonic() + 1.0
-            while time.monotonic() < cleanup_deadline:
-                lease, _ = read_json_inode(paths["session_lease"])
-                if not lease:
-                    break
-                if not proc_matches(lease.get("pid"), lease.get("proc_start")):
-                    release_leases(paths, lease.get("run_token"))
-                    break
-                time.sleep(0.05)
+            release_leases(paths, binding["run_token"])
             return {"ok": False, "error": "watcher handshake timeout"}
         raw = os.read(ready_r, 65_536)
         return json.loads(raw.splitlines()[0])
@@ -1521,12 +1628,16 @@ def status_rows(cfg):
     except OSError:
         journal_sids = set()
     rows = []
+    current_boot = boot_id()
     for sid in sorted(set(leases) | journal_sids):
         lease = leases.get(sid, {})
         paths = managed_paths(cfg, sid)
         # The pane hash is unavailable from a session-only listing; status is
-        # lease/journal oriented and does not guess a pane binding.
-        tail = attempt_tail(paths["journal"])
+        # lease/journal oriented and does not guess a pane binding. The
+        # displayed state is the CONSERVATIVE recovery mapping of the raw
+        # tail (a crashed watcher's PREPARED tail is a cleanup hazard, and
+        # must be shown as one even before any re-adopt persists it).
+        tail = recover_attempt(paths["journal"], current_boot)
         rows.append({"session_id": sid, "run_token": lease.get("run_token"),
                      "pid": lease.get("pid"),
                      "live": bool(lease) and lease_is_live(lease),
@@ -1574,7 +1685,10 @@ def stop_session(cfg, sid, timeout=10.0, proc_root="/proc"):
 def resolve_session(cfg, sid):
     paths = managed_paths(cfg, sid)
     with txn_lock(paths["txn"]):
-        tail = attempt_tail(paths["journal"])
+        # Judge resolvability on the conservative recovery mapping, not
+        # the raw tail: a crashed watcher's PREPARED/TYPED_VERIFIED tail
+        # IS the hazard the operator is resolving.
+        tail = recover_attempt(paths["journal"], boot_id())
         if tail is None or tail.get("state") not in ALERT_STATES:
             return False, "nothing resolvable"
         token = tail.get("run_token")
@@ -1683,7 +1797,8 @@ def cli_main(argv=None, run_tmux=default_run_tmux):
         print(json.dumps(rows, indent=2, sort_keys=True))
         return 0
     elif args.command == "stop":
-        tail = attempt_tail(managed_paths(cfg, args.sid)["journal"])
+        tail = recover_attempt(managed_paths(cfg, args.sid)["journal"],
+                               boot_id())
         if tail and tail.get("state") in ALERT_STATES:
             print("ALERT %s: %s" % (tail["state"],
                                     tail.get("reason", "operator action required")))

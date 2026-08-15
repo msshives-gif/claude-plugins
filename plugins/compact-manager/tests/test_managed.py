@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -90,6 +91,23 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(binding["transcript_path"], self.transcript)
         self.assertEqual(binding["pane_root_start"], 1010)
         self.assertTrue(binding["attended"])
+
+    def test_derives_transcript_for_dotted_underscored_cwd(self):
+        # Claude Code slugs EVERY non-alphanumeric to "-" (verified live);
+        # a cwd like ~/.cache/foo_bar must still resolve.
+        cwd = "/work/.here_x"
+        with open(os.path.join(self.sessions, "20.json"), "w") as fh:
+            json.dump({"pid": 20, "procStart": "2020",
+                       "sessionId": "session-1234", "cwd": cwd}, fh)
+        project = os.path.join(self.projects, "-work--here-x")
+        os.makedirs(project)
+        transcript = os.path.join(project, "session-1234.jsonl")
+        append_rows(transcript, [usage_row(1)])
+        binding, error = managed.build_binding(
+            "", "%1", True, self.runner, self.proc, self.sessions,
+            self.projects)
+        self.assertIsNone(error)
+        self.assertEqual(binding["transcript_path"], transcript)
 
     def test_rejects_registry_procstart_mismatch(self):
         with open(os.path.join(self.sessions, "20.json"), "w") as fh:
@@ -295,9 +313,26 @@ class CursorTests(unittest.TestCase):
             value = json.load(fh)
         self.assertEqual(set(value), {
             "device", "inode", "observed_size", "offset", "file_epoch",
-            "current", "boundary_count", "last_boundary", "anchor", "model"})
+            "current", "boundary_count", "last_boundary", "anchor", "model",
+            "discard_to_newline"})
         self.assertEqual(set(value["anchor"]),
                          {"offset", "sha256_of_first_row"})
+
+    def test_giant_row_discard_keeps_advancing(self):
+        # A single row larger than the scan budget must not stall the
+        # cursor forever; the discard escape skips to the next newline
+        # and later rows (including boundaries) still parse.
+        append_rows(self.path, [b"x" * 1000, usage_row(42),
+                                boundary_row(post=7)])
+        cursor = managed.default_cursor()
+        for _ in range(40):
+            cursor = managed.scan_cursor(cursor, self.path, cap=300)
+            if cursor.get("caught_up"):
+                break
+        self.assertTrue(cursor["caught_up"])
+        self.assertEqual(cursor["current"], 7)
+        self.assertEqual(cursor["boundary_count"], 1)
+        self.assertFalse(cursor["discard_to_newline"])
 
     def test_missing_transcript_cannot_remain_caught_up(self):
         append_rows(self.path, [usage_row(10)])
@@ -500,6 +535,14 @@ class JournalRecoveryTests(unittest.TestCase):
         self.assertEqual((out["state"], out["latch_kind"]),
                          ("LATCHED", "SAFETY"))
 
+    def test_unknown_boot_id_is_unproven_and_latches(self):
+        # "unknown" == "unknown" must NOT count as proven same-boot: a
+        # stale monotonic deadline would fire immediately post-reboot.
+        self.record("SUBMITTED", boot="unknown")
+        out = managed.recover_attempt(self.path, "unknown")
+        self.assertEqual((out["state"], out["latch_kind"], out["reason"]),
+                         ("LATCHED", "SAFETY", "unproven_boot_timer"))
+
 
 class RequestConfigInstructionTests(unittest.TestCase):
     def setUp(self):
@@ -634,6 +677,18 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual((tail["state"], tail["latch_kind"], tail["reason"]),
                          ("LATCHED", "SAFETY", "operator_resolved"))
 
+    def test_crashed_prepared_tail_is_visible_and_resolvable(self):
+        # A crashed watcher leaves a raw PREPARED tail; status and
+        # resolve must judge it through the conservative recovery
+        # mapping (CLEANUP_REQUIRED), not the raw state.
+        managed.journal_record(self.paths["journal"], "PREPARED",
+                               dict(self.attempt, state="PREPARED"))
+        rows = managed.status_rows(self.cfg)
+        mine = [r for r in rows if r["session_id"] == self.sid]
+        self.assertEqual(mine[0]["state"], "CLEANUP_REQUIRED")
+        ok, message = managed.resolve_session(self.cfg, self.sid)
+        self.assertTrue(ok, message)
+
     def test_live_resolve_requires_same_token_on_both_leases(self):
         live = managed.proc_stat(os.getpid())
         self.leases(os.getpid(), live["starttime"], time.time())
@@ -669,6 +724,294 @@ class LadderPredicateTests(unittest.TestCase):
             rows = [json.loads(line) for line in fh]
         row = next(x for x in rows if x.get("scenario") == "f_half_typed")
         self.assertFalse(managed.composer_idle(row["composer_after"]))
+
+
+IDLE = "❯ "
+
+
+class LadderTmux:
+    """Scripted tmux seam: fixed pane facts, queued captures, recorded
+    send-keys. The queue's last capture repeats once exhausted."""
+
+    def __init__(self, captures, send_rc=0, enter_rc=0):
+        self.captures = list(captures)
+        self.sent = []
+        self.send_rc, self.enter_rc = send_rc, enter_rc
+        self.display_rc = 0
+        self.facts = "%1\t/dev/pts/7\t10\tclaude\t0\t120\t40\t$1\n"
+
+    def __call__(self, argv, timeout=5):
+        argv = list(argv)
+        cmd = argv[2] if argv[:1] == ["-S"] else argv[0]
+        if cmd == "display-message":
+            return Result(self.facts, self.display_rc)
+        if cmd == "capture-pane":
+            cap = (self.captures.pop(0) if len(self.captures) > 1
+                   else self.captures[0])
+            return Result(cap)
+        if cmd == "send-keys":
+            self.sent.append(argv)
+            rc = self.enter_rc if argv[-1] == "Enter" else self.send_rc
+            return Result("", rc)
+        return Result("")
+
+    def enters(self):
+        return [a for a in self.sent if a[-1] == "Enter"]
+
+
+class EchoTmux:
+    """Fake tmux whose pane echoes typed text like a real composer:
+    idle until send-keys -l, then IDLE+text, cleared again on Enter."""
+
+    def __init__(self):
+        self.sent = []
+        self.typed = ""
+        self.display_rc = 0
+        self.facts = "%1\t/dev/pts/7\t10\tclaude\t0\t120\t40\t$1\n"
+
+    def __call__(self, argv, timeout=5):
+        argv = list(argv)
+        cmd = argv[2] if argv[:1] == ["-S"] else argv[0]
+        if cmd == "display-message":
+            return Result(self.facts, self.display_rc)
+        if cmd == "capture-pane":
+            return Result(IDLE + self.typed)
+        if cmd == "send-keys":
+            self.sent.append(argv)
+            if argv[-1] == "Enter":
+                self.typed = ""
+            elif "-l" in argv:
+                self.typed += argv[-1]
+            return Result("")
+        return Result("")
+
+
+class RunLadderTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.proc = os.path.join(self.temp.name, "proc")
+        write_proc(self.proc, 10, 20, 1010)
+        write_proc(self.proc, 20, 20, 2020)
+        self.cfg = managed.load_config(
+            base=dict(cm._DEFAULTS, state_dir=self.temp.name), environ={})
+        self.sid = "session-1234"
+        self.token = "a" * 16
+        self.paths = managed.managed_paths(self.cfg, self.sid, "sock", "%1")
+        lease = {"run_token": self.token, "pid": 20, "proc_start": 2020,
+                 "heartbeat_at": time.time()}
+        managed._atomic_json(self.paths["session_lease"], lease)
+        managed._atomic_json(self.paths["pane_lease"], lease)
+        self.transcript = os.path.join(self.temp.name, "t.jsonl")
+        append_rows(self.transcript, [usage_row(50)])
+        self.cursor = managed.initial_scan(managed.default_cursor(),
+                                           self.transcript)
+        self.binding = {"socket": "sock", "pane_id": "%1",
+                        "pane_tty": "/dev/pts/7", "pane_root_pid": 10,
+                        "pane_root_start": 1010, "claude_pid": 20,
+                        "claude_start": 2020, "session_id": self.sid,
+                        "transcript_path": self.transcript,
+                        "tmux_session_id": "$1", "run_token": self.token,
+                        "attended": True}
+        self.attempt = managed.new_attempt(
+            self.token, managed.generation(self.cursor), 0, 0.0, "boot")
+        self.text = managed.instruction_text(self.attempt["nonce"])
+
+    def run_ladder(self, tmux, packet=None):
+        return managed.run_ladder(
+            self.binding, self.cfg, self.paths, self.attempt, self.cursor,
+            self.paths["journal"], lambda: packet, tmux, self.proc,
+            wait=lambda seconds: None, now_mono=lambda: 0.0)
+
+    def test_happy_path_submits(self):
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text,
+                           IDLE])
+        out = self.run_ladder(tmux)
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(len(tmux.enters()), 1)
+        self.assertTrue(any(a[-1] == self.text for a in tmux.sent))
+
+    def test_r5_mismatch_is_cleanup_and_never_enters(self):
+        tmux = LadderTmux([IDLE, IDLE, IDLE + "x" + self.text])
+        out = self.run_ladder(tmux)
+        self.assertEqual(out["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(out["reason"], "R5_composer_mismatch")
+        self.assertEqual(tmux.enters(), [])
+
+    def test_r6_foreign_packet_aborts_before_enter(self):
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text])
+        out = self.run_ladder(tmux, packet={"seq": 1})
+        self.assertEqual(out["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(out["reason"], "R6_prime_foreign_packet")
+        self.assertEqual(tmux.enters(), [])
+
+    def test_r6_auto_packet_foreign_even_after_seq_reset(self):
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text])
+        out = self.run_ladder(tmux, packet={"seq": 0, "trigger": "auto"})
+        self.assertEqual(out["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(out["reason"], "R6_prime_foreign_packet")
+        self.assertEqual(tmux.enters(), [])
+
+    def test_r6_own_late_packet_aborts_before_enter(self):
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text])
+        packet = {"seq": 7,
+                  "custom_instructions": "[cm-%s]" % self.attempt["nonce"]}
+        out = self.run_ladder(tmux, packet=packet)
+        self.assertEqual(out["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(out["reason"], "R6_prime_own_packet_late")
+        self.assertEqual(tmux.enters(), [])
+
+    def test_r6_reobserves_boundary_advance(self):
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text])
+        append_rows(self.transcript, [boundary_row(post=5)])
+        out = self.run_ladder(tmux)
+        self.assertEqual(out["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(out["reason"], "R6_prime_boundary_advanced")
+        self.assertEqual(tmux.enters(), [])
+
+    def test_enter_failure_is_submission_uncertain(self):
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text],
+                          enter_rc=1)
+        out = self.run_ladder(tmux)
+        self.assertEqual(out["state"], "SUBMISSION_UNCERTAIN")
+
+    def test_composer_not_cleared_is_submission_uncertain(self):
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text,
+                           IDLE + self.text, IDLE + self.text])
+        out = self.run_ladder(tmux)
+        self.assertEqual(out["state"], "SUBMISSION_UNCERTAIN")
+        self.assertEqual(out["reason"], "composer_not_cleared")
+
+
+class TickWiringTests(unittest.TestCase):
+    """Watcher.tick() driven end-to-end through the injectable seams."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.proc = os.path.join(self.temp.name, "proc")
+        write_proc(self.proc, 10, 20, 1010)
+        write_proc(self.proc, 20, 20, 2020)
+        self.cfg = managed.load_config(
+            base=dict(cm._DEFAULTS, state_dir=self.temp.name), environ={})
+        self.sid = "session-1234"
+        self.token = "a" * 16
+        self.paths = managed.managed_paths(self.cfg, self.sid, "sock", "%1")
+        lease = {"run_token": self.token, "pid": 20, "proc_start": 2020,
+                 "heartbeat_at": time.time()}
+        managed._atomic_json(self.paths["session_lease"], lease)
+        managed._atomic_json(self.paths["pane_lease"], lease)
+        self.transcript = os.path.join(self.temp.name, "t.jsonl")
+        self.binding = {"socket": "sock", "pane_id": "%1",
+                        "pane_tty": "/dev/pts/7", "pane_root_pid": 10,
+                        "pane_root_start": 1010, "claude_pid": 20,
+                        "claude_start": 2020, "session_id": self.sid,
+                        "transcript_path": self.transcript,
+                        "tmux_session_id": "$1", "run_token": self.token,
+                        "attended": True}
+
+    def make_watcher(self, rows, tmux):
+        append_rows(self.transcript, rows)
+        return managed.Watcher(self.binding, self.cfg, self.paths,
+                               run_tmux=tmux, proc_root=self.proc,
+                               wait=lambda seconds: None)
+
+    def test_copy_mode_is_transient_not_retire(self):
+        tmux = LadderTmux([IDLE])
+        tmux.facts = "%1\t/dev/pts/7\t10\tclaude\t1\t120\t40\t$1\n"
+        watcher = self.make_watcher([usage_row(50)], tmux)
+        self.assertEqual(watcher.tick(), (True, "pane_in_mode"))
+
+    def test_pane_hiccup_with_live_claude_waits(self):
+        tmux = LadderTmux([IDLE])
+        tmux.display_rc = 1
+        watcher = self.make_watcher([usage_row(50)], tmux)
+        self.assertEqual(watcher.tick(), (True, "pane_missing"))
+
+    def test_pane_missing_with_dead_claude_retires(self):
+        tmux = LadderTmux([IDLE])
+        tmux.display_rc = 1
+        watcher = self.make_watcher([usage_row(50)], tmux)
+        shutil.rmtree(os.path.join(self.proc, "20"))
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (False, "pane_missing"))
+
+    def test_boundary_confirmed_latches_threshold_when_still_full(self):
+        rows = [usage_row(170000), boundary_row(post=170000)]
+        watcher = self.make_watcher(rows, LadderTmux([IDLE]))
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(managed.default_cursor()),
+            0, 0.0, "boot")
+        watcher.attempt["state"] = "SUBMITTED"
+        watcher.attempt["timers"]["ack_deadline_mono"] = 10 ** 9
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertEqual((watcher.attempt["state"],
+                          watcher.attempt["latch_kind"]),
+                         ("LATCHED", "THRESHOLD"))
+
+    def test_boundary_confirmed_clears_when_rearmed(self):
+        rows = [usage_row(170000), boundary_row(post=5000)]
+        watcher = self.make_watcher(rows, LadderTmux([IDLE]))
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(managed.default_cursor()),
+            0, 0.0, "boot")
+        watcher.attempt["state"] = "SUBMITTED"
+        watcher.attempt["timers"]["ack_deadline_mono"] = 10 ** 9
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+        self.assertIsNone(watcher.attempt)
+
+    def test_threshold_trigger_runs_ladder_to_submitted(self):
+        watcher = self.make_watcher([usage_row(170000)], EchoTmux())
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "SUBMITTED"))
+        states = [r["state"] for r in
+                  managed.read_journal(self.paths["journal"])]
+        for want in ("TRIGGERED", "PREPARED", "TYPED_VERIFIED", "SUBMITTED"):
+            self.assertIn(want, states)
+
+    def test_request_triggers_below_threshold_with_fingerprint(self):
+        watcher = self.make_watcher([usage_row(50)], EchoTmux())
+        cm._private_makedirs(os.path.dirname(self.paths["request"]))
+        with open(self.paths["request"], "w") as fh:
+            json.dump({"request_id": "please-compact-now"}, fh)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "SUBMITTED"))
+        triggered = [r for r in managed.read_journal(self.paths["journal"])
+                     if r.get("state") == "TRIGGERED"]
+        self.assertEqual(
+            triggered[-1]["request_fingerprint"]["request_id"],
+            "please-compact-now")
+
+
+class WatcherDeadlineTests(unittest.TestCase):
+    def test_deadline_expiry_retires_before_any_tmux_call(self):
+        # The absolute deadline cannot be exercised live (1h floor); pin it
+        # here: an expired watcher retires before touching tmux or leases.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        cfg = managed.load_config(
+            base=dict(cm._DEFAULTS, state_dir=temp.name), environ={})
+        paths = managed.managed_paths(cfg, "session-1234", "sock", "%1")
+        clock = iter([0.0, 0.0, cfg["managed_deadline_hours"] * 3600 + 1.0])
+        calls = []
+
+        def runner(argv, timeout=5):
+            calls.append(argv)
+            return Result("")
+        binding = {"socket": "sock", "pane_id": "%1", "pane_tty": "t",
+                   "pane_root_pid": 1, "pane_root_start": 1,
+                   "claude_pid": 2, "claude_start": 2,
+                   "session_id": "session-1234", "transcript_path": "/none",
+                   "tmux_session_id": "$1", "run_token": "a" * 16,
+                   "attended": True}
+        watcher = managed.Watcher(binding, cfg, paths, run_tmux=runner,
+                                  proc_root=temp.name,
+                                  monotonic=lambda: next(clock))
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (False, "deadline"))
+        self.assertEqual(calls, [])
 
 
 class StopSessionTests(unittest.TestCase):
