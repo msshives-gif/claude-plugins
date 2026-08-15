@@ -965,18 +965,25 @@ def instruction_text(nonce):
     return text
 
 
+def _composer_line(capture):
+    # capture-pane -J (required to re-join wrapped lines) PRESERVES
+    # trailing spaces, so the live composer captures as "❯"+NBSP+padding
+    # (verified live in the gate suite). Strip trailing ASCII spaces/CR
+    # only — the NBSP signature stays significant, so a shell's bare
+    # "❯ " prompt still fails the idle check.
+    lines = [line.rstrip("\r ") for line in capture.splitlines()
+             if line.startswith("❯")]
+    return lines[-1] if lines else None
+
+
 def composer_idle(capture):
     if "esc to interrupt" in capture.lower():
         return False
-    lines = [line.rstrip("\r") for line in capture.splitlines()
-             if line.startswith("❯")]
-    return bool(lines) and lines[-1] == "❯\u00a0"
+    return _composer_line(capture) == "❯\u00a0"
 
 
 def composer_exact(capture, text):
-    lines = [line.rstrip("\r") for line in capture.splitlines()
-             if line.startswith("❯")]
-    return bool(lines) and lines[-1] == "❯\u00a0" + text
+    return _composer_line(capture) == "❯\u00a0" + text
 
 
 def capture_pane(binding, run_tmux=default_run_tmux):

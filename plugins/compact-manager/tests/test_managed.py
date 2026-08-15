@@ -755,6 +755,18 @@ class LadderPredicateTests(unittest.TestCase):
         self.assertFalse(managed.composer_exact("x\n❯\u00a0BAD" + text, text))
         self.assertFalse(managed.composer_exact("x\n❯\u00a0" + text + "x", text))
 
+    def test_trailing_capture_padding_is_ignored(self):
+        # capture-pane -J preserves trailing spaces (live-gate catch):
+        # the padded composer is still idle / still exact, while a
+        # shell's "❯ "+padding (no NBSP) is still rejected.
+        self.assertTrue(managed.composer_idle("❯ " + " " * 40))
+        self.assertFalse(managed.composer_idle("❯" + " " * 40))
+        text = managed.instruction_text("a" * 16)
+        self.assertTrue(managed.composer_exact(
+            "x\n❯ " + text + " " * 30, text))
+        self.assertFalse(managed.composer_exact(
+            "x\n❯ user " + text + " " * 30, text))
+
     def test_s6_capture_half_typed_predicate(self):
         capture_path = os.path.abspath(os.path.join(
             HERE, "..", "..", "..", "tools", "s6", "captures",
