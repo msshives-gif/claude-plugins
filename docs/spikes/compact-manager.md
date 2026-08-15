@@ -129,3 +129,14 @@ underlying shell mid-ladder after R3's re-check (~1s window) — M3
 adds a pane_current_command re-check immediately before Enter to
 shrink this to milliseconds. Verdict: attended-session injection is
 viable with the ladder as primary defense.
+
+## S7 — foreground-group binding verified live (2026-08-15)
+
+On a real attended pane (user shell -> claude): `#{pane_pid}` = the
+shell; `/proc/<pane_pid>/stat` tpgid (field 8 in proc(5) numbering =
+6th field after the comm's closing paren — parse after the LAST ")")
+resolved directly to the claude process, which was its own process
+group leader and had a live `~/.claude/sessions/<pid>.json` entry
+whose sessionId matched the session actually running in that pane.
+The rev-2 binding walk (pane -> tpgid -> registry, procStart
+live-checked) is implementable exactly as planned.
