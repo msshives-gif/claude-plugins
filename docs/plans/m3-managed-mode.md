@@ -1,6 +1,15 @@
 # M3 — compact-manager v0.2.0 `managed` mode (Layer 2), revision 4
 
-Status: BUILD-READY. Rev 4 folds the round-3 convergence audit
+Status: SHIPPED 2026-08-15. Both post-build gates passed: two-family
+code audit (round 1: Sol 4C/3M/1m + Opus 1M, all folded; round 2
+fresh pair: Opus SHIP, Sol 4M/3m no-critical, all folded) and the
+live regression suite (tools/live-managed/run.sh, 20/20 on the final
+run; earlier runs caught and fixed: daemon-stdio inheritance hang,
+capture -J trailing-padding blinding the composer predicates,
+THRESHOLD-latch stale-own-packet re-ACK + growth-based re-arm,
+virgin-session transcript-pending binding for start mode).
+
+Original status: BUILD-READY. Rev 4 folds the round-3 convergence audit
 (Opus: BUILD-WITH-CHANGES, 2 should-fix; Sol: RETHINK, 5 blockers —
 all protocol pins, zero redesigns; the two reports overlap on the
 parent/watcher lease handoff, READY conflation, and composer

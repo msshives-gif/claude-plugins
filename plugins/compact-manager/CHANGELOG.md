@@ -2,6 +2,10 @@
 
 ## 0.2.0 — 2026-08-15
 
+Released after two two-family code-audit rounds (all findings folded)
+and a 20/20 live regression run against the real CLI over tmux
+(tools/live-managed/run.sh — gated, run manually).
+
 Layer 2: `managed` mode. A per-session watcher daemon (started
 explicitly with `bin/compact-manager start|adopt`; installing the
 plugin alone still changes nothing) tails the session transcript with
