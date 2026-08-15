@@ -102,8 +102,8 @@ Enable per config (`~/.claude/compact-manager.json`) or env:
 ## Install
 
 ```
-/plugin marketplace add msshives-gif/subagent-context
-/plugin install compact-manager@subagent-context
+/plugin marketplace add msshives-gif/claude-plugins
+/plugin install compact-manager@claude-plugins
 ```
 
 Manual (no plugin system): `./scripts/install.sh` merges the five

@@ -18,7 +18,7 @@ def _body(path, skip_header_lines=0):
 
 class VendorSyncTests(unittest.TestCase):
     def test_vendored_core_matches_upstream(self):
-        upstream = _body(os.path.join(REPO, "hooks", "subagent_context.py"))
+        upstream = _body(os.path.join(REPO, "plugins", "subagent-context", "hooks", "subagent_context.py"))
         vendored = _body(os.path.join(PLUGIN, "hooks", "_core.py"),
                          skip_header_lines=4)
         self.assertEqual(

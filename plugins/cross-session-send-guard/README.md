@@ -43,8 +43,8 @@ than no warning); two pids for one resumed session are fine.
 ## Install
 
 ```
-/plugin marketplace add msshives-gif/subagent-context
-/plugin install cross-session-send-guard@subagent-context
+/plugin marketplace add msshives-gif/claude-plugins
+/plugin install cross-session-send-guard@claude-plugins
 ```
 
 Manual: `./scripts/install.sh` (merges the one hook into

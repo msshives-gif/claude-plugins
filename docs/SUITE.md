@@ -1,41 +1,30 @@
-# Suite layout decision (2026-08-15)
+# Suite layout decision (2026-08-15, rev 2)
 
-**Decision: subagent-context stays rooted at `./`; sibling plugins live
-under `plugins/<name>/`; the marketplace keeps the name
-`subagent-context`.** Suite identity ("claude context tools") is
-carried by the README umbrella and the marketplace description only.
+**Decision: uniform marketplace monorepo named `claude-plugins`.**
+Every plugin lives under `plugins/<name>/`; one marketplace at the
+repo root; install ids are `<plugin>@claude-plugins`. The repo was
+renamed from `subagent-context` (GitHub redirects the old slug).
 
-## Why not a uniform `plugins/` migration (considered, rejected)
+## Why this shape
 
-- The install identity is `<pluginName>@<marketplaceName>` =
-  `subagent-context@subagent-context`. Both components survive either
-  layout, so identity doesn't decide it.
-- Moving the shipped plugin's `source` from `./` to a subdir relies on
-  unverified Claude Code behavior (whether `marketplace update`
-  re-points an installed plugin when only its source path moves —
-  `renames` covers plugin *name* changes only). Risking the proven,
-  tagged v0.3.0 for cosmetic symmetry is a bad trade.
-- Renaming the marketplace to a suite name would rewrite every existing
-  install id and break it.
+- One repo scales for "keep adding tools": a new plugin is a subdir
+  plus a marketplace entry. This is also the dominant ecosystem shape
+  for personal marketplaces (claude-plugins-official and popular
+  personal marketplaces are monorepos).
+- All plugins share one risk surface (undocumented Claude Code
+  transcript/registry formats) and, where needed verbatim, a vendored
+  measurement core — one place to notice and fix format drift.
+- Separate-repos-plus-umbrella was considered and rejected: it taxes
+  every future tool with repo setup and multiplies format-drift fixes,
+  and its main benefit (install-id branding) is achieved by the
+  marketplace name alone.
 
-Revisit only if Claude Code documents source-move behavior on update, or
-a major version forces a breaking release anyway.
+## Supersedes
 
-## Consequences accepted
-
-- Asymmetric tree (one plugin at root, others in `plugins/`).
-- Root `README.md` does double duty (umbrella + subagent-context's own
-  doc); root `scripts/` belongs to subagent-context, suite tooling goes
-  in `tools/`.
-- Cross-plugin uninstall safety is a real hazard in this layout: a
-  sibling's absolute install path contains the repo directory name, so
-  uninstall markers must match per-plugin hook path suffixes, never the
-  repo/plugin name. Pinned by `tests/test_install_scripts.py`.
-
-## Vendoring
-
-`tools/sync-core.py` vendors `hooks/subagent_context.py` verbatim into
-plugins that need it (currently: cross-session-send-guard only), with a
-provenance header; the receiving plugin carries a drift-guard test.
-compact-manager instead hand-ports a modified lib and owns its copy — no
-drift guard there. No plugin imports from another plugin.
+Rev 1 (same day) kept subagent-context rooted at `./` with siblings in
+`plugins/`, because moving an installed plugin's `source` relied on
+unverified re-point behavior. That concern died on inspection: the
+only real installs were repo-direct hook scripts (not plugin-system
+installs), and external marketplace adoption was zero on rename day —
+so the migration window was free. Anyone on the old marketplace name
+re-adds `msshives-gif/claude-plugins` and reinstalls.

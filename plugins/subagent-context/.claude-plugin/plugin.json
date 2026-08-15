@@ -6,8 +6,8 @@
     "name": "msshives-gif"
   },
   "license": "MIT",
-  "homepage": "https://github.com/msshives-gif/subagent-context",
-  "repository": "https://github.com/msshives-gif/subagent-context",
+  "homepage": "https://github.com/msshives-gif/claude-plugins/tree/main/plugins/subagent-context",
+  "repository": "https://github.com/msshives-gif/claude-plugins",
   "keywords": [
     "hooks",
     "subagents",

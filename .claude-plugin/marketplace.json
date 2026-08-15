@@ -1,19 +1,19 @@
 {
-  "name": "subagent-context",
-  "description": "claude context tools — Claude Code plugins for context-size awareness: subagent context reporting today; cross-session send-guarding and main-session compaction management to come.",
+  "name": "claude-plugins",
+  "description": "claude context tools - Claude Code plugins for context-size awareness: subagent context reporting, cross-session send guarding, and main-session compaction management incl. an opt-in tmux managed mode.",
   "owner": {
     "name": "msshives-gif"
   },
   "plugins": [
     {
       "name": "subagent-context",
-      "source": "./",
+      "source": "./plugins/subagent-context",
       "description": "Reports each subagent's context size to the orchestrating agent and warns before an overloaded subagent gets re-tasked."
     },
     {
       "name": "cross-session-send-guard",
       "source": "./plugins/cross-session-send-guard",
-      "description": "Warns before, and can gate, a SendMessage to a large idle peer session — a cold wake replays the peer's whole transcript at full price."
+      "description": "Warns before, and can gate, a SendMessage to a large idle peer session \u2014 a cold wake replays the peer's whole transcript at full price."
     },
     {
       "name": "compact-manager",
