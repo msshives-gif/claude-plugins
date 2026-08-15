@@ -1,159 +1,158 @@
 # compact-manager
 
-Lets a long-running Claude Code session survive its own context window:
-warns the model as its context fills, captures a wake packet before
-compaction, and reorients the model after it.
+Long Claude Code sessions eventually fill their context window and get
+compacted — and the model comes back from compaction disoriented, with
+no reliable pointers to what it was doing. This plugin fixes that, in
+two stages:
 
-## The problem
+- **advisory** — warns the model *before* the window fills so it can
+  write down its working state, then hands that state back to it right
+  after compaction. Pure hooks, any platform, zero risk.
+- **managed** (opt-in, per session) — additionally runs `/compact` for
+  you at the right moment, by typing it into the session's tmux pane
+  only when it has verified the pane is idle and safe. For autonomous
+  sessions that must keep working past one context window.
 
-An autonomous orchestrator eventually fills its context. Native
-auto-compact is a last-resort backstop — measured on a real machine it
-fired only at effective window exhaustion (preTokens ~218k on a
-nominal 200k window), and a headless session gets "Prompt is too long"
-errors instead of compaction. Worse, after any compaction the model
-resumes from a summary with no guaranteed pointers to its working
-state. Nothing warns the model beforehand, and nothing reorients it
-afterward.
-
-## What it does (Layer 1 — advisory)
-
-Five thin hooks, all fail-open, all inert until you set a mode:
-
-1. **advisor** (`PostToolUse`) — incrementally measures the session's
-   own transcript (normally a byte-offset resume; a replaced or
-   shrunken file triggers one full reparse). Crossing
-   `soft_pct` (default 70%) injects ONE advisory telling the model to
-   write its task state to a session-specific handoff file and wrap up
-   / compact at a natural boundary; crossing `hard_pct` (80%) injects a
-   firmer one. Hysteresis: one advisory per genuine crossing.
-2. **reorient** (`UserPromptSubmit`) — same measurement + drain at
-   prompt time, so tool-free conversation is covered too.
-3. **precompact** (`PreCompact`, manual + auto) — persists the wake
-   packet: mechanical facts (pre-compaction size, trigger, `/compact`
-   instructions) plus a bounded excerpt of the model-written handoff
-   file. Never blocks a compaction.
-4. **session_start** (`SessionStart`, compact) — injects the
-   reorientation immediately after compaction (verified working on
-   current interactive Claude Code). Opportunistic: it never consumes
-   the packet.
-5. The durable delivery is the next `PostToolUse`/`UserPromptSubmit`
-   after a compaction is detected in the transcript
-   (`compactMetadata` boundary rows — deterministic, source-attributed).
-   At-most-once per packet; the SessionStart copy may duplicate it
-   (harmless by design).
-
-`stop_marker` (`Stop`) is a reserved no-op (kept so the hook surface
-is stable across versions).
-
-## What it does (Layer 2 — managed)
-
-`managed` mode adds a per-session watcher daemon that restores what
-the advisory alone cannot: actually running `/compact` at the right
-time. Hooks cannot invoke `/compact`, so the watcher types it into
-the session's tmux pane — only after a six-rail safety ladder proves
-the pane is the right pane, the composer is empty and stable, and
-nothing changed underneath it between verification and the final
-Enter. Any doubt at any rail aborts before a keystroke; ambiguity
-after typing raises a persistent alert (`compact-manager status`)
-rather than guessing. The watcher never clears your composer and
-never restarts itself.
-
-```
-plugins/compact-manager/bin/compact-manager start -- claude [args…]
-plugins/compact-manager/bin/compact-manager adopt [-S socket] -t %pane --attended
-plugins/compact-manager/bin/compact-manager status | stop <sid> | resolve <sid>
-```
-
-- **start** launches claude in a fresh tmux session with no shell
-  underneath (tmux gets the command as an argument vector), so a
-  worst-case race has nowhere to land — the pane dies with claude.
-- **adopt** attaches a watcher to an EXISTING pane you point it at —
-  including an attended session you are typing into. That is why it
-  requires `--attended`: in a worst-case race the fixed `/compact …`
-  bytes and one Enter could reach the shell under claude, and
-  concurrent input can alter the executed line. The instruction text
-  is metacharacter-free by construction and enforced by test, but the
-  residual is real and adopt makes you acknowledge it.
-- Triggers: crossing `managed_trigger_pct` (defaults to `hard_pct`),
-  or the model writing a request file (the advisory tells it the
-  path), restoring model-chosen timing.
-- Compaction is confirmed end-to-end: a nonce in the injected text
-  round-trips through the PreCompact wake packet, and completion
-  requires the transcript's compaction boundary. Missing either
-  raises a safety latch that never re-injects; `resolve <sid>` clears
-  it after you have checked (and cleared) the composer yourself.
-- Ownership is leased (session + pane) under one lock file with
-  heartbeats, so two watchers can never share a pane; a crashed
-  watcher's journal is recovered conservatively on the next adopt.
-- Bounded lifetime: `managed_deadline_hours` (default 24) retires the
-  watcher unconditionally.
-
-## Modes
-
-| Mode | Meaning |
-|---|---|
-| `off` (default) | Installing changes nothing. |
-| `advisory` | Everything described above. Cross-platform (pure Python hooks). |
-| `managed` | Everything above, plus an opt-in per-session watcher (started explicitly via the CLI below) that types `/compact` into your tmux pane at verified-idle moments. Linux/WSL only in this release. |
-
-Enable per config (`~/.claude/compact-manager.json`) or env:
-`COMPACT_MANAGER_MODE=advisory`.
-
-## Install
+## Quick start
 
 ```
 /plugin marketplace add msshives-gif/claude-plugins
 /plugin install compact-manager@claude-plugins
 ```
 
-Manual (no plugin system): `./scripts/install.sh` merges the five
-hooks into `~/.claude/settings.json` (backup taken;
-`./scripts/uninstall.sh` reverses it, touching only this plugin's
-entries). Either way the hooks stay inert until you set a mode.
+(or, without the plugin system: `./scripts/install.sh`)
 
-## Configuration
+Then turn it on — installing alone changes nothing:
 
-Env `COMPACT_MANAGER_<NAME>` or `~/.claude/compact-manager.json`
-(env wins; `COMPACT_MANAGER_CONFIG` points elsewhere):
+```
+echo '{"mode": "advisory"}' > ~/.claude/compact-manager.json
+```
+
+That's the whole setup for advisory mode. It applies to all sessions,
+takes effect immediately (hooks re-read the file every time), and you
+can override per session with the `COMPACT_MANAGER_MODE` environment
+variable at launch.
+
+## What you'll see in advisory mode
+
+1. Nothing, most of the time. The hooks quietly measure the session's
+   own transcript as it grows.
+2. At **70%** of the context window, the model gets one message telling
+   it to write its task state to a handoff file (the message includes
+   the path) and to wrap up or compact at a natural boundary. At
+   **80%** it gets one firmer warning. No nagging — one message per
+   threshold crossing.
+3. When compaction happens (you run `/compact`, or native auto-compact
+   fires), the plugin saves the essentials: what triggered it, how big
+   the session was, and an excerpt of the model's own handoff notes.
+4. On the first opportunity after compaction, that saved state is
+   injected back — so the model resumes knowing what it was doing
+   instead of guessing from the summary.
+
+If you run big-window models, tell it so percentages are right:
+
+```json
+{"mode": "advisory",
+ "models": {"[1m]": {"context_window": 1000000}}}
+```
+
+(model names are matched by substring — `"[1m]"` catches any 1M-window
+model id).
+
+## Managed mode: it runs /compact for you
+
+Advisory can only *advise* — Claude Code gives hooks no way to invoke
+`/compact`, and native auto-compact fires only at effective window
+exhaustion (measured ~109% of the nominal window; headless sessions
+just start erroring instead). Managed mode closes the gap with a small
+watcher daemon that you attach to a specific session:
+
+```
+plugins/compact-manager/bin/compact-manager start -- claude [args…]   # new session
+plugins/compact-manager/bin/compact-manager adopt -t %pane --attended # existing pane
+plugins/compact-manager/bin/compact-manager status                    # what's running
+plugins/compact-manager/bin/compact-manager stop <session-id>
+```
+
+Set `mode` to `managed` (same file/env as above) so the hooks
+cooperate, then attach a watcher to the session you care about.
+Nothing is ever watched automatically.
+
+The watcher waits until the session crosses the trigger threshold
+(default: the 80% line) or until the model itself asks for compaction
+(the advisory tells it how). Then it types `/compact` plus a short
+instruction into the pane and presses Enter — but only after checking,
+immediately before every keystroke, that it's the right pane, the
+right claude process, the input line is empty and has stayed still,
+and no other compaction is already underway. Any doubt at any step
+means it backs off and tries later. It never deletes anything you
+typed, and if anything is ambiguous *after* it has typed, it stops,
+raises a persistent alert in `status`, and waits for you to look —
+it never guesses.
+
+Honest risk note, because you must pass `--attended` to acknowledge
+it: on a pane you're actively typing in, there is an unavoidable
+millisecond-scale window where, in a worst-case race, the `/compact`
+text and one Enter could land in the shell underneath claude instead.
+The text contains no shell metacharacters (enforced by test), but
+your own concurrent keystrokes could change what the shell sees.
+`start` avoids even that: it launches claude with no shell under the
+pane at all. Managed mode is Linux/WSL-only in this release.
+
+## Configuration reference
+
+Config file `~/.claude/compact-manager.json`, or environment variables
+`COMPACT_MANAGER_<NAME>` (env wins; `COMPACT_MANAGER_CONFIG` points at
+an alternate file — handy for per-session configs).
 
 | Knob | Default | Meaning |
 |---|---|---|
 | `mode` | `off` | `off` \| `advisory` \| `managed`. |
-| `soft_pct` | `0.70` | First advisory at this fraction of the window. |
-| `hard_pct` | `0.80` | Firm advisory here. Native auto-compact fires far later (measured ~1.09× window). |
-| `rearm_band_pct` | `0.08` | Re-arm an advisory only after dropping this far below its threshold. |
-| `context_window` | `200000` | Window tokens; per-model via `models` (e.g. `{"[1m]": {"context_window": 1000000}}`). |
-| `models` | `{}` | Per-model overrides for `soft_pct`/`hard_pct`/`context_window`. |
-| `system_message` | `true` | Show injections to the human too. |
-| `handoff_excerpt_bytes` | `4000` | Byte cap on the handoff excerpt embedded in the wake packet (delivery is capped to match). |
-| `state_dir` | `~/.claude/compact-manager` | Measurements, packets, handoff files. |
-| `ledger` / `ledger_max_bytes` | `true` / 5MB | Audit log of injections and packets, rotated at the size limit. |
-| `state_ttl_days` | `7` | Per-session files older than this are cleaned up (checked at most once a day). |
+| `soft_pct` | `0.70` | First warning at this fraction of the window. |
+| `hard_pct` | `0.80` | Firm warning here. |
+| `rearm_band_pct` | `0.08` | How far usage must drop below a threshold before that warning can fire again. |
+| `context_window` | `200000` | Window size in tokens. |
+| `models` | `{}` | Per-model overrides of the three knobs above, keyed by model-id substring. |
+| `system_message` | `true` | Also show injected messages to the human. |
+| `handoff_excerpt_bytes` | `4000` | How much of the handoff file rides along in the saved state. |
+| `state_dir` | `~/.claude/compact-manager` | Where measurements, saved state, and handoff files live. |
+| `ledger` / `ledger_max_bytes` | `true` / 5MB | Audit log of everything injected, size-rotated. |
+| `state_ttl_days` | `7` | Old per-session files are cleaned up after this. |
 
-Managed-mode knobs (same file/env, all clamped to safe ranges):
+Managed-mode knobs (all clamped to safe ranges):
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `managed_trigger_pct` | `hard_pct` | Watcher injects at this fraction of the window; must be above `soft_pct`. |
-| `managed_stable_ms` | `300` | Pane must be byte-identical across this window before typing (min 200). |
-| `managed_poll_s` | `15` | Watcher tick (min 5; backs off to 60 far from threshold). |
-| `managed_ack_timeout_s` | `120` | No PreCompact ack within this → exactly one retry, then a safety latch (min 30). |
-| `managed_completion_timeout_s` | `300` | Ack but no transcript boundary within this → safety latch (min: the ack timeout). |
-| `managed_deadline_hours` | `24` | Unconditional watcher lifetime cap (1–72). |
-| `managed_pane_commands` | `["claude"]` | `pane_current_command` whitelist; anything else defers. |
+| `managed_trigger_pct` | `hard_pct` | Watcher compacts at this fraction of the window. |
+| `managed_stable_ms` | `300` | Pane must be unchanged this long before typing. |
+| `managed_poll_s` | `15` | How often the watcher checks the session. |
+| `managed_ack_timeout_s` | `120` | No confirmation the command was received → one retry, then stop and alert. |
+| `managed_completion_timeout_s` | `300` | Command received but compaction never finished → stop and alert. |
+| `managed_deadline_hours` | `24` | Watcher retires unconditionally after this. |
+| `managed_pane_commands` | `["claude"]` | Only type into a pane running one of these. |
 
-## Limitations
+## How it works / limitations
 
-- Built on undocumented transcript internals (measured shapes pinned in
-  `docs/spikes/compact-manager.md`); format drift degrades to silence.
+Five thin hooks (PostToolUse, UserPromptSubmit, PreCompact,
+SessionStart, and a reserved Stop no-op), all fail-open — any error
+means silence, never a blocked session. Measurement parses the
+session's transcript file incrementally; compaction is detected from
+the transcript's own boundary records, and in managed mode the typed
+command carries a one-time tag that must round-trip through the
+PreCompact hook before the watcher believes its compaction happened.
+Watcher ownership is leased per session and pane, so two watchers can
+never fight over one pane, and a crashed watcher is recovered
+conservatively — anything uncertain becomes an alert for a human, not
+a retry.
+
+- Built on undocumented Claude Code internals (transcript format,
+  session registry); format drift degrades to silence, and the
+  measured shapes are pinned in `docs/spikes/compact-manager.md`.
 - Measurement reflects the last completed model call.
-- The advisory can only *advise*: neither hooks nor the model can
-  invoke `/compact` in current Claude Code. `managed` mode closes that
-  gap via tmux; outside managed mode the model can ask you, or wrap up
-  cleanly and let native compaction hit a prepared session.
-- Managed mode is Linux/WSL + tmux only (it reads `/proc` to bind the
-  pane to the exact claude process). Advisory mode is unaffected.
-- Headless (`-p`) sessions never see the SessionStart copy; the
-  durable drain covers them on their next prompt.
+- Headless (`-p`) sessions get the post-compaction state on their next
+  prompt rather than instantly.
+- Design details and the full safety analysis: the audit trail in
+  `docs/plans/m3-managed-mode.md` and the live test suite in
+  `tools/live-managed/`.
 
 MIT.
