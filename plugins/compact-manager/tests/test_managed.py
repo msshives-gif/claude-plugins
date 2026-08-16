@@ -1335,6 +1335,15 @@ class OverviewTests(unittest.TestCase):
         os.makedirs(sdir)
         with open(os.path.join(sdir, "weird.json"), "w") as fh:
             fh.write('{"model": "m", "current": -50, "peak": 1e999}')
+        # huge FINITE float: must zero, not print pct=inf%
+        with open(os.path.join(sdir, "huge.json"), "w") as fh:
+            fh.write('{"model": "m", "current": 1e308, "peak": 3}')
+        # future mtime: surfaced as untrustworthy, never a fake 0s age
+        fut = os.path.join(sdir, "future.json")
+        with open(fut, "w") as fh:
+            fh.write('{"model": "m", "current": 5, "peak": 5}')
+        later = time.time() + 3600
+        os.utime(fut, (later, later))
         out = managed.overview_text(cfg)
         neg = [l for l in out.splitlines() if "sNeg" in l][0]
         self.assertIn("MALFORMED-LEASE", neg)
@@ -1345,3 +1354,9 @@ class OverviewTests(unittest.TestCase):
         weird = [l for l in out.splitlines() if "weird" in l][0]
         self.assertIn("current=0 peak=0", weird)
         self.assertIn("pct=0.0%", weird)
+        huge = [l for l in out.splitlines() if "huge" in l][0]
+        self.assertIn("current=0", huge)
+        self.assertNotIn("inf", huge)
+        future = [l for l in out.splitlines() if "future" in l][0]
+        self.assertIn("FUTURE-MTIME", future)
+        self.assertNotIn("0s-ago", future)

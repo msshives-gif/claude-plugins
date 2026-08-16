@@ -16,14 +16,17 @@ instead of discovered at the 80% line.
   files or legacy symlinks resolving into this clone, canonicalizing
   via python3 rather than `readlink -f`).
 - Second-round verification hardening: attachment proof rejects
-  future heartbeats (same-machine writes — future is malformed, not
-  skew); the MALFORMED-LEASE flag covers all pid-malformed shapes and
-  the docs state exactly what it cannot see; overview rows carry an
-  `updated=…s-ago` age column, detach's current-session heuristic is
-  age-verified and prefers an environment-provided session id, and
-  the CLI-discovery fallback finds the CLI file itself (versioned
-  plugin-cache layouts have directories named compact-manager with no
-  bin/). Negative/non-finite token values render as zeros per-row.
+  future heartbeats beyond 1s of slop (same-machine writes — further
+  future is malformed, not skew); the MALFORMED-LEASE flag covers
+  pid-malformed shapes on surfaced live rows (what it cannot see is
+  documented); overview rows carry an `updated=…s-ago` age column
+  with future mtimes surfaced as untrustworthy, detach's
+  current-session heuristic primes its own state row first,
+  age-verifies, prefers an environment-provided session id, and asks
+  rather than guessing on any ambiguity; the CLI-discovery fallback
+  finds the CLI file itself (versioned plugin-cache layouts have
+  directories named compact-manager with no bin/). Token values
+  outside [0, 1e11] render as zeros per-row.
 - Default `context_window` is now 1,000,000 (the Claude 5 standard;
   was 200k). Deliberate failure direction: unknown new model names
   must never compact early at a stale small default — a legacy 200k

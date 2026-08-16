@@ -26,6 +26,8 @@ Report the current compact-manager state.
    subcommand.) Note: the start-of-session status line uses stricter
    positive-proof attachment than the overview's conservative `live`
    flag, so the two can disagree on a malformed lease. The
-   `MALFORMED-LEASE` flag catches pid-malformed shapes; a lease
-   malformed only in fields the row does not surface (token, start
-   time, heartbeat) can still read `live: true` without a flag.
+   `MALFORMED-LEASE` flag catches pid-malformed shapes on rows that
+   surface as live; it cannot see an empty lease file (no row is
+   produced at all), a dead lease's pid shape (flagged `DEAD-LEASE`
+   instead), or fields the row does not carry (token, start time,
+   heartbeat).

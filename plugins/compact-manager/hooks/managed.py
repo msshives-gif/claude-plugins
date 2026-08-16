@@ -1931,20 +1931,25 @@ def overview_text(cfg, now=None):
             window = cm.window_for(cfg, st.get("model"))["context_window"]
 
             def _token_count(value):
+                # 1e11 ceiling: far above any real token count; huge
+                # finite floats (1e308) otherwise overflow pct to inf.
                 ok = isinstance(value, (int, float)) \
                     and not isinstance(value, bool) \
-                    and value == value and value != float("inf") \
-                    and value >= 0
+                    and value == value and 0 <= value <= 1e11
                 return value if ok else 0
 
             current = _token_count(st.get("current"))
             peak = _token_count(st.get("peak"))
+            # A future mtime sorts first and would fake a fresh age —
+            # surface the anomaly instead of clamping it to 0s.
+            age = ("%ds-ago" % int(now - mtime) if mtime <= now + 5
+                   else "FUTURE-MTIME(untrustworthy)")
             lines.append(
                 "  %s%s model=%s current=%s peak=%s window=%s pct=%.1f%% "
-                "updated=%ds-ago"
+                "updated=%s"
                 % ("CURRENT>> " if i == 0 else "          ", sid,
                    st.get("model") or "?", current, peak, window,
-                   100.0 * current / window, max(0, int(now - mtime))))
+                   100.0 * current / window, age))
         except Exception:
             lines.append("  %s%s (unreadable state row)" % (
                 "CURRENT>> " if i == 0 else "          ", sid))
