@@ -15,6 +15,11 @@ instead of discovered at the 80% line.
   never overwritten; `uninstall.sh` removes only marker-carrying
   files or legacy symlinks resolving into this clone, canonicalizing
   via python3 rather than `readlink -f`).
+- Default `context_window` is now 1,000,000 (the Claude 5 standard;
+  was 200k). Deliberate failure direction: unknown new model names
+  must never compact early at a stale small default — a legacy 200k
+  model just misses advisories and falls back to native compaction.
+  Override legacy models via `models`.
 - `bin/compact-manager overview`: deterministic runtime readout
   (watcher rows with ATTENTION/DEAD-LEASE/MALFORMED-LEASE flags,
   per-session usage percentages, current-session marker). The status

@@ -596,7 +596,13 @@ class ConfigTests(unittest.TestCase):
             1_000_000)
         self.assertEqual(
             cm.window_for(cfg, "claude-haiku-4-5")["context_window"],
-            200_000)
+            1_000_000)  # no override -> the 1M global default
+
+    def test_default_window_is_one_million(self):
+        # Deliberate: unknown new models must not warn/compact early at
+        # a stale small default; legacy models are the override case.
+        self.assertEqual(cm._DEFAULTS["context_window"], 1_000_000)
+        self.assertEqual(cm.load_config()["context_window"], 1_000_000)
 
     def test_bool_garbage_keeps_default(self):
         os.environ["COMPACT_MANAGER_SYSTEM_MESSAGE"] = "garbage"
@@ -637,7 +643,10 @@ class HookShellTests(unittest.TestCase):
                if not k.startswith("COMPACT_MANAGER_")}
         env.update(COMPACT_MANAGER_CONFIG="/nonexistent/cm-test.json",
                    COMPACT_MANAGER_MODE=mode,
-                   COMPACT_MANAGER_STATE_DIR=self.dir.name)
+                   COMPACT_MANAGER_STATE_DIR=self.dir.name,
+                   # The numeric fixtures below are written against a
+                   # 200k window; the shipped default is 1M.
+                   COMPACT_MANAGER_CONTEXT_WINDOW="200000")
         env.update(extra_env or {})
         p = subprocess.run(
             [sys.executable, os.path.join(HOOKS, script)],

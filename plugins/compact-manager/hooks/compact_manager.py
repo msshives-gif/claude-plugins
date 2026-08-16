@@ -35,7 +35,13 @@ _DEFAULTS = {
     # (or after a compaction). Prevents boundary chatter.
     "rearm_band_pct": 0.08,
     # Window size in tokens; per-model overrides via "models".
-    "context_window": 200_000,
+    # 1M: the Claude 5 family standard. Deliberate failure direction
+    # (Matt, 2026-08-16): an unknown/new model name must never compact
+    # early at a stale small default (huge pain for big-window
+    # workloads); a legacy 200k model just misses advisories and falls
+    # back to native compaction (annoying, not catastrophic). Override
+    # legacy models via `models`.
+    "context_window": 1_000_000,
     # Show advisories to the human too.
     "system_message": True,
     # Max bytes of the model-written handoff embedded in the packet.

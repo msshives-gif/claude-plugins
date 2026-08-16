@@ -854,8 +854,11 @@ class RunLadderTests(unittest.TestCase):
         self.proc = os.path.join(self.temp.name, "proc")
         write_proc(self.proc, 10, 20, 1010)
         write_proc(self.proc, 20, 20, 2020)
+        # Fixtures in this class are written against a 200k window
+        # (the shipped default is 1M).
         self.cfg = managed.load_config(
-            base=dict(cm._DEFAULTS, state_dir=self.temp.name), environ={})
+            base=dict(cm._DEFAULTS, state_dir=self.temp.name,
+                      context_window=200_000), environ={})
         self.sid = "session-1234"
         self.token = "a" * 16
         self.paths = managed.managed_paths(self.cfg, self.sid, "sock", "%1")
@@ -965,7 +968,8 @@ class TickWiringTests(unittest.TestCase):
         write_proc(self.proc, 10, 20, 1010)
         write_proc(self.proc, 20, 20, 2020)
         self.cfg = managed.load_config(
-            base=dict(cm._DEFAULTS, state_dir=self.temp.name), environ={})
+            base=dict(cm._DEFAULTS, state_dir=self.temp.name,
+                      context_window=200_000), environ={})
         self.sid = "session-1234"
         self.token = "a" * 16
         self.paths = managed.managed_paths(self.cfg, self.sid, "sock", "%1")
@@ -1270,6 +1274,7 @@ class OverviewTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         cfg = dict(cm._DEFAULTS, mode="managed", state_dir=tmp.name,
+                   context_window=200_000,
                    models={"fable": {"context_window": 1_000_000}})
         lease_dir = os.path.join(tmp.name, "managed", "leases")
         os.makedirs(lease_dir)
@@ -1298,4 +1303,4 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("MALFORMED-LEASE", out)   # live-by-ambiguity, pid None
         self.assertIn("CURRENT>> new", out)     # newest mtime marked
         self.assertIn("pct=10.0%", out)         # 100k of fable's 1M override
-        self.assertIn("pct=25.0%", out)         # 50k of default 200k
+        self.assertIn("pct=25.0%", out)         # 50k of the configured 200k global

@@ -49,15 +49,19 @@ variable at launch.
    injected back — so the model resumes knowing what it was doing
    instead of guessing from the summary.
 
-If you run big-window models, tell it so percentages are right:
+The default window is 1M (the Claude 5 standard). If you run smaller
+legacy models, tell it so percentages are right:
 
 ```json
 {"mode": "advisory",
- "models": {"[1m]": {"context_window": 1000000}}}
+ "models": {"haiku": {"context_window": 200000}}}
 ```
 
-(model names are matched by substring — `"[1m]"` catches any 1M-window
-model id).
+(model names are matched by substring, longest match wins — `"haiku"`
+catches any haiku model id). Getting this wrong is asymmetric: too
+small a window warns and compacts far too early, which can wreck a
+long workload; too large just means advisories never fire and native
+compaction proceeds as if the plugin were off.
 
 ## Managed mode: it runs /compact for you
 
@@ -148,7 +152,7 @@ an alternate file — handy for per-session configs).
 | `soft_pct` | `0.70` | First warning at this fraction of the window. |
 | `hard_pct` | `0.80` | Firm warning here. |
 | `rearm_band_pct` | `0.08` | How far usage must drop below a threshold before that warning can fire again. |
-| `context_window` | `200000` | Window size in tokens. |
+| `context_window` | `1000000` | Window size in tokens (the Claude 5 standard). Override smaller legacy models via `models`. |
 | `models` | `{}` | Per-model overrides of the three knobs above, keyed by model-id substring. |
 | `system_message` | `true` | Also show injected messages to the human. |
 | `handoff_excerpt_bytes` | `4000` | How much of the handoff file rides along in the saved state. |
