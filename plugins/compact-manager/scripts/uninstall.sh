@@ -78,14 +78,27 @@ os.replace(tmp, settings_path)
 print(f"removed {removed} hook entrie(s); wrote {settings_path}")
 PY
 
-# Remove only command symlinks that resolve into THIS clone's commands/
-# directory — same narrow-matching rule as the hook removal above.
+# Remove only command files carrying our install marker naming THIS
+# clone or a standard …/compact-manager plugin dir, plus legacy (early
+# 0.3.0) symlinks resolving into this clone — the same narrow rule as
+# the hook removal above. Canonicalization goes through python3 (a hard
+# dependency already), never `readlink -f`, whose failure would make
+# an empty-vs-empty comparison succeed.
 CMD_DIR="$(dirname "$SETTINGS")/commands"
+MARKER="installed by compact-manager install.sh from"
 for f in "$PLUGIN_DIR"/commands/*.md; do
     [ -e "$f" ] || continue
     link="$CMD_DIR/compact-manager-$(basename "$f")"
-    if [ -L "$link" ] && \
-       [ "$(readlink -f "$link" 2>/dev/null)" = "$(readlink -f "$f")" ]; then
+    { [ -e "$link" ] || [ -L "$link" ]; } || continue
+    if [ -L "$link" ]; then
+        tgt="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$link")"
+        case "$tgt" in
+            "$PLUGIN_DIR"/commands/*) rm -f "$link"; echo "removed $link" ;;
+        esac
+        continue
+    fi
+    if grep -qF "$MARKER $PLUGIN_DIR " "$link" 2>/dev/null || \
+       grep -qE "$MARKER [^>]*/compact-manager -->" "$link" 2>/dev/null; then
         rm -f "$link"
         echo "removed $link"
     fi

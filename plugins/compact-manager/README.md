@@ -109,12 +109,17 @@ Three slash commands ship in `commands/`:
 - **status** — mode, live watchers, and per-session context usage
 
 Plugin-system installs get them namespaced (`/compact-manager:attach`
-etc.); `scripts/install.sh` symlinks them beside the settings file as
-`/compact-manager-attach` etc., and `uninstall.sh` removes only links
-that resolve into this clone.
+etc.). `scripts/install.sh` installs substituted, marker-tagged copies
+beside the settings file as `/compact-manager-attach` etc. — copies,
+because `${CLAUDE_PLUGIN_ROOT}` is only substituted in plugin context;
+rerun install.sh after editing `commands/`. An existing file without
+the marker is never overwritten, and `uninstall.sh` removes only files
+carrying the marker (or legacy symlinks resolving into this clone).
 
 In managed mode, session start/resume also injects one status line
-saying whether a watcher actually holds this session, with the attach
+saying whether a watcher demonstrably holds this session (fresh lease
+heartbeat, or its pid verified alive — ambiguity reads as NOT
+attached, inverting the lease-reclaim default), with the attach
 command if not. Without it, "mode is managed but nobody adopted this
 pane" is indistinguishable from fully-enabled until the 80% line.
 Advisory and off modes stay silent, as before.

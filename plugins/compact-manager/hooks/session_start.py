@@ -15,6 +15,7 @@
 import json
 import os
 import sys
+import time
 
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +46,24 @@ def _reorient(cfg, session_id):
     _emit(cfg, cm.reorientation_text(packet, cm.delivery_cap(cfg)))
 
 
+def _lease_attached(managed, lease):
+    """POSITIVE proof of a watcher, unlike managed.lease_is_live, whose
+    ambiguous cases deliberately count as live so lease RECLAIM fails
+    safe — the wrong default for a status display ({} would show as
+    attached). Attached = well-formed lease AND (fresh heartbeat OR
+    pid+starttime verified alive)."""
+    if not isinstance(lease, dict):
+        return False
+    pid = lease.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return False
+    heartbeat = managed._finite_number(lease.get("heartbeat_at"))
+    if heartbeat is not None and \
+            time.time() - heartbeat < managed.LEASE_FRESH_S:
+        return True
+    return managed.proc_matches(pid, lease.get("proc_start"))
+
+
 def _watcher_status(cfg, session_id):
     if cfg["mode"] != "managed":
         return
@@ -56,7 +75,7 @@ def _watcher_status(cfg, session_id):
             lease = json.load(fh)
     except (OSError, ValueError):
         lease = None
-    if isinstance(lease, dict) and managed.lease_is_live(lease):
+    if _lease_attached(managed, lease):
         text = ("compact-manager: managed mode, watcher attached to this "
                 "session (pid %s)." % lease.get("pid"))
     else:
@@ -75,12 +94,14 @@ def _watcher_status(cfg, session_id):
 
 def main():
     payload = cm.read_payload()
+    if not isinstance(payload, dict):
+        return
     cfg = cm.load_config()
     if cfg["mode"] == "off":
         return
     source = payload.get("source") or payload.get("session_started_from")
-    session_id = payload.get("session_id") or ""
-    if not session_id:
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
         return
     if source == "compact":
         _reorient(cfg, session_id)

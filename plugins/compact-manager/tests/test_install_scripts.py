@@ -56,7 +56,10 @@ class CompactManagerInstallTests(unittest.TestCase):
         self.assertIn(("SessionStart", "compact"), matchers)
         self.assertIn(("SessionStart", "startup"), matchers)
         self.assertIn(("SessionStart", "resume"), matchers)
-        # Slash commands are symlinked beside the settings file...
+        # Slash commands are installed as substituted, marker-tagged
+        # copies beside the settings file (plugin-context variables are
+        # never substituted for script installs, so symlinks would run
+        # /bin/compact-manager).
         cmd_dir = os.path.join(self.tmp.name, "commands")
         src_dir = os.path.join(PLUGIN, "commands")
         expected = sorted("compact-manager-" + n
@@ -64,21 +67,62 @@ class CompactManagerInstallTests(unittest.TestCase):
         self.assertTrue(expected)
         self.assertEqual(sorted(os.listdir(cmd_dir)), expected)
         for name in expected:
-            link = os.path.join(cmd_dir, name)
-            self.assertTrue(os.path.islink(link), link)
-            self.assertEqual(os.path.realpath(link), os.path.realpath(
-                os.path.join(src_dir, name[len("compact-manager-"):])))
+            dest = os.path.join(cmd_dir, name)
+            self.assertFalse(os.path.islink(dest), dest)
+            with open(dest) as fh:
+                body = fh.read()
+            self.assertNotIn("${CLAUDE_PLUGIN_ROOT}", body, dest)
+            self.assertIn(PLUGIN, body, dest)
+            self.assertIn("installed by compact-manager install.sh from",
+                          body, dest)
         r = _run(UNINSTALL, self.settings)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(_hook_commands(self.read()), [])
-        # ...and uninstall removes exactly those links, sparing strangers.
+        # ...and uninstall removes exactly those copies, sparing strangers.
         self.assertEqual(os.listdir(cmd_dir), [])
+
+    def test_install_never_overwrites_user_command_file(self):
+        cmd_dir = os.path.join(self.tmp.name, "commands")
+        os.makedirs(cmd_dir)
+        mine = os.path.join(cmd_dir, "compact-manager-attach.md")
+        with open(mine, "w") as fh:
+            fh.write("user-owned command\n")
+        r = _run(INSTALL, self.settings)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("SKIPPED", r.stderr)
+        with open(mine) as fh:
+            self.assertEqual(fh.read(), "user-owned command\n")
+        # Uninstall spares it too (no marker).
+        r = _run(UNINSTALL, self.settings)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isfile(mine))
+        with open(mine) as fh:
+            self.assertEqual(fh.read(), "user-owned command\n")
+
+    def test_install_upgrades_legacy_symlink_to_copy(self):
+        # Early 0.3.0 installs created symlinks; a rerun must reclaim
+        # exactly those (they resolve into this clone) and replace them
+        # with copies — while a foreign symlink is left alone.
+        cmd_dir = os.path.join(self.tmp.name, "commands")
+        os.makedirs(cmd_dir)
+        ours = os.path.join(cmd_dir, "compact-manager-attach.md")
+        os.symlink(os.path.join(PLUGIN, "commands", "attach.md"), ours)
+        foreign_target = os.path.join(self.tmp.name, "foreign.md")
+        with open(foreign_target, "w") as fh:
+            fh.write("foreign\n")
+        foreign = os.path.join(cmd_dir, "compact-manager-detach.md")
+        os.symlink(foreign_target, foreign)
+        r = _run(INSTALL, self.settings)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.islink(ours))
+        self.assertTrue(os.path.islink(foreign))
+        self.assertEqual(os.path.realpath(foreign), foreign_target)
 
     def test_uninstall_spares_foreign_command_files(self):
         _run(INSTALL, self.settings)
         cmd_dir = os.path.join(self.tmp.name, "commands")
         foreign = os.path.join(cmd_dir, "compact-manager-attach.md")
-        os.remove(foreign)  # replace our link with a real user file
+        os.remove(foreign)  # replace our copy with a real user file
         with open(foreign, "w") as fh:
             fh.write("user-owned command\n")
         r = _run(UNINSTALL, self.settings)
@@ -160,7 +204,7 @@ class CompactManagerInstallTests(unittest.TestCase):
         self.assertIn(f"python3 {root_hook} || true", cmds)
         self.assertIn(f"python3 {peer_hook} || true", cmds)
         self.assertIn("echo user-hook", cmds)
-        self.assertEqual(len(cmds), 3)  # all six of our own are gone
+        self.assertEqual(len(cmds), 3)  # all eight of our own are gone
 
     def test_uninstall_removes_standard_plugin_dir_paths(self):
         # A marketplace install lives under …/compact-manager/hooks/;

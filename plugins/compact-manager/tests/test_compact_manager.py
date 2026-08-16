@@ -676,7 +676,31 @@ class HookShellTests(unittest.TestCase):
         ctx = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("attached", ctx)
         self.assertIn("12345", ctx)
+        # Ambiguity is NOT attachment: lease_is_live's malformed-counts-
+        # as-live reclaim default must not leak into the status line.
+        lease_file = os.path.join(lease_dir, "session-sW.json")
+        with open(lease_file, "w") as fh:
+            json.dump({}, fh)
+        out = self.run_hook("session_start.py", base, mode="managed")
+        self.assertIn("NO watcher",
+                      out["hookSpecificOutput"]["additionalContext"])
+        # Stale heartbeat + dead pid: not attached either.
+        with open(lease_file, "w") as fh:
+            json.dump({"run_token": "t", "pid": 999999999,
+                       "proc_start": 1, "heartbeat_at": 1.0}, fh)
+        out = self.run_hook("session_start.py", base, mode="managed")
+        self.assertIn("NO watcher",
+                      out["hookSpecificOutput"]["additionalContext"])
+        # Non-string session ids and non-dict payloads stay silent.
+        self.assertEqual(self.run_hook(
+            "session_start.py", dict(base, session_id={"g": True}),
+            mode="managed"), {})
+        self.assertEqual(self.run_hook("session_start.py", "[1, 2]",
+                                       mode="managed"), {})
         # resume behaves like startup; unknown sources stay silent.
+        with open(lease_file, "w") as fh:
+            json.dump({"run_token": "t", "pid": 12345, "proc_start": 1,
+                       "heartbeat_at": time.time()}, fh)
         out = self.run_hook("session_start.py",
                             dict(base, source="resume"), mode="managed")
         self.assertIn("attached",

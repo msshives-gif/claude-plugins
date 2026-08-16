@@ -7,12 +7,23 @@ hooks firing, but no watcher adopted for the session — is now surfaced
 instead of discovered at the 80% line.
 
 - Slash commands `attach` / `detach` / `status` (plugin namespace
-  `/compact-manager:<name>`; `install.sh` now symlinks them beside the
-  settings file as `/compact-manager-<name>`, and `uninstall.sh`
-  removes only links resolving into this clone).
+  `/compact-manager:<name>`; `install.sh` installs substituted,
+  marker-tagged copies beside the settings file as
+  `/compact-manager-<name>` — plugin-context `${CLAUDE_PLUGIN_ROOT}`
+  is never substituted for script installs, so symlinks would have
+  resolved to `/bin/compact-manager`. Existing unmarked files are
+  never overwritten; `uninstall.sh` removes only marker-carrying
+  files or legacy symlinks resolving into this clone, canonicalizing
+  via python3 rather than `readlink -f`).
 - SessionStart wiring gains `startup` and `resume` matchers: in
   managed mode the hook injects one watcher-status line (attached with
-  pid, or the attach command to run). Advisory/off stay silent.
+  pid, or the attach command to run). Attachment needs positive proof
+  — fresh lease heartbeat or verified-alive pid — never
+  lease_is_live()'s ambiguity-counts-as-live reclaim default.
+  Advisory/off stay silent; non-dict payloads and non-string session
+  ids too. (This paragraph folds in a same-day cross-family review:
+  2 user-file deletion paths, the plugin-variable break, the
+  false-attached path, and fail-open gaps — all fixed pre-release.)
 
 ## 0.2.0 — 2026-08-15
 

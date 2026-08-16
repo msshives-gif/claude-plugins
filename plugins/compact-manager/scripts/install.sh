@@ -97,12 +97,35 @@ print("Restart running Claude Code sessions to pick up hook changes.")
 PY
 
 # Slash commands: the plugin system namespaces commands/ automatically,
-# but script installs need them linked beside the settings file. Prefix
-# with the plugin name so /status etc. stay unclaimed.
+# but script installs run outside plugin context, where the
+# ${CLAUDE_PLUGIN_ROOT} references inside the command bodies are never
+# substituted (it is a plugin-only variable). So install SUBSTITUTED,
+# marker-tagged COPIES beside the settings file (rerun install.sh after
+# editing commands/), prefixed so /status etc. stay unclaimed. A
+# destination that exists without our marker is a user's own file:
+# skipped, never overwritten.
 CMD_DIR="$(dirname "$SETTINGS")/commands"
+MARKER="installed by compact-manager install.sh from"
 mkdir -p "$CMD_DIR"
 for f in "$PLUGIN_DIR"/commands/*.md; do
     [ -e "$f" ] || continue
-    ln -sfn "$f" "$CMD_DIR/compact-manager-$(basename "$f")"
+    dest="$CMD_DIR/compact-manager-$(basename "$f")"
+    if [ -L "$dest" ]; then
+        # Legacy (early 0.3.0) symlink install: reclaim only links that
+        # resolve into this clone's commands directory.
+        tgt="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$dest")"
+        case "$tgt" in
+            "$PLUGIN_DIR"/commands/*) rm -f "$dest" ;;
+        esac
+    fi
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        if ! grep -qF "$MARKER" "$dest" 2>/dev/null; then
+            echo "SKIPPED $dest (exists and is not ours)" >&2
+            continue
+        fi
+    fi
+    { sed "s|\${CLAUDE_PLUGIN_ROOT}|$PLUGIN_DIR|g" "$f"
+      printf '\n<!-- %s %s -->\n' "$MARKER" "$PLUGIN_DIR"; } > "$dest.tmp.$$"
+    mv "$dest.tmp.$$" "$dest"
 done
-echo "linked slash commands into $CMD_DIR (compact-manager-*.md)"
+echo "installed slash commands into $CMD_DIR (compact-manager-*.md)"
