@@ -645,6 +645,7 @@ class HookShellTests(unittest.TestCase):
                    else json.dumps(payload)),
             capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(p.returncode, 0, p.stderr)
+        self.last_stderr = p.stderr
         return json.loads(p.stdout) if p.stdout.strip() else {}
 
     def test_all_hooks_silent_when_off(self):
@@ -691,12 +692,26 @@ class HookShellTests(unittest.TestCase):
         out = self.run_hook("session_start.py", base, mode="managed")
         self.assertIn("NO watcher",
                       out["hookSpecificOutput"]["additionalContext"])
+        # Fresh heartbeat does NOT rescue a malformed lease: pid -1, or
+        # a missing run_token/proc_start (round-2 audit pin).
+        for bad in ({"pid": -1, "heartbeat_at": time.time()},
+                    {"pid": 12345, "heartbeat_at": time.time()},
+                    {"pid": 12345, "run_token": "t",
+                     "heartbeat_at": time.time()}):
+            with open(lease_file, "w") as fh:
+                json.dump(bad, fh)
+            out = self.run_hook("session_start.py", base, mode="managed")
+            self.assertIn("NO watcher",
+                          out["hookSpecificOutput"]["additionalContext"],
+                          bad)
         # Non-string session ids and non-dict payloads stay silent.
         self.assertEqual(self.run_hook(
             "session_start.py", dict(base, session_id={"g": True}),
             mode="managed"), {})
+        self.assertEqual(self.last_stderr, "")
         self.assertEqual(self.run_hook("session_start.py", "[1, 2]",
                                        mode="managed"), {})
+        self.assertEqual(self.last_stderr, "")
         # resume behaves like startup; unknown sources stay silent.
         with open(lease_file, "w") as fh:
             json.dump({"run_token": "t", "pid": 12345, "proc_start": 1,

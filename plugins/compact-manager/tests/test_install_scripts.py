@@ -118,6 +118,43 @@ class CompactManagerInstallTests(unittest.TestCase):
         self.assertTrue(os.path.islink(foreign))
         self.assertEqual(os.path.realpath(foreign), foreign_target)
 
+    def test_marker_phrase_in_prose_is_not_ownership(self):
+        # NEW-1 pin: recognition is the exact anchored marker LINE, not
+        # the phrase anywhere. A user file MENTIONING the phrase is
+        # neither overwritten by install nor deleted by uninstall.
+        cmd_dir = os.path.join(self.tmp.name, "commands")
+        os.makedirs(cmd_dir)
+        mine = os.path.join(cmd_dir, "compact-manager-attach.md")
+        prose = ("KEEP my notes: the plugin is "
+                 "installed by compact-manager install.sh from my repo\n"
+                 "and a decoy: installXsh from /victim/compact-manager -->\n")
+        with open(mine, "w") as fh:
+            fh.write(prose)
+        r = _run(INSTALL, self.settings)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("SKIPPED", r.stderr)
+        with open(mine) as fh:
+            self.assertEqual(fh.read(), prose)
+        r = _run(UNINSTALL, self.settings)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(mine) as fh:
+            self.assertEqual(fh.read(), prose)
+
+    def test_uninstall_removes_legacy_symlink_spares_foreign_symlink(self):
+        cmd_dir = os.path.join(self.tmp.name, "commands")
+        os.makedirs(cmd_dir)
+        ours = os.path.join(cmd_dir, "compact-manager-attach.md")
+        os.symlink(os.path.join(PLUGIN, "commands", "attach.md"), ours)
+        foreign_target = os.path.join(self.tmp.name, "foreign.md")
+        with open(foreign_target, "w") as fh:
+            fh.write("foreign\n")
+        foreign = os.path.join(cmd_dir, "compact-manager-detach.md")
+        os.symlink(foreign_target, foreign)
+        r = _run(UNINSTALL, self.settings)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.lexists(ours))
+        self.assertTrue(os.path.islink(foreign))
+
     def test_uninstall_spares_foreign_command_files(self):
         _run(INSTALL, self.settings)
         cmd_dir = os.path.join(self.tmp.name, "commands")

@@ -55,11 +55,17 @@ def _lease_attached(managed, lease):
     if not isinstance(lease, dict):
         return False
     pid = lease.get("pid")
-    if isinstance(pid, bool) or not isinstance(pid, int):
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    token = lease.get("run_token")
+    if not isinstance(token, str) or not token:
+        return False
+    if managed._finite_number(lease.get("proc_start")) is None:
         return False
     heartbeat = managed._finite_number(lease.get("heartbeat_at"))
-    if heartbeat is not None and \
-            time.time() - heartbeat < managed.LEASE_FRESH_S:
+    now = time.time()
+    if heartbeat is not None and heartbeat <= now + 60 and \
+            now - heartbeat < managed.LEASE_FRESH_S:
         return True
     return managed.proc_matches(pid, lease.get("proc_start"))
 

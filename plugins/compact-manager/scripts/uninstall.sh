@@ -97,8 +97,11 @@ for f in "$PLUGIN_DIR"/commands/*.md; do
         esac
         continue
     fi
-    if grep -qF "$MARKER $PLUGIN_DIR " "$link" 2>/dev/null || \
-       grep -qE "$MARKER [^>]*/compact-manager -->" "$link" 2>/dev/null; then
+    # Ours = the exact FULL marker line (never the phrase in prose):
+    # this clone's path verbatim, or the standard …/compact-manager
+    # plugin-dir form (mirrors the hooks' STANDARD rule).
+    if grep -qxF "<!-- $MARKER $PLUGIN_DIR -->" "$link" 2>/dev/null || \
+       grep -qE '^<!-- installed by compact-manager install\.sh from .*/compact-manager -->$' "$link" 2>/dev/null; then
         rm -f "$link"
         echo "removed $link"
     fi

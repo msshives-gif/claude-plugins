@@ -119,13 +119,24 @@ for f in "$PLUGIN_DIR"/commands/*.md; do
         esac
     fi
     if [ -e "$dest" ] || [ -L "$dest" ]; then
-        if ! grep -qF "$MARKER" "$dest" 2>/dev/null; then
+        # Ours = the exact marker LINE syntax (anchored, any clone path
+        # — a rerun from a moved clone must still own its copies), not
+        # the phrase appearing anywhere in prose.
+        if ! grep -qE '^<!-- installed by compact-manager install\.sh from .+ -->$' "$dest" 2>/dev/null; then
             echo "SKIPPED $dest (exists and is not ours)" >&2
             continue
         fi
     fi
-    { sed "s|\${CLAUDE_PLUGIN_ROOT}|$PLUGIN_DIR|g" "$f"
-      printf '\n<!-- %s %s -->\n' "$MARKER" "$PLUGIN_DIR"; } > "$dest.tmp.$$"
+    # Substitution via python3: sed replacement text would need &, |, \
+    # escaping for valid plugin paths (audit NEW-2).
+    python3 - "$f" "$dest.tmp.$$" "$PLUGIN_DIR" "$MARKER" <<'PYSUB'
+import sys
+src, tmp, plugin, marker = sys.argv[1:5]
+with open(src) as fh:
+    body = fh.read().replace("${CLAUDE_PLUGIN_ROOT}", plugin)
+with open(tmp, "w") as fh:
+    fh.write(body + "\n<!-- %s %s -->\n" % (marker, plugin))
+PYSUB
     mv "$dest.tmp.$$" "$dest"
 done
 echo "installed slash commands into $CMD_DIR (compact-manager-*.md)"
