@@ -656,6 +656,35 @@ class HookShellTests(unittest.TestCase):
         for s in self.SCRIPTS:
             self.assertEqual(self.run_hook(s, "{not json"), {}, s)
 
+    def test_session_start_watcher_status_managed(self):
+        base = {"hook_event_name": "SessionStart", "session_id": "sW",
+                "source": "startup"}
+        # advisory mode: watcher status is a managed-mode concern only.
+        self.assertEqual(self.run_hook("session_start.py", base), {})
+        # managed, no lease: the attach hint fires.
+        out = self.run_hook("session_start.py", base, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("NO watcher", ctx)
+        self.assertIn("adopt", ctx)
+        # managed, live lease (fresh heartbeat is sufficient): attached.
+        lease_dir = os.path.join(self.dir.name, "managed", "leases")
+        os.makedirs(lease_dir, exist_ok=True)
+        with open(os.path.join(lease_dir, "session-sW.json"), "w") as fh:
+            json.dump({"run_token": "t", "pid": 12345, "proc_start": 1,
+                       "heartbeat_at": time.time()}, fh)
+        out = self.run_hook("session_start.py", base, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("attached", ctx)
+        self.assertIn("12345", ctx)
+        # resume behaves like startup; unknown sources stay silent.
+        out = self.run_hook("session_start.py",
+                            dict(base, source="resume"), mode="managed")
+        self.assertIn("attached",
+                      out["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.run_hook(
+            "session_start.py", dict(base, source="clear"),
+            mode="managed"), {})
+
     def test_advisory_end_to_end(self):
         t = os.path.join(self.dir.name, "sess.jsonl")
         append_jsonl(t, [usage_row(10, 150_000, 0, 500)])

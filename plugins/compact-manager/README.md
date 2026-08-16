@@ -99,6 +99,26 @@ your own concurrent keystrokes could change what the shell sees.
 `start` avoids even that: it launches claude with no shell under the
 pane at all. Managed mode is Linux/WSL-only in this release.
 
+## Slash commands and the start-of-session status line
+
+Three slash commands ship in `commands/`:
+
+- **attach** — adopt the current tmux pane (`adopt --attended`, with
+  the result interpreted for you)
+- **detach** — stop this session's watcher
+- **status** — mode, live watchers, and per-session context usage
+
+Plugin-system installs get them namespaced (`/compact-manager:attach`
+etc.); `scripts/install.sh` symlinks them beside the settings file as
+`/compact-manager-attach` etc., and `uninstall.sh` removes only links
+that resolve into this clone.
+
+In managed mode, session start/resume also injects one status line
+saying whether a watcher actually holds this session, with the attach
+command if not. Without it, "mode is managed but nobody adopted this
+pane" is indistinguishable from fully-enabled until the 80% line.
+Advisory and off modes stay silent, as before.
+
 ## Configuration reference
 
 Config file `~/.claude/compact-manager.json`, or environment variables

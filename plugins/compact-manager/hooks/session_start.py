@@ -1,9 +1,17 @@
-"""SessionStart (matcher "compact"): opportunistic reorientation right
-after a compaction. Spike S1: this injection DOES reach the model in
-interactive sessions on current Claude Code (not across headless
-resumes). It never advances the drain CAS — the durable delivery stays
-with advisor/reorient, so if this fires the model may see the
-reorientation twice (harmless duplicate by design)."""
+"""SessionStart, two duties by source:
+
+- "compact": opportunistic reorientation right after a compaction.
+  Spike S1: this injection DOES reach the model in interactive
+  sessions on current Claude Code (not across headless resumes). It
+  never advances the drain CAS — the durable delivery stays with
+  advisor/reorient, so if this fires the model may see the
+  reorientation twice (harmless duplicate by design).
+- "startup"/"resume": in managed mode only, one status line saying
+  whether a watcher holds THIS session. Without it, "mode is managed
+  but nobody adopted this pane" looks identical to fully-enabled
+  until the 80% line — the hooks fire, the config says managed, and
+  the missing piece (a live session lease) is invisible.
+"""
 import json
 import os
 import sys
@@ -17,31 +25,67 @@ except Exception as e:
     sys.exit(0)
 
 
-def main():
-    payload = cm.read_payload()
-    cfg = cm.load_config()
-    if cfg["mode"] == "off":
-        return
-    if (payload.get("source") or payload.get("session_started_from")) \
-            != "compact":
-        return
-    session_id = payload.get("session_id") or ""
-    if not session_id:
-        return
+def _emit(cfg, text):
+    print(json.dumps({
+        "suppressOutput": not cfg["system_message"],
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": text,
+        },
+    }))
+
+
+def _reorient(cfg, session_id):
     paths = cm.state_paths(cfg, session_id)
     packet = cm.load_packet(paths)
     if not packet:
         return
     cm.ledger_append(cfg, {"event": "inject", "hook": "session_start",
                            "seq": packet.get("seq")})
-    print(json.dumps({
-        "suppressOutput": not cfg["system_message"],
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": cm.reorientation_text(
-                packet, cm.delivery_cap(cfg)),
-        },
-    }))
+    _emit(cfg, cm.reorientation_text(packet, cm.delivery_cap(cfg)))
+
+
+def _watcher_status(cfg, session_id):
+    if cfg["mode"] != "managed":
+        return
+    import managed
+    lease_path = managed.managed_paths(cfg, session_id)["session_lease"]
+    lease = None
+    try:
+        with open(lease_path) as fh:
+            lease = json.load(fh)
+    except (OSError, ValueError):
+        lease = None
+    if isinstance(lease, dict) and managed.lease_is_live(lease):
+        text = ("compact-manager: managed mode, watcher attached to this "
+                "session (pid %s)." % lease.get("pid"))
+    else:
+        adopt = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "bin", "compact-manager")
+        text = ("compact-manager: mode is managed but NO watcher holds "
+                "this session — nothing will type /compact for you. "
+                "Attach one with the attach command "
+                "(/compact-manager:attach, or /compact-manager-attach on "
+                "script installs) or: %s adopt -t \"$TMUX_PANE\" "
+                "--attended" % os.path.normpath(adopt))
+    cm.ledger_append(cfg, {"event": "inject", "hook": "session_start",
+                           "kind": "watcher_status"})
+    _emit(cfg, text)
+
+
+def main():
+    payload = cm.read_payload()
+    cfg = cm.load_config()
+    if cfg["mode"] == "off":
+        return
+    source = payload.get("source") or payload.get("session_started_from")
+    session_id = payload.get("session_id") or ""
+    if not session_id:
+        return
+    if source == "compact":
+        _reorient(cfg, session_id)
+    elif source in ("startup", "resume"):
+        _watcher_status(cfg, session_id)
 
 
 if __name__ == "__main__":

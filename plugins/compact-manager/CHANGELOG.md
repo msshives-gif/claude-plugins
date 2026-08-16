@@ -1,5 +1,19 @@
 # Changelog — compact-manager
 
+## 0.3.0 — 2026-08-16
+
+Discoverability: managed mode's one invisible state — configured on,
+hooks firing, but no watcher adopted for the session — is now surfaced
+instead of discovered at the 80% line.
+
+- Slash commands `attach` / `detach` / `status` (plugin namespace
+  `/compact-manager:<name>`; `install.sh` now symlinks them beside the
+  settings file as `/compact-manager-<name>`, and `uninstall.sh`
+  removes only links resolving into this clone).
+- SessionStart wiring gains `startup` and `resume` matchers: in
+  managed mode the hook injects one watcher-status line (attached with
+  pid, or the attach command to run). Advisory/off stay silent.
+
 ## 0.2.0 — 2026-08-15
 
 Released after two two-family code-audit rounds (all findings folded)

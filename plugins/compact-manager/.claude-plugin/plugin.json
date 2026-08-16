@@ -1,7 +1,7 @@
 {
   "name": "compact-manager",
-  "version": "0.2.0",
-  "description": "Warns the main session as its own context fills, captures a wake packet before compaction, and reorients the session after it \u2014 so an autonomous orchestrator survives past one context window.",
+  "version": "0.3.0",
+  "description": "Warns the main session as its own context fills, captures a wake packet before compaction, and reorients the session after it — so an autonomous orchestrator survives past one context window.",
   "author": {
     "name": "msshives-gif"
   },

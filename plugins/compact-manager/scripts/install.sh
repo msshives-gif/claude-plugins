@@ -1,5 +1,5 @@
 #!/bin/bash
-# Manual (non-plugin) install: merge the five compact-manager hooks
+# Manual (non-plugin) install: merge the compact-manager hook groups
 # into ~/.claude/settings.json (or a settings file given as $1).
 # Idempotent; atomic write; backs up first.
 set -euo pipefail
@@ -24,6 +24,8 @@ WIRING = [
     ("PreCompact", "manual", "precompact.py"),
     ("PreCompact", "auto", "precompact.py"),
     ("SessionStart", "compact", "session_start.py"),
+    ("SessionStart", "startup", "session_start.py"),
+    ("SessionStart", "resume", "session_start.py"),
 ]
 
 
@@ -93,3 +95,14 @@ print("Hooks are inert until you set a mode, e.g. "
       "COMPACT_MANAGER_MODE=advisory.")
 print("Restart running Claude Code sessions to pick up hook changes.")
 PY
+
+# Slash commands: the plugin system namespaces commands/ automatically,
+# but script installs need them linked beside the settings file. Prefix
+# with the plugin name so /status etc. stay unclaimed.
+CMD_DIR="$(dirname "$SETTINGS")/commands"
+mkdir -p "$CMD_DIR"
+for f in "$PLUGIN_DIR"/commands/*.md; do
+    [ -e "$f" ] || continue
+    ln -sfn "$f" "$CMD_DIR/compact-manager-$(basename "$f")"
+done
+echo "linked slash commands into $CMD_DIR (compact-manager-*.md)"

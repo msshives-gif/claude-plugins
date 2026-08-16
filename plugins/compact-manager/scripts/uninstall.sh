@@ -77,3 +77,16 @@ with os.fdopen(fd, "w") as fh:
 os.replace(tmp, settings_path)
 print(f"removed {removed} hook entrie(s); wrote {settings_path}")
 PY
+
+# Remove only command symlinks that resolve into THIS clone's commands/
+# directory — same narrow-matching rule as the hook removal above.
+CMD_DIR="$(dirname "$SETTINGS")/commands"
+for f in "$PLUGIN_DIR"/commands/*.md; do
+    [ -e "$f" ] || continue
+    link="$CMD_DIR/compact-manager-$(basename "$f")"
+    if [ -L "$link" ] && \
+       [ "$(readlink -f "$link" 2>/dev/null)" = "$(readlink -f "$f")" ]; then
+        rm -f "$link"
+        echo "removed $link"
+    fi
+done

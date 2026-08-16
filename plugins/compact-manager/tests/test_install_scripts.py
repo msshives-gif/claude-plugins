@@ -46,7 +46,7 @@ class CompactManagerInstallTests(unittest.TestCase):
         r = _run(INSTALL, self.settings)
         self.assertEqual(r.returncode, 0, r.stderr)
         s = self.read()
-        self.assertEqual(len(_hook_commands(s)), 6)
+        self.assertEqual(len(_hook_commands(s)), 8)
         # The wiring shape matters: matchers must match hooks.json.
         matchers = {(ev, g.get("matcher"))
                     for ev, groups in s["hooks"].items() for g in groups}
@@ -54,16 +54,44 @@ class CompactManagerInstallTests(unittest.TestCase):
         self.assertIn(("PreCompact", "manual"), matchers)
         self.assertIn(("PreCompact", "auto"), matchers)
         self.assertIn(("SessionStart", "compact"), matchers)
+        self.assertIn(("SessionStart", "startup"), matchers)
+        self.assertIn(("SessionStart", "resume"), matchers)
+        # Slash commands are symlinked beside the settings file...
+        cmd_dir = os.path.join(self.tmp.name, "commands")
+        src_dir = os.path.join(PLUGIN, "commands")
+        expected = sorted("compact-manager-" + n
+                          for n in os.listdir(src_dir) if n.endswith(".md"))
+        self.assertTrue(expected)
+        self.assertEqual(sorted(os.listdir(cmd_dir)), expected)
+        for name in expected:
+            link = os.path.join(cmd_dir, name)
+            self.assertTrue(os.path.islink(link), link)
+            self.assertEqual(os.path.realpath(link), os.path.realpath(
+                os.path.join(src_dir, name[len("compact-manager-"):])))
         r = _run(UNINSTALL, self.settings)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(_hook_commands(self.read()), [])
+        # ...and uninstall removes exactly those links, sparing strangers.
+        self.assertEqual(os.listdir(cmd_dir), [])
+
+    def test_uninstall_spares_foreign_command_files(self):
+        _run(INSTALL, self.settings)
+        cmd_dir = os.path.join(self.tmp.name, "commands")
+        foreign = os.path.join(cmd_dir, "compact-manager-attach.md")
+        os.remove(foreign)  # replace our link with a real user file
+        with open(foreign, "w") as fh:
+            fh.write("user-owned command\n")
+        r = _run(UNINSTALL, self.settings)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(os.listdir(cmd_dir),
+                         ["compact-manager-attach.md"])
 
     def test_install_is_idempotent(self):
         r1 = _run(INSTALL, self.settings)
         self.assertEqual(r1.returncode, 0, r1.stderr)
         r2 = _run(INSTALL, self.settings)
         self.assertEqual(r2.returncode, 0, r2.stderr)
-        self.assertEqual(len(_hook_commands(self.read())), 6)
+        self.assertEqual(len(_hook_commands(self.read())), 8)
 
     def test_backup_suffix_lookalike_does_not_block_install(self):
         # A command referencing "<our advisor path>.backup" must not
@@ -78,7 +106,7 @@ class CompactManagerInstallTests(unittest.TestCase):
         r = _run(INSTALL, self.settings)
         self.assertEqual(r.returncode, 0, r.stderr)
         cmds = _hook_commands(self.read())
-        self.assertEqual(len(cmds), 7)  # lookalike survives + our six
+        self.assertEqual(len(cmds), 9)  # lookalike survives + our eight
         self.assertTrue(any(advisor in c and ".backup" not in c
                             for c in cmds))
 
@@ -94,7 +122,7 @@ class CompactManagerInstallTests(unittest.TestCase):
                      "timeout": 5}]}]}}, fh)
         r = _run(INSTALL, self.settings)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len(_hook_commands(self.read())), 7)
+        self.assertEqual(len(_hook_commands(self.read())), 9)
 
     def test_backups_do_not_collide(self):
         # install (no file yet: no backup) -> uninstall -> install can
