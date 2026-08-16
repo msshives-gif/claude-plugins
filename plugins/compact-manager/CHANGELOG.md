@@ -15,6 +15,15 @@ instead of discovered at the 80% line.
   never overwritten; `uninstall.sh` removes only marker-carrying
   files or legacy symlinks resolving into this clone, canonicalizing
   via python3 rather than `readlink -f`).
+- Second-round verification hardening: attachment proof rejects
+  future heartbeats (same-machine writes — future is malformed, not
+  skew); the MALFORMED-LEASE flag covers all pid-malformed shapes and
+  the docs state exactly what it cannot see; overview rows carry an
+  `updated=…s-ago` age column, detach's current-session heuristic is
+  age-verified and prefers an environment-provided session id, and
+  the CLI-discovery fallback finds the CLI file itself (versioned
+  plugin-cache layouts have directories named compact-manager with no
+  bin/). Negative/non-finite token values render as zeros per-row.
 - Default `context_window` is now 1,000,000 (the Claude 5 standard;
   was 200k). Deliberate failure direction: unknown new model names
   must never compact early at a stale small default — a legacy 200k

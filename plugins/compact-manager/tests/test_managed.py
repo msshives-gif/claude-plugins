@@ -1304,3 +1304,44 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("CURRENT>> new", out)     # newest mtime marked
         self.assertIn("pct=10.0%", out)         # 100k of fable's 1M override
         self.assertIn("pct=25.0%", out)         # 50k of the configured 200k global
+        self.assertIn("updated=", out)  # age column present
+
+    def test_overview_flag_branches_and_bad_token_values(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=tmp.name,
+                   context_window=200_000)
+        lease_dir = os.path.join(tmp.name, "managed", "leases")
+        wdir = os.path.join(tmp.name, "managed", "watchers")
+        os.makedirs(lease_dir)
+        os.makedirs(wdir)
+        # negative pid, fresh heartbeat: live-by-ambiguity + pid-malformed
+        with open(os.path.join(lease_dir, "session-sNeg.json"), "w") as fh:
+            json.dump({"run_token": "t", "pid": -7, "proc_start": 1,
+                       "heartbeat_at": time.time()}, fh)
+        # stale heartbeat + dead pid: provably dead lease, non-retired state
+        with open(os.path.join(lease_dir, "session-sDead.json"), "w") as fh:
+            json.dump({"run_token": "t", "pid": 999999999,
+                       "proc_start": 1, "heartbeat_at": 1.0}, fh)
+        # LATCHED journal tail -> ATTENTION
+        with open(os.path.join(lease_dir, "session-sAlert.json"), "w") as fh:
+            json.dump({"run_token": "u", "pid": os.getpid(),
+                       "proc_start": 1, "heartbeat_at": time.time()}, fh)
+        managed.journal_record(
+            os.path.join(wdir, "sAlert.journal.jsonl"), "LATCHED",
+            {"latch_kind": "SAFETY", "reason": "missing_ack"})
+        # state file with negative + non-finite token values -> zeros
+        sdir = os.path.join(tmp.name, "state")
+        os.makedirs(sdir)
+        with open(os.path.join(sdir, "weird.json"), "w") as fh:
+            fh.write('{"model": "m", "current": -50, "peak": 1e999}')
+        out = managed.overview_text(cfg)
+        neg = [l for l in out.splitlines() if "sNeg" in l][0]
+        self.assertIn("MALFORMED-LEASE", neg)
+        dead = [l for l in out.splitlines() if "sDead" in l][0]
+        self.assertIn("DEAD-LEASE", dead)
+        alert = [l for l in out.splitlines() if "sAlert" in l][0]
+        self.assertIn("ATTENTION", alert)
+        weird = [l for l in out.splitlines() if "weird" in l][0]
+        self.assertIn("current=0 peak=0", weird)
+        self.assertIn("pct=0.0%", weird)

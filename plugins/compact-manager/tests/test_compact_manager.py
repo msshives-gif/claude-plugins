@@ -706,7 +706,11 @@ class HookShellTests(unittest.TestCase):
         for bad in ({"pid": -1, "heartbeat_at": time.time()},
                     {"pid": 12345, "heartbeat_at": time.time()},
                     {"pid": 12345, "run_token": "t",
-                     "heartbeat_at": time.time()}):
+                     "heartbeat_at": time.time()},
+                    # future heartbeat is malformed, not clock skew:
+                    # it must not count as fresh evidence for a dead pid
+                    {"pid": 999999999, "run_token": "t", "proc_start": 1,
+                     "heartbeat_at": time.time() + 30}):
             with open(lease_file, "w") as fh:
                 json.dump(bad, fh)
             out = self.run_hook("session_start.py", base, mode="managed")

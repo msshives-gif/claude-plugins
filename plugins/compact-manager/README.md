@@ -124,10 +124,10 @@ plugin installs have open issues against it), so the command bodies
 locate the CLI defensively rather than trusting the placeholder.
 
 The data-gathering lives in the CLI, not in command prose:
-`bin/compact-manager overview` prints the deterministic runtime
-readout (watchers with attention flags, per-session usage, a
-current-session marker) that `status` relays — also usable directly,
-with no model turn at all. The monorepo's `tools/status.py` is the
+`bin/compact-manager overview` prints the runtime readout (watchers
+with attention flags, per-session usage, and a recency-based
+current-session marker with an age column to verify it) that `status`
+relays — also usable directly, with no model turn at all. The monorepo's `tools/status.py` is the
 complementary dev-side readout (knob-by-knob config provenance and
 hook wiring across the whole suite); the two deliberately do not
 overlap.

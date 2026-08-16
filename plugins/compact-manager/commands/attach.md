@@ -6,13 +6,15 @@ Attach the compact-manager watcher to the current Claude Code session so
 `/compact` gets typed automatically at the configured threshold (managed
 mode).
 
-1. Locate the compact-manager CLI. The path below normally reads as an
-   absolute path (script installs write it in). If it instead still
-   says `${CLAUDE_PLUGIN_ROOT}` literally — plugin installs may not
-   substitute command markdown — recover the plugin root with
-   `find ~/.claude/plugins -maxdepth 6 -type d -name compact-manager
-   2>/dev/null` (marketplace layout) and use
-   `<plugin-root>/bin/compact-manager`.
+1. Locate the compact-manager CLI. The path in the later steps
+   normally reads as an absolute path (script installs write it in).
+   If it instead still says `${CLAUDE_PLUGIN_ROOT}` literally — plugin
+   installs may not substitute command markdown — find the CLI file
+   itself: `find ~/.claude/plugins -maxdepth 8 -type f -name
+   compact-manager -path "*/bin/*" 2>/dev/null` (this handles
+   versioned cache layouts, where a directory merely NAMED
+   compact-manager has no bin/). If several paths match, use the most
+   recently modified (`ls -t`).
 2. Check the pane: run `echo "$TMUX_PANE"` in your shell tool. If it is
    empty, this session is not running under tmux — managed mode requires
    tmux. Report that and stop.

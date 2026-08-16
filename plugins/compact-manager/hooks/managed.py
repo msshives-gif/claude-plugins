@@ -1890,7 +1890,13 @@ def overview_text(cfg, now=None):
             flags.append("ATTENTION")
         if not r["live"] and r["state"] != "WATCHER_RETIRED":
             flags.append("DEAD-LEASE")
-        if r["live"] and r.get("pid") is None:
+        pid = r.get("pid")
+        pid_ok = isinstance(pid, int) and not isinstance(pid, bool) \
+            and pid > 0
+        # Catches pid-malformed lease shapes; a lease malformed only in
+        # fields status_rows does not surface (token/start/heartbeat)
+        # can still read live=true unflagged — status.md says so.
+        if r["live"] and not pid_ok:
             flags.append("MALFORMED-LEASE")
         lines.append("  %s pid=%s state=%s live=%s reason=%s%s" % (
             r["session_id"], r["pid"], r["state"], r["live"],
@@ -1923,24 +1929,30 @@ def overview_text(cfg, now=None):
         # state file (verify-round finding).
         try:
             window = cm.window_for(cfg, st.get("model"))["context_window"]
-            current = st.get("current")
-            current = current if isinstance(current, (int, float)) \
-                and not isinstance(current, bool) else 0
-            peak = st.get("peak")
-            peak = peak if isinstance(peak, (int, float)) \
-                and not isinstance(peak, bool) else 0
+
+            def _token_count(value):
+                ok = isinstance(value, (int, float)) \
+                    and not isinstance(value, bool) \
+                    and value == value and value != float("inf") \
+                    and value >= 0
+                return value if ok else 0
+
+            current = _token_count(st.get("current"))
+            peak = _token_count(st.get("peak"))
             lines.append(
-                "  %s%s model=%s current=%s peak=%s window=%s pct=%.1f%%"
+                "  %s%s model=%s current=%s peak=%s window=%s pct=%.1f%% "
+                "updated=%ds-ago"
                 % ("CURRENT>> " if i == 0 else "          ", sid,
                    st.get("model") or "?", current, peak, window,
-                   100.0 * current / window))
+                   100.0 * current / window, max(0, int(now - mtime))))
         except Exception:
             lines.append("  %s%s (unreadable state row)" % (
                 "CURRENT>> " if i == 0 else "          ", sid))
     if entries:
-        lines.append("(CURRENT>> = most recently updated state file; the "
-                     "advisor touches it on every tool call, so this is "
-                     "almost certainly the invoking session)")
+        lines.append("(CURRENT>> = most recently updated state file; "
+                     "the advisor touches it on every tool call, so a "
+                     "seconds-old age means it is almost certainly the "
+                     "invoking session — verify via updated=…s-ago)")
     return "\n".join(lines)
 
 

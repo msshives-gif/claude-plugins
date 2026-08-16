@@ -64,7 +64,10 @@ def _lease_attached(managed, lease):
         return False
     heartbeat = managed._finite_number(lease.get("heartbeat_at"))
     now = time.time()
-    if heartbeat is not None and heartbeat <= now + 60 and \
+    # Heartbeats are same-machine writes: a future timestamp (beyond
+    # sub-second slop) is malformed, not clock skew — it must not count
+    # as fresh evidence. The pid can still prove the watcher alive.
+    if heartbeat is not None and heartbeat <= now + 1 and \
             now - heartbeat < managed.LEASE_FRESH_S:
         return True
     return managed.proc_matches(pid, lease.get("proc_start"))
