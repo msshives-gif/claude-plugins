@@ -22,7 +22,9 @@ two stages:
 
 (or, without the plugin system: `./scripts/install.sh`)
 
-Then turn it on — installing alone changes nothing:
+Then turn it on — installing alone changes nothing. Either run the
+`setup` slash command for a guided choice, or write the config
+directly:
 
 ```
 echo '{"mode": "advisory"}' > ~/.claude/compact-manager.json
@@ -105,8 +107,11 @@ pane at all. Managed mode is Linux/WSL-only in this release.
 
 ## Slash commands and the start-of-session status line
 
-Three slash commands ship in `commands/`:
+Four slash commands ship in `commands/`:
 
+- **setup** — first-run walkthrough: pick a mode, set window
+  overrides, learn the other commands (nothing runs automatically at
+  install time — this is the guided way in)
 - **attach** — adopt the current tmux pane (`adopt --attended`, with
   the result interpreted for you)
 - **detach** — stop this session's watcher

@@ -6,6 +6,9 @@ Discoverability: managed mode's one invisible state — configured on,
 hooks firing, but no watcher adopted for the session — is now surfaced
 instead of discovered at the 80% line.
 
+- `setup` slash command: guided first-run mode choice + window
+  overrides + command introduction (install itself stays inert by
+  design; merges into an existing config, never clobbers).
 - Slash commands `attach` / `detach` / `status` (plugin namespace
   `/compact-manager:<name>`; `install.sh` installs substituted,
   marker-tagged copies beside the settings file as
