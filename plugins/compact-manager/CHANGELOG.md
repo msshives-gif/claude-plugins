@@ -15,6 +15,12 @@ instead of discovered at the 80% line.
   never overwritten; `uninstall.sh` removes only marker-carrying
   files or legacy symlinks resolving into this clone, canonicalizing
   via python3 rather than `readlink -f`).
+- `bin/compact-manager overview`: deterministic runtime readout
+  (watcher rows with ATTENTION/DEAD-LEASE/MALFORMED-LEASE flags,
+  per-session usage percentages, current-session marker). The status
+  slash command relays it instead of re-deriving logic in prose, and
+  all three command bodies locate the CLI defensively — placeholder
+  substitution in command markdown is version/install-form-dependent.
 - SessionStart wiring gains `startup` and `resume` matchers: in
   managed mode the hook injects one watcher-status line (attached with
   pid, or the attach command to run). Attachment needs positive proof

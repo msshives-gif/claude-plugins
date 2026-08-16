@@ -110,11 +110,23 @@ Three slash commands ship in `commands/`:
 
 Plugin-system installs get them namespaced (`/compact-manager:attach`
 etc.). `scripts/install.sh` installs substituted, marker-tagged copies
-beside the settings file as `/compact-manager-attach` etc. — copies,
-because `${CLAUDE_PLUGIN_ROOT}` is only substituted in plugin context;
-rerun install.sh after editing `commands/`. An existing file without
-the marker is never overwritten, and `uninstall.sh` removes only files
+beside the settings file as `/compact-manager-attach` etc.; rerun
+install.sh after editing `commands/`. An existing file without the
+marker is never overwritten, and `uninstall.sh` removes only files
 carrying the marker (or legacy symlinks resolving into this clone).
+`${CLAUDE_PLUGIN_ROOT}` substitution in command markdown is
+version- and install-form-dependent (script installs never get it;
+plugin installs have open issues against it), so the command bodies
+locate the CLI defensively rather than trusting the placeholder.
+
+The data-gathering lives in the CLI, not in command prose:
+`bin/compact-manager overview` prints the deterministic runtime
+readout (watchers with attention flags, per-session usage, a
+current-session marker) that `status` relays — also usable directly,
+with no model turn at all. The monorepo's `tools/status.py` is the
+complementary dev-side readout (knob-by-knob config provenance and
+hook wiring across the whole suite); the two deliberately do not
+overlap.
 
 In managed mode, session start/resume also injects one status line
 saying whether a watcher demonstrably holds this session (fresh lease

@@ -1870,6 +1870,69 @@ def _cli_binding(socket, pane, attended, run_tmux=default_run_tmux,
     return binding, None
 
 
+def overview_text(cfg, now=None):
+    """Deterministic status report: config, watcher rows (with the
+    attention flags status.md used to ask the model to derive), and
+    per-session usage from the advisor's state files. The slash
+    command relays this instead of re-deriving the logic in prose."""
+    now = time.time() if now is None else now
+    lines = []
+    overrides = ", ".join(
+        "%s→%s" % (k, v.get("context_window"))
+        for k, v in sorted(cfg.get("models", {}).items())) or "none"
+    lines.append("mode=%s window=%s model-overrides: %s"
+                 % (cfg["mode"], cfg["context_window"], overrides))
+    rows = status_rows(cfg)
+    lines.append("watchers: %d" % len(rows))
+    for r in rows:
+        flags = []
+        if r["state"] in ALERT_STATES:
+            flags.append("ATTENTION")
+        if not r["live"] and r["state"] != "WATCHER_RETIRED":
+            flags.append("DEAD-LEASE")
+        if r["live"] and r.get("pid") is None:
+            flags.append("MALFORMED-LEASE")
+        lines.append("  %s pid=%s state=%s live=%s reason=%s%s" % (
+            r["session_id"], r["pid"], r["state"], r["live"],
+            r["reason"], ("  <-- " + ",".join(flags)) if flags else ""))
+    state_dir = os.path.join(cfg["state_dir"], "state")
+    entries = []
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(state_dir, name)
+        try:
+            mtime = os.path.getmtime(path)
+            if now - mtime > 86400:
+                continue
+            with open(path) as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(st, dict):
+            entries.append((mtime, name[:-5], st))
+    entries.sort(key=lambda e: e[0], reverse=True)
+    lines.append("sessions (state files touched in the last 24h): %d"
+                 % len(entries))
+    for i, (mtime, sid, st) in enumerate(entries):
+        window = cm.window_for(cfg, st.get("model"))["context_window"]
+        current = st.get("current") or 0
+        lines.append(
+            "  %s%s model=%s current=%s peak=%s window=%s pct=%.1f%%" % (
+                "CURRENT>> " if i == 0 else "          ", sid,
+                st.get("model") or "?", current, st.get("peak", 0),
+                window, 100.0 * current / window))
+    if entries:
+        lines.append("(CURRENT>> = most recently updated state file; the "
+                     "advisor touches it on every tool call, so this is "
+                     "almost certainly the invoking session)")
+    return "\n".join(lines)
+
+
 def cli_main(argv=None, run_tmux=default_run_tmux):
     parser = argparse.ArgumentParser(prog="compact-manager")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1881,6 +1944,7 @@ def cli_main(argv=None, run_tmux=default_run_tmux):
     adopt.add_argument("-t", dest="pane", required=True)
     adopt.add_argument("--attended", action="store_true")
     sub.add_parser("status")
+    sub.add_parser("overview")
     stop = sub.add_parser("stop")
     stop.add_argument("sid")
     resolve = sub.add_parser("resolve")
@@ -1929,6 +1993,9 @@ def cli_main(argv=None, run_tmux=default_run_tmux):
     elif args.command == "status":
         rows = status_rows(cfg)
         print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    elif args.command == "overview":
+        print(overview_text(cfg))
         return 0
     elif args.command == "stop":
         tail = recover_attempt(managed_paths(cfg, args.sid)["journal"],

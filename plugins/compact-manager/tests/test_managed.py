@@ -1263,3 +1263,33 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OverviewTests(unittest.TestCase):
+    def test_overview_flags_and_current_marker(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=tmp.name,
+                   models={"fable": {"context_window": 1_000_000}})
+        cfg = managed.load_managed_config(cfg) if hasattr(
+            managed, "load_managed_config") else cfg
+        lease_dir = os.path.join(tmp.name, "managed", "leases")
+        os.makedirs(lease_dir)
+        with open(os.path.join(lease_dir, "session-sBad.json"), "w") as fh:
+            json.dump({"heartbeat_at": time.time()}, fh)  # malformed: no pid
+        state_dir = os.path.join(tmp.name, "state")
+        os.makedirs(state_dir)
+        now = time.time()
+        with open(os.path.join(state_dir, "old.json"), "w") as fh:
+            json.dump({"model": "claude-fable-5", "current": 100_000,
+                       "peak": 200_000}, fh)
+        os.utime(os.path.join(state_dir, "old.json"), (now - 60, now - 60))
+        with open(os.path.join(state_dir, "new.json"), "w") as fh:
+            json.dump({"model": "claude-opus-5", "current": 50_000,
+                       "peak": 50_000}, fh)
+        out = managed.overview_text(cfg, now=now)
+        self.assertIn("mode=managed", out)
+        self.assertIn("MALFORMED-LEASE", out)   # live-by-ambiguity, pid None
+        self.assertIn("CURRENT>> new", out)     # newest mtime marked
+        self.assertIn("pct=10.0%", out)         # 100k of fable's 1M override
+        self.assertIn("pct=25.0%", out)         # 50k of default 200k
