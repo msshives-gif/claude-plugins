@@ -1271,8 +1271,6 @@ class OverviewTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         cfg = dict(cm._DEFAULTS, mode="managed", state_dir=tmp.name,
                    models={"fable": {"context_window": 1_000_000}})
-        cfg = managed.load_managed_config(cfg) if hasattr(
-            managed, "load_managed_config") else cfg
         lease_dir = os.path.join(tmp.name, "managed", "leases")
         os.makedirs(lease_dir)
         with open(os.path.join(lease_dir, "session-sBad.json"), "w") as fh:
@@ -1287,8 +1285,16 @@ class OverviewTests(unittest.TestCase):
         with open(os.path.join(state_dir, "new.json"), "w") as fh:
             json.dump({"model": "claude-opus-5", "current": 50_000,
                        "peak": 50_000}, fh)
+        # A state file with a garbage token field degrades to one bad
+        # row, never a lost readout (verify-round pin).
+        with open(os.path.join(state_dir, "garbage.json"), "w") as fh:
+            json.dump({"model": "claude-opus-5", "current": "oops",
+                       "peak": None}, fh)
+        os.utime(os.path.join(state_dir, "garbage.json"),
+                 (now - 120, now - 120))
         out = managed.overview_text(cfg, now=now)
         self.assertIn("mode=managed", out)
+        self.assertIn("garbage model=claude-opus-5 current=0 peak=0", out)
         self.assertIn("MALFORMED-LEASE", out)   # live-by-ambiguity, pid None
         self.assertIn("CURRENT>> new", out)     # newest mtime marked
         self.assertIn("pct=10.0%", out)         # 100k of fable's 1M override

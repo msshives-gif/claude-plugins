@@ -1919,13 +1919,24 @@ def overview_text(cfg, now=None):
     lines.append("sessions (state files touched in the last 24h): %d"
                  % len(entries))
     for i, (mtime, sid, st) in enumerate(entries):
-        window = cm.window_for(cfg, st.get("model"))["context_window"]
-        current = st.get("current") or 0
-        lines.append(
-            "  %s%s model=%s current=%s peak=%s window=%s pct=%.1f%%" % (
-                "CURRENT>> " if i == 0 else "          ", sid,
-                st.get("model") or "?", current, st.get("peak", 0),
-                window, 100.0 * current / window))
+        # Degrade per-row, never lose the whole readout to one bad
+        # state file (verify-round finding).
+        try:
+            window = cm.window_for(cfg, st.get("model"))["context_window"]
+            current = st.get("current")
+            current = current if isinstance(current, (int, float)) \
+                and not isinstance(current, bool) else 0
+            peak = st.get("peak")
+            peak = peak if isinstance(peak, (int, float)) \
+                and not isinstance(peak, bool) else 0
+            lines.append(
+                "  %s%s model=%s current=%s peak=%s window=%s pct=%.1f%%"
+                % ("CURRENT>> " if i == 0 else "          ", sid,
+                   st.get("model") or "?", current, peak, window,
+                   100.0 * current / window))
+        except Exception:
+            lines.append("  %s%s (unreadable state row)" % (
+                "CURRENT>> " if i == 0 else "          ", sid))
     if entries:
         lines.append("(CURRENT>> = most recently updated state file; the "
                      "advisor touches it on every tool call, so this is "
