@@ -1351,7 +1351,14 @@ class OverviewTests(unittest.TestCase):
             fh.write('{"model": "m", "current": 5, "peak": 5}')
         near = time.time() + 2
         os.utime(fut2, (near, near))
-        out = managed.overview_text(cfg)
+        # in-slop future fixture with a FIXED clock: exercises the
+        # max(0,...) floor itself — without it this renders -1s-ago
+        fixed_now = time.time()
+        fut3 = os.path.join(sdir, "slop.json")
+        with open(fut3, "w") as fh:
+            fh.write('{"model": "m", "current": 5, "peak": 5}')
+        os.utime(fut3, (fixed_now + 0.9, fixed_now + 0.9))
+        out = managed.overview_text(cfg, now=fixed_now)
         neg = [l for l in out.splitlines() if "sNeg" in l][0]
         self.assertIn("MALFORMED-LEASE", neg)
         dead = [l for l in out.splitlines() if "sDead" in l][0]
@@ -1364,6 +1371,8 @@ class OverviewTests(unittest.TestCase):
         huge = [l for l in out.splitlines() if "huge" in l][0]
         self.assertIn("current=0", huge)
         self.assertNotIn("inf", huge)
+        slop = [l for l in out.splitlines() if "slop" in l][0]
+        self.assertIn("updated=0s-ago", slop)
         for name in ("future ", "future2 "):
             row = [l for l in out.splitlines() if name in l][0]
             self.assertIn("FUTURE-MTIME", row)
