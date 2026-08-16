@@ -1941,8 +1941,10 @@ def overview_text(cfg, now=None):
             current = _token_count(st.get("current"))
             peak = _token_count(st.get("peak"))
             # A future mtime sorts first and would fake a fresh age —
-            # surface the anomaly instead of clamping it to 0s.
-            age = ("%ds-ago" % int(now - mtime) if mtime <= now + 5
+            # surface the anomaly instead of clamping it to 0s. 1s
+            # covers fs-timestamp granularity; beyond that is anomaly.
+            age = ("%ds-ago" % max(0, int(now - mtime))
+                   if mtime <= now + 1
                    else "FUTURE-MTIME(untrustworthy)")
             lines.append(
                 "  %s%s model=%s current=%s peak=%s window=%s pct=%.1f%% "

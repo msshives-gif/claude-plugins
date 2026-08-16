@@ -1344,6 +1344,13 @@ class OverviewTests(unittest.TestCase):
             fh.write('{"model": "m", "current": 5, "peak": 5}')
         later = time.time() + 3600
         os.utime(fut, (later, later))
+        # boundary pin: +2s is already an anomaly, and no negative age
+        # may ever render
+        fut2 = os.path.join(sdir, "future2.json")
+        with open(fut2, "w") as fh:
+            fh.write('{"model": "m", "current": 5, "peak": 5}')
+        near = time.time() + 2
+        os.utime(fut2, (near, near))
         out = managed.overview_text(cfg)
         neg = [l for l in out.splitlines() if "sNeg" in l][0]
         self.assertIn("MALFORMED-LEASE", neg)
@@ -1357,6 +1364,7 @@ class OverviewTests(unittest.TestCase):
         huge = [l for l in out.splitlines() if "huge" in l][0]
         self.assertIn("current=0", huge)
         self.assertNotIn("inf", huge)
-        future = [l for l in out.splitlines() if "future" in l][0]
-        self.assertIn("FUTURE-MTIME", future)
-        self.assertNotIn("0s-ago", future)
+        for name in ("future ", "future2 "):
+            row = [l for l in out.splitlines() if name in l][0]
+            self.assertIn("FUTURE-MTIME", row)
+        self.assertNotIn("updated=-", out)  # no negative age anywhere
