@@ -25,8 +25,8 @@ SCHEMA_VERSION = 1
 _DEFAULTS = {
     # off: installing changes nothing. advisory: measure own context,
     # inject soft/hard advisories, persist + reinject the wake packet.
-    # managed: + Layer-2 watcher coordination (NOT BUILT YET: managed
-    # currently behaves as advisory; the mode value is reserved).
+    # managed: + Layer-2 watcher coordination (hooks/managed.py; a
+    # watcher must still be attached per session via bin/compact-manager).
     "mode": "off",
     # Fractions of the model's context window.
     "soft_pct": 0.70,

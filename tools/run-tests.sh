@@ -3,9 +3,6 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
-echo "== subagent-context =="
-(cd "$REPO" && python3 -m unittest discover tests)
-
 for plugin in "$REPO"/plugins/*/; do
     [ -d "$plugin/tests" ] || continue
     echo "== $(basename "$plugin") =="

@@ -16,7 +16,9 @@ plugins for context-size awareness, each installable independently.
 
 Every plugin lives under [`plugins/`](plugins/); shared measurement
 core is vendored (see `tools/sync-core.py`); layout rationale in
-[docs/SUITE.md](docs/SUITE.md). History: this repo began life as
+[docs/SUITE.md](docs/SUITE.md). `tools/status.py` prints a one-screen
+readout of every plugin's effective config (default/file/env per
+knob), hook wiring, and live watchers. History: this repo began life as
 `subagent-gauge`, then `subagent-context` (single plugin) — GitHub
 redirects the old slugs.
 
