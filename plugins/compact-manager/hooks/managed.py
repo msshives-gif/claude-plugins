@@ -503,6 +503,77 @@ def _registry_entry(pid, sessions_dir):
         return None
 
 
+def live_session_ids(sessions_dir=None, proc_root="/proc", limit=256):
+    """Session ids with a positively-proven-live claude process: a
+    sessions-registry entry (<pid>.json) whose pid is alive, not a
+    zombie, and whose procStart matches /proc starttime (pid-reuse
+    guard). Returns (ids, complete): complete=True only when EVERY
+    registry entry was examined and judged, so callers may read
+    absence as dead. complete=False (registry/proc unreadable, an
+    unreadable or malformed entry, the scan bound hit) means absence
+    proves nothing — a session could be live behind the entry we
+    could not judge — and callers must render unknown, never dead.
+    Mirrors lease_is_live's philosophy: declaring death needs proof.
+    Never raises; any surprise degrades to incomplete."""
+    ids = set()
+    try:
+        sessions_dir = sessions_dir or os.path.expanduser(
+            "~/.claude/sessions")
+        if not os.path.isdir(proc_root):
+            return ids, False
+        try:
+            names = os.listdir(sessions_dir)
+        except OSError:
+            return ids, False
+        complete = True
+        seen = 0
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            stem = name[:-len(".json")]
+            # Length-bounded before int(): CPython raises on absurdly
+            # long digit strings, and no real pid exceeds 9 digits.
+            if not stem.isdigit() or len(stem) > 9:
+                continue
+            seen += 1
+            if seen > limit:
+                complete = False  # unexamined entries could be live
+                break
+            try:
+                pid = int(stem)
+                entry = _registry_entry(pid, sessions_dir)
+                if not entry:
+                    complete = False  # unreadable: could name anyone
+                    continue
+                sid = entry.get("sessionId")
+                if not isinstance(sid, str) or not _SESSION_ID.match(sid):
+                    complete = False
+                    continue
+                st = proc_stat(pid, proc_root)
+                if st is None:
+                    # Missing /proc dir is proof of death; an existing
+                    # but unreadable one (hidepid, races) is not proof
+                    # of anything — unknown, not live (start-time
+                    # unverifiable) and not dead.
+                    if os.path.exists(os.path.join(proc_root, str(pid))):
+                        complete = False
+                    continue
+                if st.get("state") in ("Z", "X", "x"):
+                    continue  # zombie/dead per proc_pid_stat(5): exited
+                try:
+                    if int(entry.get("procStart")) == st["starttime"]:
+                        ids.add(sid)
+                    # mismatch: pid reused — positive proof this entry
+                    # is stale, completeness unaffected
+                except (TypeError, ValueError, OverflowError):
+                    complete = False  # malformed procStart: unjudged
+            except Exception:
+                complete = False
+        return ids, complete
+    except Exception:
+        return ids, False
+
+
 def derive_transcript(cwd, session_id, projects_dir=None):
     """Derive the transcript PATH (containment-checked). The file may not
     exist yet — a virgin session writes it on its first turn, and start
@@ -1997,12 +2068,15 @@ def _fmt_age(seconds):
     return "%.1fh ago" % (seconds / 3600.0)
 
 
-def overview_data(cfg, now=None):
+def overview_data(cfg, now=None, sessions_dir=None, proc_root="/proc"):
     """Everything the overview shows, as one JSON-safe dict (full
     session ids; ages in integer seconds; per-model EFFECTIVE values).
     The text renderer and the `overview --json` consumers (e.g. a
     dashboard poller) share this so they can never disagree. Degrades
-    per-row like the text renderer always has."""
+    per-row like the text renderer always has. Each session row
+    carries session_live: True (claude process proven alive), False
+    (no live process — the state file merely lingers, up to 24h), or
+    None (liveness could not be judged on this machine)."""
     now = time.time() if now is None else now
     hard = cfg.get("hard_pct", 0.80)
     data = {
@@ -2078,8 +2152,14 @@ def overview_data(cfg, now=None):
         if isinstance(st, dict):
             entries.append((mtime, name[:-5], st))
     entries.sort(key=lambda e: e[0], reverse=True)
+    live_ids, liveness_complete = live_session_ids(sessions_dir, proc_root)
     for mtime, sid, st in entries:
-        row = {"session_id": sid}
+        # Dead may only be asserted from a COMPLETE scan: with any
+        # entry unjudged, this sid could be live behind it.
+        row = {"session_id": sid,
+               "session_live": (True if sid in live_ids
+                                else False if liveness_complete
+                                else None)}
         # Degrade per-row, never lose the whole readout to one bad
         # state file (verify-round finding).
         try:
@@ -2119,13 +2199,13 @@ def overview_data(cfg, now=None):
     return data
 
 
-def overview_text(cfg, now=None):
+def overview_text(cfg, now=None, sessions_dir=None, proc_root="/proc"):
     """Deterministic status report: config, watcher rows (with the
     attention flags status.md used to ask the model to derive), and
     per-session usage from the advisor's state files. The slash
     command relays this instead of re-deriving the logic in prose.
     Session ids print as 8-char prefixes; stop/resolve accept them."""
-    data = overview_data(cfg, now)
+    data = overview_data(cfg, now, sessions_dir, proc_root)
     lines = []
     lines.append("mode=%s  window=%s  soft=%s  hard=%s  trigger=%s" % (
         data["mode"], _fmt_grouped(data["context_window"]),
@@ -2175,43 +2255,57 @@ def overview_text(cfg, now=None):
     lines.append("")
     label = "sessions touched <24h (%d)" % len(data["sessions"])
     srows = []
+
+    def _alive_text(value):
+        if value is True:
+            return "live"
+        if value is False:
+            return "GONE"
+        return "?"
+
     for i, s in enumerate(data["sessions"]):
         marker = "> " if i == 0 else "  "
+        alive = _alive_text(s.get("session_live"))
         if s.get("unreadable"):
+            # Through the same column machinery as readable rows so the
+            # alive verdict stays under its header (audit finding).
             srows.append((marker, str(s["session_id"])[:8],
-                          None, "", "", "", ""))
+                          "(unreadable state row)", "", "", "", "", alive))
             continue
         age = ("FUTURE-MTIME(untrustworthy)" if s.get("future_mtime")
                else _fmt_age(s["age_s"]))
         srows.append((marker, str(s["session_id"])[:8],
                       str(s.get("model") or "?"),
                       _fmt_grouped(s["current"]), _fmt_grouped(s["peak"]),
-                      "%.1f%%" % s["pct"], age))
+                      "%.1f%%" % s["pct"], age, alive))
     if srows:
         lines.append(label)
         id_w = max([len("session")] + [len(t[1]) for t in srows])
-        model_w = max([len("model")] + [len(t[2]) for t in srows
-                                        if t[2] is not None])
+        model_w = max([len("model")] + [len(t[2]) for t in srows])
         cur_w = max([len("current")] + [len(t[3]) for t in srows])
         peak_w = max([len("peak")] + [len(t[4]) for t in srows])
         pct_w = max([len("pct")] + [len(t[5]) for t in srows])
         age_w = max([len("updated")] + [len(t[6]) for t in srows])
-        lines.append("  %s  %s  %s  %s  %s  %s" % (
+        lines.append("  %s  %s  %s  %s  %s  %s  %s" % (
             "session".ljust(id_w), "model".ljust(model_w),
             "current".rjust(cur_w), "peak".rjust(peak_w),
-            "pct".rjust(pct_w), "updated".rjust(age_w)))
+            "pct".rjust(pct_w), "updated".rjust(age_w), "alive"))
         for t in srows:
-            if t[2] is None:
-                lines.append("%s%s  (unreadable state row)"
-                             % (t[0], t[1]))
-                continue
-            lines.append(("%s%s  %s  %s  %s  %s  %s" % (
+            lines.append(("%s%s  %s  %s  %s  %s  %s  %s" % (
                 t[0], t[1].ljust(id_w), t[2].ljust(model_w),
                 t[3].rjust(cur_w), t[4].rjust(peak_w),
-                t[5].rjust(pct_w), t[6].rjust(age_w))).rstrip())
+                t[5].rjust(pct_w), t[6].rjust(age_w), t[7])).rstrip())
         lines.append("(> = most recently updated; the advisor touches "
                      "it on every tool call, so a seconds-old age is "
                      "almost certainly the invoking session)")
+        alives = {t[7] for t in srows}
+        if "GONE" in alives:
+            lines.append("(GONE = no live claude process for this "
+                         "session; its state file just lingers and "
+                         "ages out of this list after 24h)")
+        if "?" in alives:
+            lines.append("(alive=? — session liveness could not be "
+                         "judged on this machine)")
     else:
         lines.append(label)
     return "\n".join(lines)

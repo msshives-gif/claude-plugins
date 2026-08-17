@@ -30,4 +30,9 @@ Report the current compact-manager state.
    surface as live; it cannot see an empty lease file (no row is
    produced at all), a dead lease's pid shape (flagged `DEAD-LEASE`
    instead), or fields the row does not carry (token, start time,
-   heartbeat).
+   heartbeat). The sessions table's `alive` column is the CLI's own
+   verdict (registry + /proc proof) — relay it, don't re-derive:
+   `GONE` means the session's claude process is no longer running and
+   the row is just its state file aging out (≤24h); `?` means
+   liveness could not be judged on this machine. A `GONE` row is
+   normal housekeeping, not something to alert on.

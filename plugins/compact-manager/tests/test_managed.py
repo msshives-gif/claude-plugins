@@ -1605,3 +1605,172 @@ class OverviewTests(unittest.TestCase):
             row = [l for l in out.splitlines() if name in l][0]
             self.assertIn("FUTURE-MTIME", row)
         self.assertNotRegex(out, r"-\d+s ago")  # no negative age anywhere
+
+
+class SessionLivenessTests(unittest.TestCase):
+    """live_session_ids and the overview's session_live/alive surface."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.proc = os.path.join(self.temp.name, "proc")
+        self.sessions = os.path.join(self.temp.name, "sessions")
+        os.makedirs(self.proc)
+        os.makedirs(self.sessions)
+
+    def _entry(self, pid, sid, start):
+        with open(os.path.join(self.sessions, "%d.json" % pid), "w") as fh:
+            json.dump({"pid": pid, "procStart": str(start),
+                       "sessionId": sid}, fh)
+
+    def test_liveness_needs_pid_and_start_proof(self):
+        # proven live: pid exists, procStart matches starttime
+        write_proc(self.proc, 20, 20, 2020)
+        self._entry(20, "sess-live-1234", 2020)
+        # dead: registry entry lingers, /proc dir gone
+        self._entry(30, "sess-dead-1234", 3030)
+        # pid reused: alive but starttime mismatch -> not this session
+        write_proc(self.proc, 40, 40, 9999)
+        self._entry(40, "sess-reuse-1234", 4040)
+        # zombie: process exited, awaiting reap -> not live
+        write_proc(self.proc, 60, 60, 6060, state="Z")
+        self._entry(60, "sess-zomb-1234", 6060)
+        # non-pid filename is ignored without costing completeness
+        with open(os.path.join(self.sessions, "notapid.json"), "w") as fh:
+            fh.write("{}")
+        ids, complete = managed.live_session_ids(self.sessions, self.proc)
+        self.assertTrue(complete)
+        self.assertEqual(ids, {"sess-live-1234"})
+
+    def test_liveness_unjudgeable_returns_incomplete(self):
+        ids, complete = managed.live_session_ids(
+            os.path.join(self.temp.name, "missing"), self.proc)
+        self.assertEqual((ids, complete), (set(), False))
+        ids, complete = managed.live_session_ids(
+            self.sessions, os.path.join(self.temp.name, "noproc"))
+        self.assertEqual((ids, complete), (set(), False))
+
+    def test_liveness_partial_scan_reads_incomplete_not_dead(self):
+        write_proc(self.proc, 20, 20, 2020)
+        self._entry(20, "sess-live-1234", 2020)
+        # an unreadable registry entry could name ANY session -> the
+        # scan is incomplete and absence proves nothing
+        with open(os.path.join(self.sessions, "50.json"), "w") as fh:
+            fh.write("not json")
+        ids, complete = managed.live_session_ids(self.sessions, self.proc)
+        self.assertEqual(ids, {"sess-live-1234"})
+        self.assertFalse(complete)
+
+    def test_liveness_scan_bound_reads_incomplete(self):
+        for pid in (20, 30, 40):
+            write_proc(self.proc, pid, pid, pid * 100)
+            self._entry(pid, "sess-p%d-1234" % pid, pid * 100)
+        ids, complete = managed.live_session_ids(
+            self.sessions, self.proc, limit=2)
+        self.assertFalse(complete)
+        self.assertEqual(len(ids), 2)
+
+    def test_liveness_unreadable_proc_stat_is_unknown_not_live(self):
+        # /proc/<pid> exists but stat is unopenable (a directory here):
+        # start-time proof impossible -> neither live nor dead
+        os.makedirs(os.path.join(self.proc, "70", "stat"))
+        self._entry(70, "sess-hidn-1234", 7070)
+        ids, complete = managed.live_session_ids(self.sessions, self.proc)
+        self.assertEqual(ids, set())
+        self.assertFalse(complete)
+
+    def test_liveness_absurd_numeric_filename_skipped(self):
+        # A digit stem beyond CPython's int-conversion limit (~4300)
+        # would raise from int(); NAME_MAX prevents creating one on
+        # disk, so inject via listdir. The guard skips any stem over 9
+        # chars outright — no crash, no scan-bound cost, completeness
+        # intact. (Also a zombie/dead-state pid is never live.)
+        from unittest import mock
+        write_proc(self.proc, 20, 20, 2020)
+        self._entry(20, "sess-live-1234", 2020)
+        write_proc(self.proc, 60, 60, 6060, state="X")
+        self._entry(60, "sess-xdea-1234", 6060)
+        names = ["9" * 5000 + ".json", "20.json", "60.json"]
+        with mock.patch.object(managed.os, "listdir",
+                               return_value=names):
+            ids, complete = managed.live_session_ids(
+                self.sessions, self.proc, limit=2)
+        self.assertEqual(ids, {"sess-live-1234"})
+        self.assertTrue(complete)
+
+    def test_overview_carries_session_live_tristate(self):
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=self.temp.name,
+                   context_window=200_000)
+        state_dir = os.path.join(self.temp.name, "state")
+        os.makedirs(state_dir)
+        now = time.time()
+        for sid in ("sess-live-1234", "sess-dead-1234"):
+            with open(os.path.join(state_dir, sid + ".json"), "w") as fh:
+                json.dump({"model": "claude-fable-5", "current": 1000,
+                           "peak": 1000}, fh)
+        write_proc(self.proc, 20, 20, 2020)
+        self._entry(20, "sess-live-1234", 2020)
+        data = managed.overview_data(cfg, now=now,
+                                     sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        rows = {s["session_id"]: s for s in data["sessions"]}
+        self.assertIs(rows["sess-live-1234"]["session_live"], True)
+        self.assertIs(rows["sess-dead-1234"]["session_live"], False)
+        json.loads(json.dumps(data))  # stays strict JSON
+        out = managed.overview_text(cfg, now=now,
+                                    sessions_dir=self.sessions,
+                                    proc_root=self.proc)
+        self.assertIn("alive", out)
+        live_row = [l for l in out.splitlines() if "sess-liv" in l][0]
+        self.assertEqual(live_row.split()[-1], "live")
+        dead_row = [l for l in out.splitlines() if "sess-dea" in l][0]
+        self.assertEqual(dead_row.split()[-1], "GONE")
+        self.assertIn("(GONE = no live claude process", out)
+        self.assertNotIn("alive=?", out)
+
+    def test_overview_text_unreadable_row_verdict_aligns(self):
+        # No real fixture reaches the unreadable branch since the
+        # loader hardening, so stub the data layer: the renderer must
+        # keep an unreadable row's alive verdict under its header.
+        from unittest import mock
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=self.temp.name,
+                   context_window=200_000)
+        data = {"schema": 1, "generated_at": 0, "mode": "managed",
+                "context_window": 200_000, "soft_pct": 0.7,
+                "hard_pct": 0.8, "managed_trigger_pct": 0.8,
+                "models": {}, "watchers": [],
+                "sessions": [
+                    {"session_id": "sess-good-1234", "session_live": True,
+                     "model": "m", "current": 1000, "peak": 1000,
+                     "window": 200_000, "pct": 0.5, "updated_epoch": 0,
+                     "age_s": 5},
+                    {"session_id": "sess-unrd-1234",
+                     "session_live": False, "unreadable": True}]}
+        with mock.patch.object(managed, "overview_data",
+                               return_value=data):
+            out = managed.overview_text(cfg)
+        header = [l for l in out.splitlines() if "updated  alive" in l][0]
+        unread = [l for l in out.splitlines()
+                  if "unreadable state row" in l][0]
+        self.assertEqual(unread.split()[-1], "GONE")
+        self.assertEqual(unread.rindex("GONE"), header.rindex("alive"))
+
+    def test_overview_liveness_unknown_renders_question_mark(self):
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=self.temp.name,
+                   context_window=200_000)
+        state_dir = os.path.join(self.temp.name, "state")
+        os.makedirs(state_dir)
+        with open(os.path.join(state_dir, "sess-any-1234.json"), "w") as fh:
+            json.dump({"model": "claude-fable-5", "current": 1000,
+                       "peak": 1000}, fh)
+        data = managed.overview_data(
+            cfg, sessions_dir=os.path.join(self.temp.name, "missing"),
+            proc_root=self.proc)
+        self.assertIsNone(data["sessions"][0]["session_live"])
+        out = managed.overview_text(
+            cfg, sessions_dir=os.path.join(self.temp.name, "missing"),
+            proc_root=self.proc)
+        row = [l for l in out.splitlines() if "sess-any" in l][0]
+        self.assertEqual(row.split()[-1], "?")
+        self.assertIn("alive=?", out)
+        self.assertNotIn("(GONE =", out)

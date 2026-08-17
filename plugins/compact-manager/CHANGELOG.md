@@ -1,5 +1,18 @@
 # Changelog — compact-manager
 
+## Unreleased
+
+- Overview session rows carry a liveness verdict: `alive` column in
+  the text readout (`live` / `GONE` / `?`), `session_live`
+  (true/false/null) in `overview --json`. Proof-based (sessions
+  registry entry + `/proc` pid + non-zombie state + start-time match,
+  mirroring lease-reclaim's "declaring death needs proof"), and dead
+  is only asserted from a COMPLETE registry scan — any unjudged entry
+  (unreadable file, unreadable `/proc` stat, scan bound) degrades the
+  absent sessions to unknown, never to dead; machines with no `/proc`
+  or registry read as unknown throughout. Distinguishes "idle but
+  running" from "exited, state lingering out the 24h window".
+
 ## 0.3.0 — 2026-08-16
 
 Discoverability: managed mode's one invisible state — configured on,

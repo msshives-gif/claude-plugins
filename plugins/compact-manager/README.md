@@ -133,7 +133,15 @@ The data-gathering lives in the CLI, not in command prose:
 thresholds global and per-model-override, watchers with attention
 flags, per-session usage, and a recency-based current-session marker
 with an age column to verify it) that `status`
-relays — also usable directly, with no model turn at all. The monorepo's `tools/status.py` is the
+relays — also usable directly, with no model turn at all. Each
+session row also carries an `alive` verdict (`live` / `GONE` / `?`):
+a row is only "state file touched in the last 24h", so the CLI
+cross-checks the harness's sessions registry against `/proc`
+(pid + start-time proof, mirroring the lease-reclaim discipline) to
+say whether the claude process behind it is actually still running.
+`GONE` rows are normal — dead sessions' state lingers until the 24h
+window and the TTL reaper age it out. In JSON (`overview --json`)
+this is `session_live: true/false/null` per session row. The monorepo's `tools/status.py` is the
 complementary dev-side readout (knob-by-knob config provenance and
 hook wiring across the whole suite); the two deliberately do not
 overlap.
