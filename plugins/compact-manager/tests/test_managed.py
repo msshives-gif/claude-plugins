@@ -1304,7 +1304,8 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("model overrides (1)", out)
         fable = [l for l in out.splitlines()
                  if l.strip().startswith("fable")][0]
-        self.assertEqual(fable.split(), ["fable", "1M", "70%", "80%"])
+        self.assertEqual(fable.split(),
+                         ["fable", "1M", "70%", "80%", "80%"])
         garbage = [l for l in out.splitlines() if "garbage" in l][0]
         self.assertEqual(garbage.split()[:5],
                          ["garbage", "claude-opus-5", "0", "0", "0.0%"])
@@ -1314,6 +1315,36 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("25.0%", out)         # 50k of the configured 200k global
         self.assertIn("updated", out)   # age column present
         self.assertIn("ago", out)
+
+    def test_per_model_trigger_override(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "config.json")
+        with open(path, "w") as fh:
+            json.dump({"models": {
+                "haiku": {"context_window": 200_000,
+                          "managed_trigger_pct": 0.9},
+                # only a trigger: cm's cleaner would drop this pattern,
+                # the managed layer must graft it back
+                "opus": {"managed_trigger_pct": 0.5},
+            }}, fh)
+        # base plays cm.load_config's cleaned output (trigger stripped)
+        base = dict(cm._DEFAULTS, mode="managed",
+                    models={"haiku": {"context_window": 200_000}})
+        cfg = managed.load_config(
+            base=base, environ={"COMPACT_MANAGER_CONFIG": path})
+        self.assertEqual(managed.trigger_for(cfg, "claude-haiku-4"), 0.9)
+        # 0.5 <= effective soft 0.7: invalid, falls back to the global
+        # trigger (itself defaulted to hard)
+        self.assertEqual(managed.trigger_for(cfg, "claude-opus-5"), 0.8)
+        self.assertEqual(managed.trigger_for(cfg, "unmatched-model"), 0.8)
+        # env models JSON wins over the file, same as the cm layer
+        cfg_env = managed.load_config(base=dict(base), environ={
+            "COMPACT_MANAGER_CONFIG": path,
+            "COMPACT_MANAGER_MODELS":
+                '{"haiku": {"managed_trigger_pct": 0.85}}'})
+        self.assertEqual(managed.trigger_for(cfg_env, "claude-haiku-4"),
+                         0.85)
 
     def test_expand_sid_prefixes(self):
         tmp = tempfile.TemporaryDirectory()

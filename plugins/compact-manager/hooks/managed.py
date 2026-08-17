@@ -103,6 +103,32 @@ def load_config(base=None, environ=None):
         trigger = hard
     cfg["managed_trigger_pct"] = trigger
 
+    # Per-model trigger overrides. cm.load_config's models cleaner only
+    # keeps its own keys (and drops patterns left empty), so re-read the
+    # raw models map — same env-over-file precedence as cm — and graft
+    # managed_trigger_pct back onto cfg["models"]; window_for then
+    # carries it into the effective dict. Range-validated here, the
+    # soft<trigger ordering is checked per-model in trigger_for.
+    raw_models = env.get("COMPACT_MANAGER_MODELS")
+    if raw_models is not None:
+        try:
+            raw_models = json.loads(raw_models)
+        except ValueError:
+            raw_models = None
+    else:
+        raw_models = raw_file.get("models")
+    if isinstance(raw_models, dict):
+        cfg["models"] = dict(cfg.get("models", {}))
+        for pat, overrides in raw_models.items():
+            if not (isinstance(pat, str) and pat.strip()
+                    and isinstance(overrides, dict)):
+                continue
+            value = _finite_number(overrides.get("managed_trigger_pct"))
+            if value is not None and 0 < value <= 1.0:
+                entry = dict(cfg["models"].get(pat, {}))
+                entry["managed_trigger_pct"] = value
+                cfg["models"][pat] = entry
+
     def integer(key, floor, ceiling=None):
         value = _finite_number(raw[key])
         if value is None:
@@ -127,6 +153,20 @@ def load_config(base=None, environ=None):
         commands = list(MANAGED_DEFAULTS["managed_pane_commands"])
     cfg["managed_pane_commands"] = commands
     return cfg
+
+
+def trigger_for(cfg, model):
+    """Effective managed trigger for a model id: the per-model
+    override when valid against the model's EFFECTIVE soft, else the
+    global trigger, else the model's effective hard."""
+    eff = cm.window_for(cfg, model)
+    soft = eff["soft_pct"]
+    for candidate in (eff.get("managed_trigger_pct"),
+                      cfg.get("managed_trigger_pct")):
+        value = _finite_number(candidate)
+        if value is not None and soft < value <= 1.0:
+            return value
+    return eff["hard_pct"]
 
 
 def managed_paths(cfg, session_id, socket="", pane_id=""):
@@ -1371,7 +1411,7 @@ class Watcher:
                 self.backoff = BACKOFF_INITIAL_S
                 eff = cm.window_for(self.cfg, self.cursor.get("model"))
                 pct = self.cursor.get("current", 0) / eff["context_window"]
-                if pct >= (self.cfg["managed_trigger_pct"] -
+                if pct >= (trigger_for(self.cfg, self.cursor.get("model")) -
                            self.cfg["rearm_band_pct"]):
                     # The completed compaction left the session at/near the
                     # trigger; re-firing immediately would loop. THRESHOLD
@@ -1405,7 +1445,8 @@ class Watcher:
                     # re-arm band of real work, so no compaction churn.
                     grown = (self.cursor.get("current", 0) -
                              self.attempt.get("latch_tokens", 0))
-                    if (pct < (self.cfg["managed_trigger_pct"] -
+                    if (pct < (trigger_for(self.cfg,
+                                           self.cursor.get("model")) -
                                self.cfg["rearm_band_pct"]) or
                             grown >= self.cfg["rearm_band_pct"] * window):
                         self.attempt = transition_attempt(
@@ -1454,7 +1495,8 @@ class Watcher:
         request_id = pending_request_id(self.request_history,
                                         self.consumed_request_generations,
                                         req_generation)
-        if pct < self.cfg["managed_trigger_pct"] and request_id is None:
+        if pct < trigger_for(self.cfg, self.cursor.get("model")) \
+                and request_id is None:
             return True, "below_threshold"
         floor = packet_seq(packet)
         # An in-flight packet at creation is foreign unless its boundary is
@@ -1555,7 +1597,7 @@ class Watcher:
             eff = cm.window_for(self.cfg, self.cursor.get("model"))
             pct = self.cursor.get("current", 0) / eff["context_window"]
             interval = self.cfg["managed_poll_s"]
-            if pct < self.cfg["managed_trigger_pct"] - 0.20:
+            if pct < trigger_for(self.cfg, self.cursor.get("model")) - 0.20:
                 interval = 60
             # Floor keeps an overdue heartbeat from degenerating into a
             # zero-sleep hot loop.
@@ -1933,22 +1975,24 @@ def overview_text(cfg, now=None):
     if patterns:
         lines.append("")
         lines.append("model overrides (%d)" % len(patterns))
-        orows = [("pattern", "window", "soft", "hard")]
+        orows = [("pattern", "window", "soft", "hard", "trigger")]
         for pat in patterns:
-            # window_for gives the EFFECTIVE values a matching model
-            # gets (override merged onto globals, clamps applied), not
-            # the raw override fragment.
+            # window_for/trigger_for give the EFFECTIVE values a
+            # matching model gets (override merged onto globals,
+            # clamps applied), not the raw override fragment.
             eff = cm.window_for(cfg, pat)
             orows.append((pat, _fmt_window_short(eff["context_window"]),
                           _fmt_pct(eff["soft_pct"]),
-                          _fmt_pct(eff["hard_pct"])))
+                          _fmt_pct(eff["hard_pct"]),
+                          _fmt_pct(trigger_for(cfg, pat))))
         pat_w = max(len(t[0]) for t in orows)
         win_w = max(len(t[1]) for t in orows)
         soft_w = max(len(t[2]) for t in orows)
+        hard_w = max(len(t[3]) for t in orows)
         for t in orows:
-            lines.append("  %s  %s  %s  %s" % (
+            lines.append("  %s  %s  %s  %s  %s" % (
                 t[0].ljust(pat_w), t[1].ljust(win_w),
-                t[2].ljust(soft_w), t[3]))
+                t[2].ljust(soft_w), t[3].ljust(hard_w), t[4]))
     lines.append("")
     rows = status_rows(cfg)
     lines.append("watchers (%d)" % len(rows))
