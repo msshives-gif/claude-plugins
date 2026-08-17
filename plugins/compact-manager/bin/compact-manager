@@ -3,7 +3,10 @@
 import os
 import sys
 
-HOOKS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hooks"))
+# realpath, not abspath: a symlink onto PATH (~/.local/bin) must still
+# find hooks/ next to the real install, not next to the link.
+HOOKS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "hooks")
 sys.path.insert(0, HOOKS)
 
 try:
