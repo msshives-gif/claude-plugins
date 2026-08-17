@@ -725,7 +725,9 @@ class HookShellTests(unittest.TestCase):
         self.assertEqual(self.run_hook("session_start.py", "[1, 2]",
                                        mode="managed"), {})
         self.assertEqual(self.last_stderr, "")
-        # resume behaves like startup; unknown sources stay silent.
+        # resume and clear behave like startup (a /clear rotates the
+        # session id and retires any watcher, so the fresh id must hear
+        # its coverage status); unknown sources stay silent.
         with open(lease_file, "w") as fh:
             json.dump({"run_token": "t", "pid": 12345, "proc_start": 1,
                        "heartbeat_at": time.time()}, fh)
@@ -733,8 +735,12 @@ class HookShellTests(unittest.TestCase):
                             dict(base, source="resume"), mode="managed")
         self.assertIn("attached",
                       out["hookSpecificOutput"]["additionalContext"])
+        out = self.run_hook("session_start.py",
+                            dict(base, source="clear"), mode="managed")
+        self.assertIn("attached",
+                      out["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.run_hook(
-            "session_start.py", dict(base, source="clear"),
+            "session_start.py", dict(base, source="mystery"),
             mode="managed"), {})
 
     def test_advisory_end_to_end(self):

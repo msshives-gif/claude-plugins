@@ -26,6 +26,7 @@ WIRING = [
     ("SessionStart", "compact", "session_start.py"),
     ("SessionStart", "startup", "session_start.py"),
     ("SessionStart", "resume", "session_start.py"),
+    ("SessionStart", "clear", "session_start.py"),
 ]
 
 

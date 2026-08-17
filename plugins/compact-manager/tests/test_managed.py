@@ -153,6 +153,58 @@ class BindingTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(why, "foreground_lost")
 
+    def _validate(self, binding):
+        cfg = managed.load_config(
+            base=dict(cm._DEFAULTS, state_dir=self.temp.name), environ={})
+        return managed.validate_binding(
+            binding, cfg, run_tmux=self.runner, proc_root=self.proc,
+            check_leases=False, sessions_dir=self.sessions)
+
+    def test_validate_binding_retires_on_session_rotation(self):
+        # /clear or in-app /resume: same pid, same starttime, registry
+        # now names a different session id -> positive rotation proof.
+        binding, _ = managed.build_binding(
+            "", "%1", True, self.runner, self.proc, self.sessions,
+            self.projects, "a" * 16)
+        ok, _ = self._validate(binding)
+        self.assertTrue(ok)  # matching id: healthy
+        with open(os.path.join(self.sessions, "20.json"), "w") as fh:
+            json.dump({"pid": 20, "procStart": "2020",
+                       "sessionId": "session-5678", "cwd": "/work/here"},
+                      fh)
+        ok, why = self._validate(binding)
+        self.assertFalse(ok)
+        self.assertEqual(why, "session_rotated")
+        # rotation is not a wait state: _transient must say retire
+        # (self is unused on the non-pane_missing path)
+        import types
+        self.assertFalse(managed.Watcher._transient(
+            types.SimpleNamespace(), "session_rotated"))
+
+    def test_validate_binding_rotation_needs_positive_proof(self):
+        binding, _ = managed.build_binding(
+            "", "%1", True, self.runner, self.proc, self.sessions,
+            self.projects, "a" * 16)
+        registry = os.path.join(self.sessions, "20.json")
+        # different id but procStart mismatch: not the same process,
+        # proves nothing
+        with open(registry, "w") as fh:
+            json.dump({"pid": 20, "procStart": "9999",
+                       "sessionId": "session-5678"}, fh)
+        self.assertTrue(self._validate(binding)[0])
+        # malformed entry: proves nothing
+        with open(registry, "w") as fh:
+            fh.write("not json")
+        self.assertTrue(self._validate(binding)[0])
+        # invalid session id shape: proves nothing
+        with open(registry, "w") as fh:
+            json.dump({"pid": 20, "procStart": "2020", "sessionId": "x"},
+                      fh)
+        self.assertTrue(self._validate(binding)[0])
+        # missing entry entirely: proves nothing
+        os.unlink(registry)
+        self.assertTrue(self._validate(binding)[0])
+
 
 class LeaseTests(unittest.TestCase):
     def setUp(self):
@@ -992,6 +1044,17 @@ class TickWiringTests(unittest.TestCase):
                                run_tmux=tmux, proc_root=self.proc,
                                wait=lambda seconds: None)
 
+    def test_operator_stop_journals_stop_requested(self):
+        # A stop must record its actual cause, not the incidental
+        # last-tick status ("below_threshold") — and never leave the
+        # journal without a final retirement record.
+        watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+        watcher.stop_requested = True
+        watcher.run()
+        records = list(managed.read_journal(self.paths["journal"]))
+        self.assertEqual(records[-1]["state"], "WATCHER_RETIRED")
+        self.assertEqual(records[-1].get("reason"), "stop_requested")
+
     def test_missing_transcript_is_pending_not_retire(self):
         # A virgin session's watcher waits for the first turn to create
         # the transcript; it must not retire (deadline bounds the wait).
@@ -1053,9 +1116,14 @@ class TickWiringTests(unittest.TestCase):
             0, 0.0, "boot")
         watcher.attempt["state"] = "SUBMITTED"
         watcher.run()
-        states = [r["state"] for r in
-                  managed.read_journal(self.paths["journal"])]
+        records = list(managed.read_journal(self.paths["journal"]))
+        states = [r["state"] for r in records]
         self.assertIn("CLEANUP_REQUIRED", states)
+        # The catch-up exit must also leave a final retirement record
+        # with the failure as its reason — without it, status reads
+        # WATCHER_READY + DEAD-LEASE for a watcher that left cleanly.
+        self.assertEqual(records[-1]["state"], "WATCHER_RETIRED")
+        self.assertEqual(records[-1].get("reason"), "tty_changed")
 
     def test_boundary_confirmed_latches_threshold_when_still_full(self):
         rows = [usage_row(170000), boundary_row(post=170000)]

@@ -46,7 +46,7 @@ class CompactManagerInstallTests(unittest.TestCase):
         r = _run(INSTALL, self.settings)
         self.assertEqual(r.returncode, 0, r.stderr)
         s = self.read()
-        self.assertEqual(len(_hook_commands(s)), 8)
+        self.assertEqual(len(_hook_commands(s)), 9)
         # The wiring shape matters: matchers must match hooks.json.
         matchers = {(ev, g.get("matcher"))
                     for ev, groups in s["hooks"].items() for g in groups}
@@ -56,6 +56,7 @@ class CompactManagerInstallTests(unittest.TestCase):
         self.assertIn(("SessionStart", "compact"), matchers)
         self.assertIn(("SessionStart", "startup"), matchers)
         self.assertIn(("SessionStart", "resume"), matchers)
+        self.assertIn(("SessionStart", "clear"), matchers)
         # Slash commands are installed as substituted, marker-tagged
         # copies beside the settings file (plugin-context variables are
         # never substituted for script installs, so symlinks would run
@@ -172,7 +173,7 @@ class CompactManagerInstallTests(unittest.TestCase):
         self.assertEqual(r1.returncode, 0, r1.stderr)
         r2 = _run(INSTALL, self.settings)
         self.assertEqual(r2.returncode, 0, r2.stderr)
-        self.assertEqual(len(_hook_commands(self.read())), 8)
+        self.assertEqual(len(_hook_commands(self.read())), 9)
 
     def test_backup_suffix_lookalike_does_not_block_install(self):
         # A command referencing "<our advisor path>.backup" must not
@@ -187,7 +188,7 @@ class CompactManagerInstallTests(unittest.TestCase):
         r = _run(INSTALL, self.settings)
         self.assertEqual(r.returncode, 0, r.stderr)
         cmds = _hook_commands(self.read())
-        self.assertEqual(len(cmds), 9)  # lookalike survives + our eight
+        self.assertEqual(len(cmds), 10)  # lookalike survives + our nine
         self.assertTrue(any(advisor in c and ".backup" not in c
                             for c in cmds))
 
@@ -203,7 +204,7 @@ class CompactManagerInstallTests(unittest.TestCase):
                      "timeout": 5}]}]}}, fh)
         r = _run(INSTALL, self.settings)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len(_hook_commands(self.read())), 9)
+        self.assertEqual(len(_hook_commands(self.read())), 10)
 
     def test_backups_do_not_collide(self):
         # install (no file yet: no backup) -> uninstall -> install can
@@ -241,7 +242,7 @@ class CompactManagerInstallTests(unittest.TestCase):
         self.assertIn(f"python3 {root_hook} || true", cmds)
         self.assertIn(f"python3 {peer_hook} || true", cmds)
         self.assertIn("echo user-hook", cmds)
-        self.assertEqual(len(cmds), 3)  # all eight of our own are gone
+        self.assertEqual(len(cmds), 3)  # all nine of our own are gone
 
     def test_uninstall_removes_standard_plugin_dir_paths(self):
         # A marketplace install lives under …/compact-manager/hooks/;

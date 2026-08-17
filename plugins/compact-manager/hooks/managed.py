@@ -634,7 +634,8 @@ def build_binding(socket, pane_id, attended, run_tmux=default_run_tmux,
 
 
 def validate_binding(binding, cfg, paths=None, run_tmux=default_run_tmux,
-                     proc_root="/proc", check_leases=True):
+                     proc_root="/proc", check_leases=True,
+                     sessions_dir=None):
     facts = pane_facts(binding["socket"], binding["pane_id"], run_tmux)
     if facts is None:
         return False, "pane_missing"
@@ -646,6 +647,29 @@ def validate_binding(binding, cfg, paths=None, run_tmux=default_run_tmux,
         return False, "pane_root_changed"
     if not proc_matches(binding["claude_pid"], binding["claude_start"], proc_root):
         return False, "claude_dead"
+    # /clear and in-app /resume rotate the session id inside the SAME
+    # claude process; without this check the watcher babysits the dead
+    # id's frozen transcript until its deadline while the live session
+    # goes unwatched. Positive proof only: a readable registry entry
+    # for the bound pid, same starttime (same process), carrying a
+    # DIFFERENT valid session id. A missing or malformed entry proves
+    # nothing and must never retire a healthy watcher.
+    try:
+        entry = _registry_entry(
+            binding["claude_pid"],
+            sessions_dir or os.path.expanduser("~/.claude/sessions"))
+        if entry:
+            sid = entry.get("sessionId")
+            try:
+                same_proc = (int(entry.get("procStart"))
+                             == binding["claude_start"])
+            except (TypeError, ValueError, OverflowError):
+                same_proc = False
+            if (same_proc and isinstance(sid, str) and _SESSION_ID.match(sid)
+                    and sid != binding["session_id"]):
+                return False, "session_rotated"
+    except Exception:
+        pass  # registry trouble is never a retirement reason
     if root["tpgid"] != binding["claude_pid"]:
         return False, "foreground_lost"
     if facts["pane_current_command"] not in cfg["managed_pane_commands"]:
@@ -1134,13 +1158,15 @@ def capture_pane(binding, run_tmux=default_run_tmux):
 
 
 def ladder_preflight(binding, cfg, paths, run_tmux=default_run_tmux,
-                     proc_root="/proc", wait=lambda seconds: time.sleep(seconds)):
-    ok, facts = validate_binding(binding, cfg, paths, run_tmux, proc_root)
+                     proc_root="/proc", wait=lambda seconds: time.sleep(seconds),
+                     sessions_dir=None):
+    ok, facts = validate_binding(binding, cfg, paths, run_tmux, proc_root,
+                                 sessions_dir=sessions_dir)
     if not ok:
         return False, "R1_%s" % facts
     first = capture_pane(binding, run_tmux)
     leases_ok, leases_reason = validate_binding(
-        binding, cfg, paths, run_tmux, proc_root)
+        binding, cfg, paths, run_tmux, proc_root, sessions_dir=sessions_dir)
     if not leases_ok:
         return False, "R2_%s" % leases_reason
     if first is None or not composer_idle(first):
@@ -1149,7 +1175,8 @@ def ladder_preflight(binding, cfg, paths, run_tmux=default_run_tmux,
     digest = hashlib.sha256(first.encode()).digest()
     wait(cfg["managed_stable_ms"] / 1000.0)
     second = capture_pane(binding, run_tmux)
-    ok, facts2 = validate_binding(binding, cfg, paths, run_tmux, proc_root)
+    ok, facts2 = validate_binding(binding, cfg, paths, run_tmux, proc_root,
+                                  sessions_dir=sessions_dir)
     if not ok:
         return False, "R3_%s" % facts2
     if (second is None or hashlib.sha256(second.encode()).digest() != digest or
@@ -1160,12 +1187,15 @@ def ladder_preflight(binding, cfg, paths, run_tmux=default_run_tmux,
 
 def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
                packet_loader, run_tmux=default_run_tmux, proc_root="/proc",
-               wait=lambda seconds: time.sleep(seconds), now_mono=time.monotonic):
+               wait=lambda seconds: time.sleep(seconds), now_mono=time.monotonic,
+               sessions_dir=None):
     """Execute R1-R6'.  Never sends a clearing key."""
-    ok, reason = ladder_preflight(binding, cfg, paths, run_tmux, proc_root, wait)
+    ok, reason = ladder_preflight(binding, cfg, paths, run_tmux, proc_root, wait,
+                                  sessions_dir=sessions_dir)
     if not ok:
         return dict(attempt, state="DEFERRED", reason=reason)
-    ok, reason = validate_binding(binding, cfg, paths, run_tmux, proc_root)
+    ok, reason = validate_binding(binding, cfg, paths, run_tmux, proc_root,
+                                  sessions_dir=sessions_dir)
     if not ok:
         return dict(attempt, state="DEFERRED", reason="R4_%s" % reason)
     attempt = transition_attempt(attempt, "prepared", now_mono(), cfg)
@@ -1180,7 +1210,8 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
         return attempt
     wait(0.4)
     capture = capture_pane(binding, run_tmux)
-    ok, reason = validate_binding(binding, cfg, paths, run_tmux, proc_root)
+    ok, reason = validate_binding(binding, cfg, paths, run_tmux, proc_root,
+                                  sessions_dir=sessions_dir)
     if not ok or capture is None or not composer_exact(capture, text):
         detail = reason if not ok else "composer_mismatch"
         attempt.update(state="CLEANUP_REQUIRED", reason="R5_%s" % detail)
@@ -1189,7 +1220,8 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
         return attempt
     attempt = transition_attempt(attempt, "typed_verified", now_mono(), cfg)
     journal_record(journal_path, "TYPED_VERIFIED", attempt)
-    ok, why = validate_binding(binding, cfg, paths, run_tmux, proc_root)
+    ok, why = validate_binding(binding, cfg, paths, run_tmux, proc_root,
+                               sessions_dir=sessions_dir)
     capture = capture_pane(binding, run_tmux)
     packet = packet_loader()
     # R6' re-OBSERVES the transcript rather than trusting the tick's
@@ -1334,9 +1366,10 @@ def notify(binding, cfg, paths, attempt, run_tmux=default_run_tmux):
 class Watcher:
     def __init__(self, binding, cfg, paths, run_tmux=default_run_tmux,
                  proc_root="/proc", monotonic=time.monotonic,
-                 wall=time.time, wait=None):
+                 wall=time.time, wait=None, sessions_dir=None):
         self.binding, self.cfg, self.paths = binding, cfg, paths
         self.run_tmux, self.proc_root = run_tmux, proc_root
+        self.sessions_dir = sessions_dir
         self.monotonic, self.wall = monotonic, wall
         self.wait = wait or (lambda seconds: time.sleep(seconds))
         self.stop_requested = False
@@ -1446,7 +1479,8 @@ class Watcher:
             self._journal_typed_hazard("watcher_deadline")
             return False, "deadline"
         ok, reason = validate_binding(self.binding, self.cfg, self.paths,
-                                      self.run_tmux, self.proc_root)
+                                      self.run_tmux, self.proc_root,
+                                      sessions_dir=self.sessions_dir)
         if not ok:
             typed = (self.attempt and self.attempt.get("state") in
                      ("PREPARED", "TYPED_VERIFIED", "SUBMITTED", "ACKED"))
@@ -1562,7 +1596,7 @@ class Watcher:
                         lambda: load_layer1_packet(
                             self.cfg, self.binding["session_id"]),
                         self.run_tmux, self.proc_root, self.wait,
-                        self.monotonic)
+                        self.monotonic, sessions_dir=self.sessions_dir)
                 finally:
                     self.typed_critical = False
                 if self.attempt["state"] == "DEFERRED":
@@ -1619,7 +1653,8 @@ class Watcher:
                 self.binding, self.cfg, self.paths, self.attempt, self.cursor,
                 self.paths["journal"],
                 lambda: load_layer1_packet(self.cfg, self.binding["session_id"]),
-                self.run_tmux, self.proc_root, self.wait, self.monotonic)
+                self.run_tmux, self.proc_root, self.wait, self.monotonic,
+                sessions_dir=self.sessions_dir)
         finally:
             self.typed_critical = False
         if self.attempt["state"] == "DEFERRED":
@@ -1638,6 +1673,14 @@ class Watcher:
         # necessary, keeping the fixed heartbeat alive between chunks.
         while not self.cursor.get("caught_up"):
             if self.stop_requested:
+                # An operator stop is a clean exit and must say so —
+                # a silent return leaves READY + DEAD-LEASE in status.
+                journal_record(
+                    self.paths["journal"], "WATCHER_RETIRED",
+                    self.attempt or {
+                        "run_token": self.binding["run_token"],
+                        "generation": generation(self.cursor)},
+                    reason="stop_requested")
                 return
             now = self.monotonic()
             if now >= self.deadline:
@@ -1645,12 +1688,21 @@ class Watcher:
                 return
             valid, why = validate_binding(
                 self.binding, self.cfg, self.paths, self.run_tmux,
-                self.proc_root)
+                self.proc_root, sessions_dir=self.sessions_dir)
             if not valid:
                 if not self._transient(why):
                     # Same contract as tick(): retiring with a recovered
-                    # typed-state attempt must leave a durable hazard.
+                    # typed-state attempt must leave a durable hazard —
+                    # and the retirement itself must be journaled, or
+                    # status keeps reading WATCHER_READY + DEAD-LEASE
+                    # for a watcher that left cleanly (audit finding).
                     self._journal_typed_hazard(why)
+                    journal_record(
+                        self.paths["journal"], "WATCHER_RETIRED",
+                        self.attempt or {
+                            "run_token": self.binding["run_token"],
+                            "generation": generation(self.cursor)},
+                        reason=why)
                     return
                 if not self._heartbeat_due(now):
                     return
@@ -1679,6 +1731,11 @@ class Watcher:
         while True:
             keep, reason = self.tick()
             if not keep or (self.stop_requested and not self.typed_critical):
+                if keep:
+                    # Operator stop mid-idle: journal the actual cause,
+                    # not the incidental last-tick status (which would
+                    # read e.g. "below_threshold").
+                    reason = "stop_requested"
                 journal_record(self.paths["journal"], "WATCHER_RETIRED",
                                self.attempt or {"run_token": self.binding["run_token"],
                                                 "generation": generation(self.cursor)},

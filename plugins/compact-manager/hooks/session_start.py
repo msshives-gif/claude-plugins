@@ -6,11 +6,14 @@
   never advances the drain CAS — the durable delivery stays with
   advisor/reorient, so if this fires the model may see the
   reorientation twice (harmless duplicate by design).
-- "startup"/"resume": in managed mode only, one status line saying
-  whether a watcher holds THIS session. Without it, "mode is managed
-  but nobody adopted this pane" looks identical to fully-enabled
-  until the 80% line — the hooks fire, the config says managed, and
-  the missing piece (a live session lease) is invisible.
+- "startup"/"resume"/"clear": in managed mode only, one status line
+  saying whether a watcher holds THIS session. Without it, "mode is
+  managed but nobody adopted this pane" looks identical to
+  fully-enabled until the 80% line — the hooks fire, the config says
+  managed, and the missing piece (a live session lease) is invisible.
+  clear matters as much as startup: /clear rotates the session id,
+  retiring any watcher (session_rotated), so the fresh id must hear
+  that nobody holds it.
 """
 import json
 import os
@@ -114,7 +117,10 @@ def main():
         return
     if source == "compact":
         _reorient(cfg, session_id)
-    elif source in ("startup", "resume"):
+    elif source in ("startup", "resume", "clear"):
+        # clear matters as much as startup: /clear rotates the session
+        # id, which retires any watcher (session_rotated) — the fresh
+        # id must hear that nobody holds it.
         _watcher_status(cfg, session_id)
 
 

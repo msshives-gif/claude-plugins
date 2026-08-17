@@ -86,6 +86,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py\" || python \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py\" || true",
+            "timeout": 5
+          }
+        ]
       }
     ]
   }

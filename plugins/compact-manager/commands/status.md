@@ -30,7 +30,11 @@ Report the current compact-manager state.
    surface as live; it cannot see an empty lease file (no row is
    produced at all), a dead lease's pid shape (flagged `DEAD-LEASE`
    instead), or fields the row does not carry (token, start time,
-   heartbeat). The sessions table's `alive` column is the CLI's own
+   heartbeat). A watcher row with `reason=session_rotated` means the
+   pane's session id changed under it (`/clear` or in-app `/resume`)
+   and it retired cleanly — suggest re-attaching if the user wants
+   the pane's current session watched. The sessions table's `alive`
+   column is the CLI's own
    verdict (registry + /proc proof) — relay it, don't re-derive:
    `GONE` means the session's claude process is no longer running and
    the row is just its state file aging out (≤24h); `?` means

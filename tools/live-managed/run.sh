@@ -20,6 +20,9 @@
 #       once the watcher is stopped (dead-token cleanup path)
 #   s11 start mode: pane dies with claude; watcher retires, leases free
 #   s12 start with a non-claude argv fails closed
+#   s13 /clear rotates the session id in the same claude process; the
+#       watcher retires with reason=session_rotated (registry-transition
+#       invariant pinned live)
 # Deadline expiry is unit-tested (1h floor makes it impractical live).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -102,7 +105,7 @@ adopt() {  # adopt <pane> [extra-env...] -> stdout of CLI; rc passthrough
 }
 
 cleanup() {
-  for s in $SES ${SES}bash cml2start; do tmux kill-session -t "$s" 2>/dev/null || true; done
+  for s in $SES ${SES}bash cml2start cml2rot; do tmux kill-session -t "$s" 2>/dev/null || true; done
   # best-effort: stop any watcher we leaked
   "$CMBIN" status 2>/dev/null | python3 -c 'import json,sys; [print(r["pid"]) for r in json.load(sys.stdin) if r.get("live") and r.get("pid")]' 2>/dev/null | while read -r p; do kill "$p" 2>/dev/null || true; done
 }
@@ -331,6 +334,60 @@ if [ $RC -eq 0 ]; then
   wait_for 60 watcher_gone && row s11_watcher_retires pass || row s11_watcher_retires fail "watcher outlived pane"
 else
   row s11_start fail "rc=$RC $MSG"
+fi
+
+# --- s13: /clear rotates the session id in place; the watcher must
+# retire with session_rotated instead of babysitting the dead id
+MSG="$(cd "$WORK" && env COMPACT_MANAGER_MANAGED_TRIGGER_PCT=0.99 "$CMBIN" start --session-name cml2rot -- claude --model haiku --settings "$WORK/settings.json" --allowedTools Read 2>&1)"; RC=$?
+if [ $RC -eq 0 ]; then
+  RPID="$(echo "$MSG" | grep -o 'pid=[0-9]*' | cut -d= -f2)"
+  RSID="$(sid_of)"
+  if ! wait_idle cml2rot 120; then
+    # Startup failure invalidates the rotation assertion — do not let a
+    # later unrelated watcher death read as a pass (audit finding).
+    row s13_clear_rotation fail "rotation session never idle"
+  else
+    tmux send-keys -t cml2rot -l "/clear"; sleep 1; tmux send-keys -t cml2rot Enter
+    rwatcher_gone() { ! kill -0 "$RPID" 2>/dev/null; }
+    if wait_for 90 rwatcher_gone; then
+      # The journal's FINAL word must be the rotation retirement — a
+      # mid-run R1_session_rotated DEFERRED followed by an unrelated
+      # death must not pass — and the lease must be released.
+      VERDICT="$(python3 - "$STATE/managed/watchers/$RSID.journal.jsonl" "$STATE/managed/leases/session-$RSID.json" <<'PYEOF'
+import json, os, sys
+last = None
+try:
+    with open(sys.argv[1]) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                last = json.loads(line)
+except Exception as e:
+    print("journal_unreadable:%r" % e); raise SystemExit
+if not last:
+    print("journal_empty")
+elif last.get("state") != "WATCHER_RETIRED":
+    print("final_state=%s" % last.get("state"))
+elif last.get("reason") != "session_rotated":
+    print("final_reason=%s" % last.get("reason"))
+elif os.path.exists(sys.argv[2]):
+    print("lease_still_present")
+else:
+    print("ok")
+PYEOF
+)"
+      if [ "$VERDICT" = "ok" ]; then
+        row s13_clear_rotation pass "final record WATCHER_RETIRED/session_rotated, lease released"
+      else
+        row s13_clear_rotation fail "$VERDICT; states=$(jstates "$RSID")"
+      fi
+    else
+      row s13_clear_rotation fail "watcher outlived /clear rotation: $(jstates "$RSID")"
+    fi
+  fi
+  tmux kill-session -t cml2rot 2>/dev/null || true
+else
+  row s13_clear_rotation fail "rc=$RC $MSG"
 fi
 
 # --- s12: start with non-claude argv fails closed

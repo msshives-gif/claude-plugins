@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Watchers retire on session-id rotation instead of babysitting the
+  dead id: `/clear` and in-app `/resume` keep the claude process but
+  rotate its session id, which previously left the watcher holding
+  its lease against a frozen transcript until the 24h deadline while
+  the live session went unwatched. `validate_binding` now retires
+  with `reason=session_rotated` on positive proof only — a readable
+  registry entry for the bound pid, same start time, carrying a
+  different valid session id; missing/malformed registry entries
+  never retire a healthy watcher. Retirement is journaled from every
+  exit path (including the initial catch-up loop). SessionStart now
+  also fires on `clear` (new hook matcher), so the fresh session id
+  immediately hears that no watcher holds it, with the attach
+  command. Pinned live by suite scenario s13 (/clear rotation →
+  final journal record `WATCHER_RETIRED`/`session_rotated` + lease
+  released); in-app `/resume` rotation shares the code path but has
+  no live scenario yet.
+- Operator stops journal `reason=stop_requested` (previously the
+  retirement record inherited the incidental last-tick status, e.g.
+  `below_threshold`), from both the tick loop and the catch-up loop.
+
 - Overview session rows carry a liveness verdict: `alive` column in
   the text readout (`live` / `GONE` / `?`), `session_live`
   (true/false/null) in `overview --json`. Proof-based (sessions
