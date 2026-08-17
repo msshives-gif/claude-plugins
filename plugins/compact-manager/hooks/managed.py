@@ -1943,11 +1943,12 @@ def overview_text(cfg, now=None):
                       "—" if pid is None else str(pid),
                       str(state), status))
     if wrows:
-        id_w = max(len(t[0]) for t in wrows)
-        pid_w = max(len(t[1]) for t in wrows)
-        st_w = max(len(t[2]) for t in wrows)
-        for t in wrows:
-            lines.append(("  %s  pid %s  %s  %s" % (
+        header = ("session", "pid", "state", "status")
+        id_w = max(len(t[0]) for t in wrows + [header])
+        pid_w = max(len(t[1]) for t in wrows + [header])
+        st_w = max(len(t[2]) for t in wrows + [header])
+        for t in [header] + wrows:
+            lines.append(("  %s  %s  %s  %s" % (
                 t[0].ljust(id_w), t[1].ljust(pid_w),
                 t[2].ljust(st_w), t[3])).rstrip())
     lines.append("")
@@ -2004,15 +2005,16 @@ def overview_text(cfg, now=None):
         except Exception:
             srows.append((marker, str(sid)[:8], None, "", "", "", ""))
     if srows:
-        id_w = max(len(t[1]) for t in srows)
-        model_w = max((len(t[2]) for t in srows if t[2] is not None),
-                      default=0)
-        left_w = max(len(label), 2 + id_w + 2 + model_w)
+        lines.append(label)
+        id_w = max([len("session")] + [len(t[1]) for t in srows])
+        model_w = max([len("model")] + [len(t[2]) for t in srows
+                                        if t[2] is not None])
         cur_w = max([len("current")] + [len(t[3]) for t in srows])
         peak_w = max([len("peak")] + [len(t[4]) for t in srows])
         pct_w = max([len("pct")] + [len(t[5]) for t in srows])
         age_w = max([len("updated")] + [len(t[6]) for t in srows])
-        lines.append(label.ljust(left_w) + "  %s  %s  %s  %s" % (
+        lines.append("  %s  %s  %s  %s  %s  %s" % (
+            "session".ljust(id_w), "model".ljust(model_w),
             "current".rjust(cur_w), "peak".rjust(peak_w),
             "pct".rjust(pct_w), "updated".rjust(age_w)))
         for t in srows:
@@ -2020,9 +2022,8 @@ def overview_text(cfg, now=None):
                 lines.append("%s%s  (unreadable state row)"
                              % (t[0], t[1]))
                 continue
-            left = (t[0] + t[1].ljust(id_w) + "  "
-                    + t[2].ljust(model_w)).ljust(left_w)
-            lines.append((left + "  %s  %s  %s  %s" % (
+            lines.append(("%s%s  %s  %s  %s  %s  %s" % (
+                t[0], t[1].ljust(id_w), t[2].ljust(model_w),
                 t[3].rjust(cur_w), t[4].rjust(peak_w),
                 t[5].rjust(pct_w), t[6].rjust(age_w))).rstrip())
         lines.append("(> = most recently updated; the advisor touches "
