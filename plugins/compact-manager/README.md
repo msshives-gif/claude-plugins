@@ -170,7 +170,7 @@ Managed-mode knobs (all clamped to safe ranges):
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `managed_trigger_pct` | `hard_pct` | Watcher compacts at this fraction of the window. Also valid inside a `models` entry as a per-model override; an override not above the model's effective `soft_pct` is ignored. |
+| `managed_trigger_pct` | `hard_pct` | Watcher compacts at this fraction of the window. Also valid inside a `models` entry as a per-model override; an override not above the model's effective `soft_pct` falls back to the global trigger. Trigger overrides resolve independently of the window/soft/hard override matching, so a trigger-only pattern never shadows another pattern's other values. |
 | `managed_stable_ms` | `300` | Pane must be unchanged this long before typing. |
 | `managed_poll_s` | `15` | How often the watcher checks the session. |
 | `managed_ack_timeout_s` | `120` | No confirmation the command was received → one retry, then stop and alert. |

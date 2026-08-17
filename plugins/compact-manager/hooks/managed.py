@@ -105,29 +105,29 @@ def load_config(base=None, environ=None):
 
     # Per-model trigger overrides. cm.load_config's models cleaner only
     # keeps its own keys (and drops patterns left empty), so re-read the
-    # raw models map — same env-over-file precedence as cm — and graft
-    # managed_trigger_pct back onto cfg["models"]; window_for then
-    # carries it into the effective dict. Range-validated here, the
-    # soft<trigger ordering is checked per-model in trigger_for.
-    raw_models = env.get("COMPACT_MANAGER_MODELS")
-    if raw_models is not None:
+    # raw models map — `env or file`, byte-for-byte the same precedence
+    # expression as cm's, so an empty env var falls through to the file
+    # in both loaders. Kept in a SEPARATE map (never grafted onto
+    # cfg["models"]) so a trigger-only pattern cannot shadow another
+    # pattern's window/soft/hard in window_for's single longest-match
+    # merge. Range-validated here; the soft<trigger ordering is checked
+    # per-model in trigger_for.
+    raw_models = env.get("COMPACT_MANAGER_MODELS") or raw_file.get("models")
+    if isinstance(raw_models, str):
         try:
             raw_models = json.loads(raw_models)
         except ValueError:
             raw_models = None
-    else:
-        raw_models = raw_file.get("models")
+    triggers = {}
     if isinstance(raw_models, dict):
-        cfg["models"] = dict(cfg.get("models", {}))
         for pat, overrides in raw_models.items():
             if not (isinstance(pat, str) and pat.strip()
                     and isinstance(overrides, dict)):
                 continue
             value = _finite_number(overrides.get("managed_trigger_pct"))
             if value is not None and 0 < value <= 1.0:
-                entry = dict(cfg["models"].get(pat, {}))
-                entry["managed_trigger_pct"] = value
-                cfg["models"][pat] = entry
+                triggers[pat] = value
+    cfg["managed_model_triggers"] = triggers
 
     def integer(key, floor, ceiling=None):
         value = _finite_number(raw[key])
@@ -156,16 +156,28 @@ def load_config(base=None, environ=None):
 
 
 def trigger_for(cfg, model):
-    """Effective managed trigger for a model id: the per-model
-    override when valid against the model's EFFECTIVE soft, else the
-    global trigger, else the model's effective hard."""
+    """Effective managed trigger for a model id. A per-model override
+    (longest matching pattern, same matching rule as window_for) wins
+    when it sits above the model's EFFECTIVE soft; otherwise the global
+    trigger applies exactly as load_config validated it — so a config
+    with no per-model triggers behaves identically to before this knob
+    existed, even when a per-model soft override sits above the global
+    trigger. Bare-dict callers (no load_config) fall back to effective
+    hard, matching the loader's own default."""
     eff = cm.window_for(cfg, model)
-    soft = eff["soft_pct"]
-    for candidate in (eff.get("managed_trigger_pct"),
-                      cfg.get("managed_trigger_pct")):
-        value = _finite_number(candidate)
-        if value is not None and soft < value <= 1.0:
+    triggers = cfg.get("managed_model_triggers") or {}
+    name = str(model or "").lower()
+    best = ""
+    for pat in triggers:
+        if len(pat) > len(best) and pat.lower() in name:
+            best = pat
+    if best:
+        value = triggers[best]
+        if eff["soft_pct"] < value <= 1.0:
             return value
+    value = _finite_number(cfg.get("managed_trigger_pct"))
+    if value is not None and 0 < value <= 1.0:
+        return value
     return eff["hard_pct"]
 
 
@@ -856,7 +868,15 @@ def boot_id(proc_root="/proc"):
 
 
 def recover_attempt(path, current_boot_id):
-    tail = attempt_tail(path)
+    return recover_attempt_records(read_journal(path), current_boot_id)
+
+
+def recover_attempt_records(records, current_boot_id):
+    tail = None
+    for record in reversed(records):
+        if record.get("state") in ATTEMPT_STATES:
+            tail = record
+            break
     if tail is None:
         return None
     state = tail.get("state")
@@ -1794,22 +1814,34 @@ def status_rows(cfg):
         # displayed state is the CONSERVATIVE recovery mapping of the raw
         # tail (a crashed watcher's PREPARED tail is a cleanup hazard, and
         # must be shown as one even before any re-adopt persists it).
-        tail = recover_attempt(paths["journal"], current_boot)
+        records = read_journal(paths["journal"])
+        tail = recover_attempt_records(records, current_boot)
         state = (tail or {}).get("state")
         reason = (tail or {}).get("reason")
+        last = records[-1] if records else None
         if state is None:
             # No attempt rows in the journal: fall back to the last
             # lifecycle record, so a cleanly retired watcher reads
             # WATCHER_RETIRED instead of a default READY that the
             # overview would flag as a DEAD-LEASE false alarm.
-            for record in reversed(read_journal(paths["journal"])):
+            for record in reversed(records):
                 if record.get("state") in LIFECYCLE_STATES:
                     state = record.get("state")
                     reason = record.get("reason")
                     break
+        elif (last is not None
+              and last.get("state") == "WATCHER_RETIRED"
+              and state not in ALERT_STATES):
+            # The journal's FINAL word is a clean retirement: an older
+            # completed attempt row must not resurrect READY plus a
+            # DEAD-LEASE false alarm. Alert states still win — a
+            # retirement record never masks a recovered hazard.
+            state = "WATCHER_RETIRED"
+            reason = last.get("reason")
         rows.append({"session_id": sid, "run_token": lease.get("run_token"),
                      "pid": lease.get("pid"),
                      "live": bool(lease) and lease_is_live(lease),
+                     "has_lease": bool(lease),
                      "state": state or "WATCHER_READY",
                      "reason": reason})
     return rows
@@ -1978,7 +2010,9 @@ def overview_data(cfg, now=None):
         "watchers": [],
         "sessions": [],
     }
-    for pat in sorted(cfg.get("models", {})):
+    override_patterns = (set(cfg.get("models", {}))
+                         | set(cfg.get("managed_model_triggers") or {}))
+    for pat in sorted(override_patterns):
         # window_for/trigger_for give the EFFECTIVE values a matching
         # model gets (override merged onto globals, clamps applied),
         # not the raw override fragment.
@@ -1994,6 +2028,12 @@ def overview_data(cfg, now=None):
         if r["state"] in ALERT_STATES:
             flags.append("ATTENTION")
         if not r["live"] and r["state"] != "WATCHER_RETIRED":
+            flags.append("DEAD-LEASE")
+        elif r["state"] == "WATCHER_RETIRED" and r.get("has_lease"):
+            # A clean retirement releases its lease; retired WITH a
+            # lease left behind means the watcher died in the window
+            # between journaling retirement and releasing — that lease
+            # still needs eyes, so retirement must not whitewash it.
             flags.append("DEAD-LEASE")
         pid = r.get("pid")
         pid_ok = isinstance(pid, int) and not isinstance(pid, bool) \
@@ -2023,7 +2063,10 @@ def overview_data(cfg, now=None):
                 continue
             with open(path) as fh:
                 st = json.load(fh)
-        except (OSError, ValueError):
+        except Exception:
+            # Broad on purpose: e.g. a deeply nested state file raises
+            # RecursionError out of json.load, and one bad file must
+            # skip its row, never abort the whole readout.
             continue
         if isinstance(st, dict):
             entries.append((mtime, name[:-5], st))
@@ -2180,8 +2223,17 @@ def expand_sid(cfg, sid):
         except OSError:
             continue
         for name in names:
-            if name.startswith(prefix) and name.endswith(suffix):
-                candidates.add(name[len(prefix):len(name) - len(suffix)])
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                continue
+            candidate = name[len(prefix):len(name) - len(suffix)]
+            # Ghost-candidate hygiene: only session-id-shaped names from
+            # regular files may widen a prefix into ambiguity (the
+            # operational lease reads reject symlinks; mirror that).
+            if not _SESSION_ID.match(candidate):
+                continue
+            if os.path.islink(os.path.join(directory, name)):
+                continue
+            candidates.add(candidate)
     if sid in candidates:
         return sid, None
     matches = sorted(c for c in candidates if c.startswith(sid))

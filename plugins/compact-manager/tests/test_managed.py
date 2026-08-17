@@ -1381,6 +1381,52 @@ class OverviewTests(unittest.TestCase):
                 '{"haiku": {"managed_trigger_pct": 0.85}}'})
         self.assertEqual(managed.trigger_for(cfg_env, "claude-haiku-4"),
                          0.85)
+        # EMPTY env var falls through to the file (cm's `env or file`
+        # precedence, mirrored) — file triggers must survive
+        cfg_empty = managed.load_config(base=dict(base), environ={
+            "COMPACT_MANAGER_CONFIG": path,
+            "COMPACT_MANAGER_MODELS": ""})
+        self.assertEqual(managed.trigger_for(cfg_empty, "claude-haiku-4"),
+                         0.9)
+
+    def test_trigger_no_override_is_exact_noop(self):
+        # A config with NO per-model triggers must use the global
+        # trigger verbatim, even when a per-model soft override sits
+        # ABOVE the global trigger (Sol HIGH-1: re-validating the
+        # global against effective soft silently delayed compaction).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "config.json")
+        with open(path, "w") as fh:
+            json.dump({"managed_trigger_pct": 0.8}, fh)
+        base = dict(cm._DEFAULTS, mode="managed",
+                    models={"fable": {"soft_pct": 0.9, "hard_pct": 0.95}})
+        cfg = managed.load_config(
+            base=base, environ={"COMPACT_MANAGER_CONFIG": path})
+        self.assertEqual(managed.trigger_for(cfg, "claude-fable-5"), 0.8)
+
+    def test_trigger_only_pattern_does_not_shadow(self):
+        # A longer trigger-only pattern must not shadow a shorter
+        # pattern's window/soft/hard in window_for (Sol HIGH-2).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "config.json")
+        with open(path, "w") as fh:
+            json.dump({"models": {
+                "opus": {"context_window": 200_000},
+                "claude-opus-5": {"managed_trigger_pct": 0.5},
+            }}, fh)
+        # base plays cm's cleaned output: the trigger-only pattern is gone
+        base = dict(cm._DEFAULTS, mode="managed",
+                    models={"opus": {"context_window": 200_000}})
+        cfg = managed.load_config(
+            base=base, environ={"COMPACT_MANAGER_CONFIG": path})
+        self.assertEqual(
+            cm.window_for(cfg, "claude-opus-5")["context_window"], 200_000)
+        # the invalid (<= soft) trigger falls back to the global one
+        self.assertEqual(managed.trigger_for(cfg, "claude-opus-5"), 0.8)
+        # and cfg["models"] itself was not polluted
+        self.assertEqual(set(cfg["models"]), {"opus"})
 
     def test_expand_sid_prefixes(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1405,6 +1451,14 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("abcd9999-full-two", error)
         # unknown id passes through so stop reports 'no live lease'
         self.assertEqual(managed.expand_sid(cfg, "zzzz"), ("zzzz", None))
+        # ghost hygiene (Sol LOW-9): a dangling symlink and a
+        # non-session-shaped name must not widen a prefix into ambiguity
+        os.symlink("/nonexistent-target",
+                   os.path.join(lease_dir, "session-abcd1234-ghost.json"))
+        with open(os.path.join(lease_dir, "session-x!.json"), "w") as fh:
+            fh.write("{}")
+        self.assertEqual(managed.expand_sid(cfg, "abcd1234"),
+                         ("abcd1234-full-one", None))
 
     def test_overview_flag_branches_and_bad_token_values(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1435,9 +1489,38 @@ class OverviewTests(unittest.TestCase):
         managed.journal_record(
             os.path.join(wdir, "sGone.journal.jsonl"), "WATCHER_RETIRED",
             {}, reason="claude_dead")
+        # retirement AFTER a completed attempt: the final RETIRED record
+        # wins over the older attempt row (Sol MEDIUM-3)
+        managed.journal_record(
+            os.path.join(wdir, "sDone.journal.jsonl"),
+            "BOUNDARY_CONFIRMED", {"run_token": "t"})
+        managed.journal_record(
+            os.path.join(wdir, "sDone.journal.jsonl"), "WATCHER_RETIRED",
+            {}, reason="claude_dead")
+        # ...but retirement never masks a recovered HAZARD: a PREPARED
+        # tail maps to CLEANUP_REQUIRED and must stay flagged
+        managed.journal_record(
+            os.path.join(wdir, "sHazard.journal.jsonl"),
+            "PREPARED", {"run_token": "t"})
+        managed.journal_record(
+            os.path.join(wdir, "sHazard.journal.jsonl"), "WATCHER_RETIRED",
+            {}, reason="claude_dead")
+        # retired journal but the lease was never released: the leftover
+        # lease is a cleanup hazard, so DEAD-LEASE must survive (Sol LOW-5)
+        with open(os.path.join(lease_dir, "session-sOrphan.json"), "w") as fh:
+            json.dump({"run_token": "t", "pid": 999999999,
+                       "proc_start": 1, "heartbeat_at": 1.0}, fh)
+        managed.journal_record(
+            os.path.join(wdir, "sOrphan.journal.jsonl"), "WATCHER_RETIRED",
+            {}, reason="claude_dead")
         # state file with negative + non-finite token values -> zeros
         sdir = os.path.join(tmp.name, "state")
         os.makedirs(sdir)
+        # deeply nested state file: RecursionError escapes json.load's
+        # usual ValueError contract; the row must be skipped, never
+        # abort the whole readout (Sol MEDIUM-4)
+        with open(os.path.join(sdir, "deep.json"), "w") as fh:
+            fh.write('{"a":' * 50_000 + "1" + "}" * 50_000)
         with open(os.path.join(sdir, "weird.json"), "w") as fh:
             fh.write('{"model": "m", "current": -50, "peak": 1e999}')
         # huge FINITE float: must zero, not print pct=inf%
@@ -1474,6 +1557,15 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("RETIRED", gone)
         self.assertIn("claude_dead", gone)
         self.assertNotIn("DEAD-LEASE", gone)
+        done = [l for l in out.splitlines() if "sDone" in l][0]
+        self.assertIn("RETIRED", done)
+        self.assertNotIn("DEAD-LEASE", done)
+        hazard = [l for l in out.splitlines() if "sHazard" in l][0]
+        self.assertIn("ATTENTION", hazard)
+        orphan = [l for l in out.splitlines() if "sOrphan" in l][0]
+        self.assertIn("RETIRED", orphan)
+        self.assertIn("DEAD-LEASE", orphan)
+        self.assertNotIn("deep", out)  # nested bomb skipped, not fatal
         weird = [l for l in out.splitlines() if "weird" in l][0]
         self.assertEqual(weird.split()[:5], ["weird", "m", "0", "0", "0.0%"])
         huge = [l for l in out.splitlines() if "huge" in l][0]
