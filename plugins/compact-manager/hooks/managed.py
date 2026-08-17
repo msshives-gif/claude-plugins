@@ -1753,11 +1753,23 @@ def status_rows(cfg):
         # tail (a crashed watcher's PREPARED tail is a cleanup hazard, and
         # must be shown as one even before any re-adopt persists it).
         tail = recover_attempt(paths["journal"], current_boot)
+        state = (tail or {}).get("state")
+        reason = (tail or {}).get("reason")
+        if state is None:
+            # No attempt rows in the journal: fall back to the last
+            # lifecycle record, so a cleanly retired watcher reads
+            # WATCHER_RETIRED instead of a default READY that the
+            # overview would flag as a DEAD-LEASE false alarm.
+            for record in reversed(read_journal(paths["journal"])):
+                if record.get("state") in LIFECYCLE_STATES:
+                    state = record.get("state")
+                    reason = record.get("reason")
+                    break
         rows.append({"session_id": sid, "run_token": lease.get("run_token"),
                      "pid": lease.get("pid"),
                      "live": bool(lease) and lease_is_live(lease),
-                     "state": (tail or {}).get("state", "WATCHER_READY"),
-                     "reason": (tail or {}).get("reason")})
+                     "state": state or "WATCHER_READY",
+                     "reason": reason})
     return rows
 
 
@@ -1943,7 +1955,7 @@ def overview_text(cfg, now=None):
                       "—" if pid is None else str(pid),
                       str(state), status))
     if wrows:
-        header = ("session", "pid", "state", "status")
+        header = ("session", "watcher pid", "state", "health")
         id_w = max(len(t[0]) for t in wrows + [header])
         pid_w = max(len(t[1]) for t in wrows + [header])
         st_w = max(len(t[2]) for t in wrows + [header])

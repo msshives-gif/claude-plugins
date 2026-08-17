@@ -1357,6 +1357,11 @@ class OverviewTests(unittest.TestCase):
         managed.journal_record(
             os.path.join(wdir, "sAlert.journal.jsonl"), "LATCHED",
             {"latch_kind": "SAFETY", "reason": "missing_ack"})
+        # journal-only cleanly retired watcher (no lease): must read
+        # RETIRED, not the READY default plus a DEAD-LEASE false alarm
+        managed.journal_record(
+            os.path.join(wdir, "sGone.journal.jsonl"), "WATCHER_RETIRED",
+            {}, reason="claude_dead")
         # state file with negative + non-finite token values -> zeros
         sdir = os.path.join(tmp.name, "state")
         os.makedirs(sdir)
@@ -1392,6 +1397,10 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("DEAD-LEASE", dead)
         alert = [l for l in out.splitlines() if "sAlert" in l][0]
         self.assertIn("ATTENTION", alert)
+        gone = [l for l in out.splitlines() if "sGone" in l][0]
+        self.assertIn("RETIRED", gone)
+        self.assertIn("claude_dead", gone)
+        self.assertNotIn("DEAD-LEASE", gone)
         weird = [l for l in out.splitlines() if "weird" in l][0]
         self.assertEqual(weird.split()[:5], ["weird", "m", "0", "0", "0.0%"])
         huge = [l for l in out.splitlines() if "huge" in l][0]
