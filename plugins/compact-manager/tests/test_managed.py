@@ -1299,12 +1299,39 @@ class OverviewTests(unittest.TestCase):
                  (now - 120, now - 120))
         out = managed.overview_text(cfg, now=now)
         self.assertIn("mode=managed", out)
-        self.assertIn("garbage model=claude-opus-5 current=0 peak=0", out)
+        garbage = [l for l in out.splitlines() if "garbage" in l][0]
+        self.assertEqual(garbage.split()[:5],
+                         ["garbage", "claude-opus-5", "0", "0", "0.0%"])
         self.assertIn("MALFORMED-LEASE", out)   # live-by-ambiguity, pid None
-        self.assertIn("CURRENT>> new", out)     # newest mtime marked
-        self.assertIn("pct=10.0%", out)         # 100k of fable's 1M override
-        self.assertIn("pct=25.0%", out)         # 50k of the configured 200k global
-        self.assertIn("updated=", out)  # age column present
+        self.assertIn("\n> new", out)           # newest mtime marked
+        self.assertIn("10.0%", out)         # 100k of fable's 1M override
+        self.assertIn("25.0%", out)         # 50k of the configured 200k global
+        self.assertIn("updated", out)   # age column present
+        self.assertIn("ago", out)
+
+    def test_expand_sid_prefixes(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=tmp.name)
+        lease_dir = os.path.join(tmp.name, "managed", "leases")
+        os.makedirs(lease_dir)
+        for sid in ("abcd1234-full-one", "abcd9999-full-two"):
+            with open(os.path.join(lease_dir,
+                                   "session-%s.json" % sid), "w") as fh:
+                json.dump({"pid": 1}, fh)
+        # unique prefix expands to the full id
+        self.assertEqual(managed.expand_sid(cfg, "abcd1234"),
+                         ("abcd1234-full-one", None))
+        # exact id passes through
+        self.assertEqual(managed.expand_sid(cfg, "abcd1234-full-one"),
+                         ("abcd1234-full-one", None))
+        # ambiguous prefix is an error naming the matches
+        sid, error = managed.expand_sid(cfg, "abcd")
+        self.assertIsNone(sid)
+        self.assertIn("abcd1234-full-one", error)
+        self.assertIn("abcd9999-full-two", error)
+        # unknown id passes through so stop reports 'no live lease'
+        self.assertEqual(managed.expand_sid(cfg, "zzzz"), ("zzzz", None))
 
     def test_overview_flag_branches_and_bad_token_values(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1366,14 +1393,13 @@ class OverviewTests(unittest.TestCase):
         alert = [l for l in out.splitlines() if "sAlert" in l][0]
         self.assertIn("ATTENTION", alert)
         weird = [l for l in out.splitlines() if "weird" in l][0]
-        self.assertIn("current=0 peak=0", weird)
-        self.assertIn("pct=0.0%", weird)
+        self.assertEqual(weird.split()[:5], ["weird", "m", "0", "0", "0.0%"])
         huge = [l for l in out.splitlines() if "huge" in l][0]
-        self.assertIn("current=0", huge)
+        self.assertEqual(huge.split()[2], "0")
         self.assertNotIn("inf", huge)
         slop = [l for l in out.splitlines() if "slop" in l][0]
-        self.assertIn("updated=0s-ago", slop)
+        self.assertIn("0s ago", slop)
         for name in ("future ", "future2 "):
             row = [l for l in out.splitlines() if name in l][0]
             self.assertIn("FUTURE-MTIME", row)
-        self.assertNotIn("updated=-", out)  # no negative age anywhere
+        self.assertNotRegex(out, r"-\d+s ago")  # no negative age anywhere

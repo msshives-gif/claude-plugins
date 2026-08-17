@@ -25,7 +25,9 @@ session.
    trivial command (e.g. `echo priming`) — completing it writes your
    state file; (b) then run
    `"${CLAUDE_PLUGIN_ROOT}/bin/compact-manager" overview` and read the
-   `updated=…s-ago` ages. Expect YOUR row at `CURRENT>>`, seconds old.
+   `updated` ages. Expect YOUR row marked `>`, seconds old. (The
+   overview prints session ids shortened to 8 characters; `stop`
+   accepts an unambiguous prefix, so the short id is usable as-is.)
    Do NOT proceed on the heuristic alone — show the row and ask the
    user to confirm — if ANY of: the top row is not seconds-old, its
    age says `FUTURE-MTIME`, two rows are under ~2 minutes old (a

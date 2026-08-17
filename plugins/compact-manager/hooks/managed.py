@@ -1870,20 +1870,53 @@ def _cli_binding(socket, pane, attended, run_tmux=default_run_tmux,
     return binding, None
 
 
+def _fmt_grouped(value):
+    """1000000 -> '1,000,000'; anything non-numeric passes through."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    return "{:,}".format(int(value))
+
+
+def _fmt_window_short(value):
+    """Compact window for the overrides list: 1M, 200k, else grouped."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    value = int(value)
+    if value and value % 1000000 == 0:
+        return "%dM" % (value // 1000000)
+    if value and value % 1000 == 0:
+        return "%dk" % (value // 1000)
+    return _fmt_grouped(value)
+
+
+def _fmt_age(seconds):
+    if seconds < 60:
+        return "%ds ago" % seconds
+    if seconds < 3600:
+        return "%dm ago" % (seconds // 60)
+    return "%.1fh ago" % (seconds / 3600.0)
+
+
 def overview_text(cfg, now=None):
     """Deterministic status report: config, watcher rows (with the
     attention flags status.md used to ask the model to derive), and
     per-session usage from the advisor's state files. The slash
-    command relays this instead of re-deriving the logic in prose."""
+    command relays this instead of re-deriving the logic in prose.
+    Session ids print as 8-char prefixes; stop/resolve accept them."""
     now = time.time() if now is None else now
     lines = []
+    header = "mode=%s  window=%s" % (
+        cfg["mode"], _fmt_grouped(cfg["context_window"]))
     overrides = ", ".join(
-        "%s→%s" % (k, v.get("context_window"))
-        for k, v in sorted(cfg.get("models", {}).items())) or "none"
-    lines.append("mode=%s window=%s model-overrides: %s"
-                 % (cfg["mode"], cfg["context_window"], overrides))
+        "%s→%s" % (k, _fmt_window_short(v.get("context_window")))
+        for k, v in sorted(cfg.get("models", {}).items()))
+    if overrides:
+        header += "  (overrides: %s)" % overrides
+    lines.append(header)
+    lines.append("")
     rows = status_rows(cfg)
-    lines.append("watchers: %d" % len(rows))
+    lines.append("watchers (%d)" % len(rows))
+    wrows = []
     for r in rows:
         flags = []
         if r["state"] in ALERT_STATES:
@@ -1898,9 +1931,26 @@ def overview_text(cfg, now=None):
         # can still read live=true unflagged — status.md says so.
         if r["live"] and not pid_ok:
             flags.append("MALFORMED-LEASE")
-        lines.append("  %s pid=%s state=%s live=%s reason=%s%s" % (
-            r["session_id"], r["pid"], r["state"], r["live"],
-            r["reason"], ("  <-- " + ",".join(flags)) if flags else ""))
+        state = r["state"]
+        if isinstance(state, str) and state.startswith("WATCHER_"):
+            state = state[len("WATCHER_"):]
+        status = ("✗ " + ",".join(flags)) if flags \
+            else ("live" if r["live"] else "")
+        if r["reason"]:
+            status = (status + "  " if status else "") \
+                + "reason=%s" % r["reason"]
+        wrows.append((str(r["session_id"])[:8],
+                      "—" if pid is None else str(pid),
+                      str(state), status))
+    if wrows:
+        id_w = max(len(t[0]) for t in wrows)
+        pid_w = max(len(t[1]) for t in wrows)
+        st_w = max(len(t[2]) for t in wrows)
+        for t in wrows:
+            lines.append(("  %s  pid %s  %s  %s" % (
+                t[0].ljust(id_w), t[1].ljust(pid_w),
+                t[2].ljust(st_w), t[3])).rstrip())
+    lines.append("")
     state_dir = os.path.join(cfg["state_dir"], "state")
     entries = []
     try:
@@ -1922,9 +1972,10 @@ def overview_text(cfg, now=None):
         if isinstance(st, dict):
             entries.append((mtime, name[:-5], st))
     entries.sort(key=lambda e: e[0], reverse=True)
-    lines.append("sessions (state files touched in the last 24h): %d"
-                 % len(entries))
+    label = "sessions touched <24h (%d)" % len(entries)
+    srows = []
     for i, (mtime, sid, st) in enumerate(entries):
+        marker = "> " if i == 0 else "  "
         # Degrade per-row, never lose the whole readout to one bad
         # state file (verify-round finding).
         try:
@@ -1943,24 +1994,74 @@ def overview_text(cfg, now=None):
             # A future mtime sorts first and would fake a fresh age —
             # surface the anomaly instead of clamping it to 0s. 1s
             # covers fs-timestamp granularity; beyond that is anomaly.
-            age = ("%ds-ago" % max(0, int(now - mtime))
+            age = (_fmt_age(max(0, int(now - mtime)))
                    if mtime <= now + 1
                    else "FUTURE-MTIME(untrustworthy)")
-            lines.append(
-                "  %s%s model=%s current=%s peak=%s window=%s pct=%.1f%% "
-                "updated=%s"
-                % ("CURRENT>> " if i == 0 else "          ", sid,
-                   st.get("model") or "?", current, peak, window,
-                   100.0 * current / window, age))
+            srows.append((marker, str(sid)[:8],
+                          str(st.get("model") or "?"),
+                          _fmt_grouped(current), _fmt_grouped(peak),
+                          "%.1f%%" % (100.0 * current / window), age))
         except Exception:
-            lines.append("  %s%s (unreadable state row)" % (
-                "CURRENT>> " if i == 0 else "          ", sid))
-    if entries:
-        lines.append("(CURRENT>> = most recently updated state file; "
-                     "the advisor touches it on every tool call, so a "
-                     "seconds-old age means it is almost certainly the "
-                     "invoking session — verify via updated=…s-ago)")
+            srows.append((marker, str(sid)[:8], None, "", "", "", ""))
+    if srows:
+        id_w = max(len(t[1]) for t in srows)
+        model_w = max((len(t[2]) for t in srows if t[2] is not None),
+                      default=0)
+        left_w = max(len(label), 2 + id_w + 2 + model_w)
+        cur_w = max([len("current")] + [len(t[3]) for t in srows])
+        peak_w = max([len("peak")] + [len(t[4]) for t in srows])
+        pct_w = max([len("pct")] + [len(t[5]) for t in srows])
+        age_w = max([len("updated")] + [len(t[6]) for t in srows])
+        lines.append(label.ljust(left_w) + "  %s  %s  %s  %s" % (
+            "current".rjust(cur_w), "peak".rjust(peak_w),
+            "pct".rjust(pct_w), "updated".rjust(age_w)))
+        for t in srows:
+            if t[2] is None:
+                lines.append("%s%s  (unreadable state row)"
+                             % (t[0], t[1]))
+                continue
+            left = (t[0] + t[1].ljust(id_w) + "  "
+                    + t[2].ljust(model_w)).ljust(left_w)
+            lines.append((left + "  %s  %s  %s  %s" % (
+                t[3].rjust(cur_w), t[4].rjust(peak_w),
+                t[5].rjust(pct_w), t[6].rjust(age_w))).rstrip())
+        lines.append("(> = most recently updated; the advisor touches "
+                     "it on every tool call, so a seconds-old age is "
+                     "almost certainly the invoking session)")
+    else:
+        lines.append(label)
     return "\n".join(lines)
+
+
+def expand_sid(cfg, sid):
+    """Expand an unambiguous session-id prefix (overview prints 8-char
+    ids) to the full id known from leases, journals, or state files.
+    An exact id always passes through; an unknown one is returned
+    unchanged so stop/resolve report their own 'no live lease'."""
+    candidates = set()
+    base = cfg["state_dir"]
+    for directory, prefix, suffix in (
+            (os.path.join(base, "managed", "leases"),
+             "session-", ".json"),
+            (os.path.join(base, "managed", "watchers"),
+             "", ".journal.jsonl"),
+            (os.path.join(base, "state"), "", ".json")):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            if name.startswith(prefix) and name.endswith(suffix):
+                candidates.add(name[len(prefix):len(name) - len(suffix)])
+    if sid in candidates:
+        return sid, None
+    matches = sorted(c for c in candidates if c.startswith(sid))
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, ("ambiguous session-id prefix %s: matches %s"
+                      % (sid, ", ".join(matches)))
+    return sid, None
 
 
 def cli_main(argv=None, run_tmux=default_run_tmux):
@@ -2028,16 +2129,24 @@ def cli_main(argv=None, run_tmux=default_run_tmux):
         print(overview_text(cfg))
         return 0
     elif args.command == "stop":
-        tail = recover_attempt(managed_paths(cfg, args.sid)["journal"],
+        sid, error = expand_sid(cfg, args.sid)
+        if error:
+            print("compact-manager: %s" % error, file=sys.stderr)
+            return 1
+        tail = recover_attempt(managed_paths(cfg, sid)["journal"],
                                boot_id())
         if tail and tail.get("state") in ALERT_STATES:
             print("ALERT %s: %s" % (tail["state"],
                                     tail.get("reason", "operator action required")))
-        ok, message = stop_session(cfg, args.sid)
+        ok, message = stop_session(cfg, sid)
         print(message)
         return 0 if ok else 1
     else:
-        ok, message = resolve_session(cfg, args.sid)
+        sid, error = expand_sid(cfg, args.sid)
+        if error:
+            print("compact-manager: %s" % error, file=sys.stderr)
+            return 1
+        ok, message = resolve_session(cfg, sid)
         print(message)
         return 0 if ok else 1
     if result.get("ok"):

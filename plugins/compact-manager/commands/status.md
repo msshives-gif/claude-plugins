@@ -17,10 +17,10 @@ Report the current compact-manager state.
    relay its output verbatim in a code block. The logic (window
    resolution, attention flags, current-session marker) lives in the
    CLI, not here — do not re-derive it.
-3. Add ONE line of interpretation for the CURRENT>> row: its usage
-   percentage and whether a watcher holds it. (`CURRENT>>` is a
-   recency heuristic — check its `updated=…s-ago` age; seconds-old
-   means it is almost certainly the invoking session.) Any row flagged
+3. Add ONE line of interpretation for the `>`-marked session row: its
+   usage percentage and whether a watcher holds it. (`>` is a recency
+   heuristic — check its `updated` age; seconds-old means it is
+   almost certainly the invoking session.) Any row flagged
    `ATTENTION`, `DEAD-LEASE`, or `MALFORMED-LEASE` needs the human's
    eyes — lead with those. (Raw JSON, if needed: the `status`
    subcommand.) Note: the start-of-session status line uses stricter
