@@ -1330,6 +1330,14 @@ class OverviewTests(unittest.TestCase):
                        "peak": 200_000}, fh)
         with open(os.path.join(state_dir, "bad.json"), "w") as fh:
             json.dump({"model": {"weird": True}, "current": 1}, fh)
+        # inf-model: json accepts 1e400 as Infinity; must not survive to
+        # the payload (bare Infinity is invalid JSON to JS consumers)
+        with open(os.path.join(state_dir, "infm.json"), "w") as fh:
+            fh.write('{"model": 1e400, "current": 2}')
+        # deeply nested but LOADABLE model: must not blow up the final
+        # json.dumps after loading fine
+        with open(os.path.join(state_dir, "nested.json"), "w") as fh:
+            fh.write('{"model": ' + '[' * 900 + ']' * 900 + ', "current": 3}')
         data = managed.overview_data(cfg, now=now)
         # must be JSON-serializable end to end
         json.dumps(data)
@@ -1345,10 +1353,18 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(good["window"], 1_000_000)
         self.assertAlmostEqual(good["pct"], 10.0)
         self.assertIn("age_s", good)
-        # a non-str model is not unreadable: window_for stringifies
+        # a non-str model is not unreadable: window_for stringifies,
+        # and the payload carries None instead of the hostile value
         bad = rows["bad"]
         self.assertNotIn("unreadable", bad)
         self.assertEqual(bad["current"], 1)
+        self.assertIsNone(bad["model"])
+        self.assertIsNone(rows["infm"]["model"])
+        self.assertIsNone(rows["nested"]["model"])
+        # the serialized form must be strict JSON (no bare Infinity)
+        json.loads(json.dumps(data))
+        for s in data["sessions"]:
+            self.assertNotIn("Infinity", json.dumps(s))
         # text renderer consumes the same data without crashing
         self.assertIn("aaaa-ful", managed.overview_text(cfg, now=now))
 
@@ -1457,6 +1473,11 @@ class OverviewTests(unittest.TestCase):
                    os.path.join(lease_dir, "session-abcd1234-ghost.json"))
         with open(os.path.join(lease_dir, "session-x!.json"), "w") as fh:
             fh.write("{}")
+        # a DIRECTORY and a trailing-newline name are ghosts too (Sol r2)
+        os.makedirs(os.path.join(lease_dir, "session-abcd1234-dir.json"))
+        with open(os.path.join(lease_dir, "session-abcd1234nl\n.json"),
+                  "w") as fh:
+            fh.write("{}")
         self.assertEqual(managed.expand_sid(cfg, "abcd1234"),
                          ("abcd1234-full-one", None))
 
@@ -1505,6 +1526,10 @@ class OverviewTests(unittest.TestCase):
         managed.journal_record(
             os.path.join(wdir, "sHazard.journal.jsonl"), "WATCHER_RETIRED",
             {}, reason="claude_dead")
+        # one malformed journal record (non-iterable nonces) must degrade
+        # to a flagged default row, never abort the readout (Sol r2)
+        with open(os.path.join(wdir, "sMangled.journal.jsonl"), "w") as fh:
+            fh.write('{"schema": 1, "state": "LATCHED", "nonces": 42}\n')
         # retired journal but the lease was never released: the leftover
         # lease is a cleanup hazard, so DEAD-LEASE must survive (Sol LOW-5)
         with open(os.path.join(lease_dir, "session-sOrphan.json"), "w") as fh:
@@ -1565,6 +1590,9 @@ class OverviewTests(unittest.TestCase):
         orphan = [l for l in out.splitlines() if "sOrphan" in l][0]
         self.assertIn("RETIRED", orphan)
         self.assertIn("DEAD-LEASE", orphan)
+        mangled = [l for l in out.splitlines() if "sMangled" in l][0]
+        self.assertIn("journal unreadable", mangled)
+        self.assertIn("DEAD-LEASE", mangled)  # no lease, degraded state
         self.assertNotIn("deep", out)  # nested bomb skipped, not fatal
         weird = [l for l in out.splitlines() if "weird" in l][0]
         self.assertEqual(weird.split()[:5], ["weird", "m", "0", "0", "0.0%"])

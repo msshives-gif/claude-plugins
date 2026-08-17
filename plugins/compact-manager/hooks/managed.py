@@ -1814,30 +1814,37 @@ def status_rows(cfg):
         # displayed state is the CONSERVATIVE recovery mapping of the raw
         # tail (a crashed watcher's PREPARED tail is a cleanup hazard, and
         # must be shown as one even before any re-adopt persists it).
-        records = read_journal(paths["journal"])
-        tail = recover_attempt_records(records, current_boot)
-        state = (tail or {}).get("state")
-        reason = (tail or {}).get("reason")
-        last = records[-1] if records else None
-        if state is None:
-            # No attempt rows in the journal: fall back to the last
-            # lifecycle record, so a cleanly retired watcher reads
-            # WATCHER_RETIRED instead of a default READY that the
-            # overview would flag as a DEAD-LEASE false alarm.
-            for record in reversed(records):
-                if record.get("state") in LIFECYCLE_STATES:
-                    state = record.get("state")
-                    reason = record.get("reason")
-                    break
-        elif (last is not None
-              and last.get("state") == "WATCHER_RETIRED"
-              and state not in ALERT_STATES):
-            # The journal's FINAL word is a clean retirement: an older
-            # completed attempt row must not resurrect READY plus a
-            # DEAD-LEASE false alarm. Alert states still win — a
-            # retirement record never masks a recovered hazard.
-            state = "WATCHER_RETIRED"
-            reason = last.get("reason")
+        # Per-watcher guard: one malformed journal record (unhashable
+        # state, non-iterable nonces) must degrade to a flagged default
+        # row, never abort the whole readout.
+        try:
+            records = read_journal(paths["journal"])
+            tail = recover_attempt_records(records, current_boot)
+            state = (tail or {}).get("state")
+            reason = (tail or {}).get("reason")
+            last = records[-1] if records else None
+            if state is None:
+                # No attempt rows in the journal: fall back to the last
+                # lifecycle record, so a cleanly retired watcher reads
+                # WATCHER_RETIRED instead of a default READY that the
+                # overview would flag as a DEAD-LEASE false alarm.
+                for record in reversed(records):
+                    if record.get("state") in LIFECYCLE_STATES:
+                        state = record.get("state")
+                        reason = record.get("reason")
+                        break
+            elif (last is not None
+                  and last.get("state") == "WATCHER_RETIRED"
+                  and state not in ALERT_STATES):
+                # The journal's FINAL word is a clean retirement: an
+                # older completed attempt row must not resurrect READY
+                # plus a DEAD-LEASE false alarm. Alert states still win
+                # — a retirement record never masks a recovered hazard.
+                state = "WATCHER_RETIRED"
+                reason = last.get("reason")
+        except Exception:
+            state = None
+            reason = "journal unreadable (malformed record)"
         rows.append({"session_id": sid, "run_token": lease.get("run_token"),
                      "pid": lease.get("pid"),
                      "live": bool(lease) and lease_is_live(lease),
@@ -2088,8 +2095,13 @@ def overview_data(cfg, now=None):
 
             current = _token_count(st.get("current"))
             peak = _token_count(st.get("peak"))
+            raw_model = st.get("model")
             row.update({
-                "model": st.get("model"),
+                # Strings only: a hostile model value (nested object,
+                # 1e400→inf) would otherwise survive to json.dumps and
+                # emit invalid JSON (bare Infinity) or RecursionError —
+                # and an object reaches React as an unrenderable child.
+                "model": raw_model if isinstance(raw_model, str) else None,
                 "current": current, "peak": peak, "window": window,
                 "pct": 100.0 * current / window,
                 "updated_epoch": mtime,
@@ -2229,9 +2241,12 @@ def expand_sid(cfg, sid):
             # Ghost-candidate hygiene: only session-id-shaped names from
             # regular files may widen a prefix into ambiguity (the
             # operational lease reads reject symlinks; mirror that).
-            if not _SESSION_ID.match(candidate):
+            # fullmatch, not match: `$` alone would admit a trailing
+            # newline in the name. isfile excludes dirs/FIFOs.
+            if not _SESSION_ID.fullmatch(candidate):
                 continue
-            if os.path.islink(os.path.join(directory, name)):
+            full = os.path.join(directory, name)
+            if os.path.islink(full) or not os.path.isfile(full):
                 continue
             candidates.add(candidate)
     if sid in candidates:
