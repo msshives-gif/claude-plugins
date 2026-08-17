@@ -1047,8 +1047,21 @@ class TickWiringTests(unittest.TestCase):
     def test_operator_stop_journals_stop_requested(self):
         # A stop must record its actual cause, not the incidental
         # last-tick status ("below_threshold") — and never leave the
-        # journal without a final retirement record.
+        # journal without a final retirement record. (This exit goes
+        # through the catch-up loop: the cursor starts uncaught-up.)
         watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+        watcher.stop_requested = True
+        watcher.run()
+        records = list(managed.read_journal(self.paths["journal"]))
+        self.assertEqual(records[-1]["state"], "WATCHER_RETIRED")
+        self.assertEqual(records[-1].get("reason"), "stop_requested")
+
+    def test_operator_stop_mid_tick_journals_stop_requested(self):
+        # The tick-loop exit: cursor already caught up, tick returns
+        # keep=True ("below_threshold"), stop must override that
+        # incidental reason — while keep=False keeps its true reason.
+        watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+        watcher.cursor["caught_up"] = True
         watcher.stop_requested = True
         watcher.run()
         records = list(managed.read_journal(self.paths["journal"]))
