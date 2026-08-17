@@ -1299,6 +1299,12 @@ class OverviewTests(unittest.TestCase):
                  (now - 120, now - 120))
         out = managed.overview_text(cfg, now=now)
         self.assertIn("mode=managed", out)
+        # global thresholds on the header; trigger defaults to hard
+        self.assertIn("soft=70%  hard=80%  trigger=80%", out)
+        self.assertIn("model overrides (1)", out)
+        fable = [l for l in out.splitlines()
+                 if l.strip().startswith("fable")][0]
+        self.assertEqual(fable.split(), ["fable", "1M", "70%", "80%"])
         garbage = [l for l in out.splitlines() if "garbage" in l][0]
         self.assertEqual(garbage.split()[:5],
                          ["garbage", "claude-opus-5", "0", "0", "0.0%"])

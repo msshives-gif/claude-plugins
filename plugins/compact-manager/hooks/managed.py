@@ -1901,6 +1901,13 @@ def _fmt_window_short(value):
     return _fmt_grouped(value)
 
 
+def _fmt_pct(value):
+    """0.7 -> '70%'; guards float noise like 70.00000000000001."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    return "%g%%" % round(value * 100, 3)
+
+
 def _fmt_age(seconds):
     if seconds < 60:
         return "%ds ago" % seconds
@@ -1917,14 +1924,31 @@ def overview_text(cfg, now=None):
     Session ids print as 8-char prefixes; stop/resolve accept them."""
     now = time.time() if now is None else now
     lines = []
-    header = "mode=%s  window=%s" % (
-        cfg["mode"], _fmt_grouped(cfg["context_window"]))
-    overrides = ", ".join(
-        "%s→%s" % (k, _fmt_window_short(v.get("context_window")))
-        for k, v in sorted(cfg.get("models", {}).items()))
-    if overrides:
-        header += "  (overrides: %s)" % overrides
-    lines.append(header)
+    hard = cfg.get("hard_pct", 0.80)
+    lines.append("mode=%s  window=%s  soft=%s  hard=%s  trigger=%s" % (
+        cfg["mode"], _fmt_grouped(cfg["context_window"]),
+        _fmt_pct(cfg.get("soft_pct", 0.70)), _fmt_pct(hard),
+        _fmt_pct(cfg.get("managed_trigger_pct", hard))))
+    patterns = sorted(cfg.get("models", {}))
+    if patterns:
+        lines.append("")
+        lines.append("model overrides (%d)" % len(patterns))
+        orows = [("pattern", "window", "soft", "hard")]
+        for pat in patterns:
+            # window_for gives the EFFECTIVE values a matching model
+            # gets (override merged onto globals, clamps applied), not
+            # the raw override fragment.
+            eff = cm.window_for(cfg, pat)
+            orows.append((pat, _fmt_window_short(eff["context_window"]),
+                          _fmt_pct(eff["soft_pct"]),
+                          _fmt_pct(eff["hard_pct"])))
+        pat_w = max(len(t[0]) for t in orows)
+        win_w = max(len(t[1]) for t in orows)
+        soft_w = max(len(t[2]) for t in orows)
+        for t in orows:
+            lines.append("  %s  %s  %s  %s" % (
+                t[0].ljust(pat_w), t[1].ljust(win_w),
+                t[2].ljust(soft_w), t[3]))
     lines.append("")
     rows = status_rows(cfg)
     lines.append("watchers (%d)" % len(rows))
