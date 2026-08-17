@@ -141,7 +141,14 @@ cross-checks the harness's sessions registry against `/proc`
 say whether the claude process behind it is actually still running.
 `GONE` rows are normal — dead sessions' state lingers until the 24h
 window and the TTL reaper age it out. In JSON (`overview --json`)
-this is `session_live: true/false/null` per session row. The monorepo's `tools/status.py` is the
+this is `session_live: true/false/null` per session row. Session rows
+also carry their EFFECTIVE thresholds: the advisor stamps its own
+env-honoring, per-model-merged window/soft/hard/trigger into the
+state file, and the overview prefers those stamps over re-deriving
+from its own config — so per-session env overrides
+(`COMPACT_MANAGER_*` at session launch) and per-model overrides both
+display truthfully. The text table's `trig` column and the JSON's
+per-row `soft_pct`/`hard_pct`/`trigger_pct` carry the result. The monorepo's `tools/status.py` is the
 complementary dev-side readout (knob-by-knob config provenance and
 hook wiring across the whole suite); the two deliberately do not
 overlap.

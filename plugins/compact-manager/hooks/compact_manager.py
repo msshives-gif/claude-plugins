@@ -311,7 +311,11 @@ _STATE_DEFAULTS = {"schema": SCHEMA_VERSION, "inode": None, "size": 0,
                    "auto_boundaries": 0, "model": "",
                    "advisory_level": "none", "armed_at_ts": 0,
                    "packet_seq": 0, "last_drained_packet_seq": -1,
-                   "discard_to_newline": False}
+                   "discard_to_newline": False,
+                   # Effective thresholds stamped by the advisor (its
+                   # env-honoring, per-model-merged view); 0 = unstamped.
+                   "eff_window": 0, "eff_soft_pct": 0.0,
+                   "eff_hard_pct": 0.0, "eff_trigger_pct": 0.0}
 
 
 def load_state(paths):
@@ -337,6 +341,11 @@ def load_state(paths):
             st[k] = v if isinstance(v, str) else ""
         elif k == "discard_to_newline":
             st[k] = v if isinstance(v, bool) else False
+        elif k in ("eff_soft_pct", "eff_hard_pct", "eff_trigger_pct"):
+            # Stamped threshold fractions: (0, 1] or back to unstamped.
+            ok = (isinstance(v, (int, float)) and not isinstance(v, bool)
+                  and v == v and 0 < v <= 1)
+            st[k] = float(v) if ok else dflt
         elif k == "armed_at_ts":
             # Timestamp: non-negative int of any size, or finite
             # non-negative float. math.isfinite(huge_int) raises

@@ -751,6 +751,14 @@ class HookShellTests(unittest.TestCase):
         out = self.run_hook("advisor.py", payload)
         ctx = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("75%", ctx)  # 150,510 / 200,000
+        # The advisor stamps its effective thresholds into the state
+        # file so readouts can honor per-session/per-model overrides.
+        with open(os.path.join(self.dir.name, "state", "sA.json")) as fh:
+            st = json.load(fh)
+        self.assertEqual(st["eff_window"], 200_000)
+        self.assertEqual((st["eff_soft_pct"], st["eff_hard_pct"]),
+                         (0.7, 0.8))
+        self.assertEqual(st["eff_trigger_pct"], 0.8)
         # Same state again: hysteresis, no repeat.
         self.assertEqual(self.run_hook("advisor.py", payload), {})
 

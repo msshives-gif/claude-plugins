@@ -2220,7 +2220,25 @@ def overview_data(cfg, now=None, sessions_dir=None, proc_root="/proc"):
         # Degrade per-row, never lose the whole readout to one bad
         # state file (verify-round finding).
         try:
-            window = cm.window_for(cfg, st.get("model"))["context_window"]
+            eff = cm.window_for(cfg, st.get("model"))
+
+            def _stamped_pct(key, fallback):
+                # Advisor-stamped fraction (its env-honoring view);
+                # anything outside (0, 1] means unstamped/garbage.
+                v = st.get(key)
+                ok = (isinstance(v, (int, float))
+                      and not isinstance(v, bool) and v == v
+                      and 0 < v <= 1)
+                return float(v) if ok else fallback
+
+            sw = st.get("eff_window")
+            window = (sw if isinstance(sw, int)
+                      and not isinstance(sw, bool) and sw >= 10_000
+                      else eff["context_window"])
+            soft = _stamped_pct("eff_soft_pct", eff["soft_pct"])
+            hard = _stamped_pct("eff_hard_pct", eff["hard_pct"])
+            trig = _stamped_pct("eff_trigger_pct",
+                                trigger_for(cfg, st.get("model")))
 
             def _token_count(value):
                 # 1e11 ceiling: far above any real token count; huge
@@ -2241,6 +2259,7 @@ def overview_data(cfg, now=None, sessions_dir=None, proc_root="/proc"):
                 "model": raw_model if isinstance(raw_model, str) else None,
                 "current": current, "peak": peak, "window": window,
                 "pct": 100.0 * current / window,
+                "soft_pct": soft, "hard_pct": hard, "trigger_pct": trig,
                 "updated_epoch": mtime,
             })
             # A future mtime sorts first and would fake a fresh age —
@@ -2327,14 +2346,16 @@ def overview_text(cfg, now=None, sessions_dir=None, proc_root="/proc"):
             # Through the same column machinery as readable rows so the
             # alive verdict stays under its header (audit finding).
             srows.append((marker, str(s["session_id"])[:8],
-                          "(unreadable state row)", "", "", "", "", alive))
+                          "(unreadable state row)", "", "", "", "", "",
+                          alive))
             continue
         age = ("FUTURE-MTIME(untrustworthy)" if s.get("future_mtime")
                else _fmt_age(s["age_s"]))
         srows.append((marker, str(s["session_id"])[:8],
                       str(s.get("model") or "?"),
                       _fmt_grouped(s["current"]), _fmt_grouped(s["peak"]),
-                      "%.1f%%" % s["pct"], age, alive))
+                      "%.1f%%" % s["pct"], _fmt_pct(s.get("trigger_pct")),
+                      age, alive))
     if srows:
         lines.append(label)
         id_w = max([len("session")] + [len(t[1]) for t in srows])
@@ -2342,20 +2363,23 @@ def overview_text(cfg, now=None, sessions_dir=None, proc_root="/proc"):
         cur_w = max([len("current")] + [len(t[3]) for t in srows])
         peak_w = max([len("peak")] + [len(t[4]) for t in srows])
         pct_w = max([len("pct")] + [len(t[5]) for t in srows])
-        age_w = max([len("updated")] + [len(t[6]) for t in srows])
-        lines.append("  %s  %s  %s  %s  %s  %s  %s" % (
+        trig_w = max([len("trig")] + [len(t[6]) for t in srows])
+        age_w = max([len("updated")] + [len(t[7]) for t in srows])
+        lines.append("  %s  %s  %s  %s  %s  %s  %s  %s" % (
             "session".ljust(id_w), "model".ljust(model_w),
             "current".rjust(cur_w), "peak".rjust(peak_w),
-            "pct".rjust(pct_w), "updated".rjust(age_w), "alive"))
+            "pct".rjust(pct_w), "trig".rjust(trig_w),
+            "updated".rjust(age_w), "alive"))
         for t in srows:
-            lines.append(("%s%s  %s  %s  %s  %s  %s  %s" % (
+            lines.append(("%s%s  %s  %s  %s  %s  %s  %s  %s" % (
                 t[0], t[1].ljust(id_w), t[2].ljust(model_w),
                 t[3].rjust(cur_w), t[4].rjust(peak_w),
-                t[5].rjust(pct_w), t[6].rjust(age_w), t[7])).rstrip())
+                t[5].rjust(pct_w), t[6].rjust(trig_w),
+                t[7].rjust(age_w), t[8])).rstrip())
         lines.append("(> = most recently updated; the advisor touches "
                      "it on every tool call, so a seconds-old age is "
                      "almost certainly the invoking session)")
-        alives = {t[7] for t in srows}
+        alives = {t[8] for t in srows}
         if "GONE" in alives:
             lines.append("(GONE = no live claude process for this "
                          "session; its state file just lingers and "

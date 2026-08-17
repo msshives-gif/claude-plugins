@@ -1855,3 +1855,58 @@ class SessionLivenessTests(unittest.TestCase):
         self.assertEqual(row.split()[-1], "?")
         self.assertIn("alive=?", out)
         self.assertNotIn("(GONE =", out)
+
+
+class ThresholdStampTests(unittest.TestCase):
+    """Advisor-stamped effective thresholds flow through the overview."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cfg = dict(cm._DEFAULTS, mode="managed",
+                        state_dir=self.temp.name, context_window=200_000)
+        self.state_dir = os.path.join(self.temp.name, "state")
+        os.makedirs(self.state_dir)
+        self.proc = os.path.join(self.temp.name, "proc")
+        self.sessions = os.path.join(self.temp.name, "sessions")
+        os.makedirs(self.proc)
+        os.makedirs(self.sessions)
+
+    def _state(self, sid, extra):
+        with open(os.path.join(self.state_dir, sid + ".json"), "w") as fh:
+            json.dump(dict({"model": "claude-fable-5", "current": 120_000,
+                            "peak": 120_000}, **extra), fh)
+
+    def test_stamped_thresholds_override_readout_config(self):
+        # A session running with env overrides stamps its own numbers;
+        # the overview must prefer them over its own (different) config.
+        self._state("sess-stmp-1234",
+                    {"eff_window": 1_000_000, "eff_soft_pct": 0.5,
+                     "eff_hard_pct": 0.6, "eff_trigger_pct": 0.55})
+        data = managed.overview_data(self.cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        row = data["sessions"][0]
+        self.assertEqual(row["window"], 1_000_000)
+        self.assertAlmostEqual(row["pct"], 12.0)  # 120k of 1M, not 200k
+        self.assertEqual((row["soft_pct"], row["hard_pct"],
+                          row["trigger_pct"]), (0.5, 0.6, 0.55))
+        out = managed.overview_text(self.cfg, sessions_dir=self.sessions,
+                                    proc_root=self.proc)
+        line = [l for l in out.splitlines() if "sess-stm" in l][0]
+        self.assertIn("12.0%", line)
+        self.assertIn("55%", line)  # trig column carries the stamp
+        self.assertIn("trig", out)
+
+    def test_unstamped_and_garbage_stamps_fall_back(self):
+        self._state("sess-none-1234", {})  # pre-stamp state file
+        self._state("sess-junk-1234",
+                    {"eff_window": "big", "eff_soft_pct": 7,
+                     "eff_hard_pct": -1, "eff_trigger_pct": float("nan")})
+        data = managed.overview_data(self.cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        for row in data["sessions"]:
+            self.assertEqual(row["window"], 200_000)  # readout config
+            self.assertAlmostEqual(row["pct"], 60.0)
+            self.assertEqual((row["soft_pct"], row["hard_pct"],
+                              row["trigger_pct"]), (0.7, 0.8, 0.8))
+        json.loads(json.dumps(data))

@@ -21,6 +21,14 @@
 - Operator stops journal `reason=stop_requested` (previously the
   retirement record inherited the incidental last-tick status, e.g.
   `below_threshold`), from both the tick loop and the catch-up loop.
+- Session rows display the thresholds each session ACTUALLY runs
+  with: the advisor stamps its effective (env-honoring,
+  per-model-merged) window/soft/hard/trigger into the state file
+  (`eff_*` fields, validated on load); the overview prefers stamps
+  over re-deriving from its own config, which cannot see another
+  session's env overrides. Text table gains a `trig` column; JSON
+  rows gain `soft_pct`/`hard_pct`/`trigger_pct`. Unstamped or
+  garbage stamps fall back to the readout's own derivation.
 
 - Overview session rows carry a liveness verdict: `alive` column in
   the text readout (`live` / `GONE` / `?`), `session_live`

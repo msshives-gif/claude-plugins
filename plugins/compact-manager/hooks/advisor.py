@@ -37,6 +37,20 @@ def run(payload, cfg):
         if text:
             parts.append(text)
         eff = cm.window_for(cfg, st.get("model"))
+        # Stamp the EFFECTIVE thresholds this session actually runs
+        # with (env-honoring, per-model merged) into the state file:
+        # readouts (overview text/JSON, dashboards) prefer the stamps
+        # over re-deriving from their own config, which cannot see
+        # this session's env overrides.
+        st["eff_window"] = eff["context_window"]
+        st["eff_soft_pct"] = eff["soft_pct"]
+        st["eff_hard_pct"] = eff["hard_pct"]
+        try:
+            import managed as mg
+            st["eff_trigger_pct"] = mg.trigger_for(mg.load_config(),
+                                                   st.get("model"))
+        except Exception:
+            st["eff_trigger_pct"] = eff["hard_pct"]
         level, advisory = cm.advise(st, eff, paths["handoff"],
                                     cfg["rearm_band_pct"])
         if advisory:
