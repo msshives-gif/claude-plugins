@@ -1316,6 +1316,42 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("updated", out)   # age column present
         self.assertIn("ago", out)
 
+    def test_overview_data_json(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=tmp.name,
+                   context_window=200_000,
+                   models={"fable": {"context_window": 1_000_000}})
+        state_dir = os.path.join(tmp.name, "state")
+        os.makedirs(state_dir)
+        now = time.time()
+        with open(os.path.join(state_dir, "aaaa-full-id.json"), "w") as fh:
+            json.dump({"model": "claude-fable-5", "current": 100_000,
+                       "peak": 200_000}, fh)
+        with open(os.path.join(state_dir, "bad.json"), "w") as fh:
+            json.dump({"model": {"weird": True}, "current": 1}, fh)
+        data = managed.overview_data(cfg, now=now)
+        # must be JSON-serializable end to end
+        json.dumps(data)
+        self.assertEqual(data["mode"], "managed")
+        self.assertEqual(
+            data["models"]["fable"],
+            {"context_window": 1_000_000, "soft_pct": 0.70,
+             "hard_pct": 0.80, "managed_trigger_pct": 0.80})
+        rows = {s["session_id"]: s for s in data["sessions"]}
+        # full ids in JSON (the text table shortens to 8 chars)
+        good = rows["aaaa-full-id"]
+        self.assertEqual(good["current"], 100_000)
+        self.assertEqual(good["window"], 1_000_000)
+        self.assertAlmostEqual(good["pct"], 10.0)
+        self.assertIn("age_s", good)
+        # a non-str model is not unreadable: window_for stringifies
+        bad = rows["bad"]
+        self.assertNotIn("unreadable", bad)
+        self.assertEqual(bad["current"], 1)
+        # text renderer consumes the same data without crashing
+        self.assertIn("aaaa-ful", managed.overview_text(cfg, now=now))
+
     def test_per_model_trigger_override(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

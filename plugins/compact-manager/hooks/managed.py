@@ -1958,46 +1958,38 @@ def _fmt_age(seconds):
     return "%.1fh ago" % (seconds / 3600.0)
 
 
-def overview_text(cfg, now=None):
-    """Deterministic status report: config, watcher rows (with the
-    attention flags status.md used to ask the model to derive), and
-    per-session usage from the advisor's state files. The slash
-    command relays this instead of re-deriving the logic in prose.
-    Session ids print as 8-char prefixes; stop/resolve accept them."""
+def overview_data(cfg, now=None):
+    """Everything the overview shows, as one JSON-safe dict (full
+    session ids; ages in integer seconds; per-model EFFECTIVE values).
+    The text renderer and the `overview --json` consumers (e.g. a
+    dashboard poller) share this so they can never disagree. Degrades
+    per-row like the text renderer always has."""
     now = time.time() if now is None else now
-    lines = []
     hard = cfg.get("hard_pct", 0.80)
-    lines.append("mode=%s  window=%s  soft=%s  hard=%s  trigger=%s" % (
-        cfg["mode"], _fmt_grouped(cfg["context_window"]),
-        _fmt_pct(cfg.get("soft_pct", 0.70)), _fmt_pct(hard),
-        _fmt_pct(cfg.get("managed_trigger_pct", hard))))
-    patterns = sorted(cfg.get("models", {}))
-    if patterns:
-        lines.append("")
-        lines.append("model overrides (%d)" % len(patterns))
-        orows = [("pattern", "window", "soft", "hard", "trigger")]
-        for pat in patterns:
-            # window_for/trigger_for give the EFFECTIVE values a
-            # matching model gets (override merged onto globals,
-            # clamps applied), not the raw override fragment.
-            eff = cm.window_for(cfg, pat)
-            orows.append((pat, _fmt_window_short(eff["context_window"]),
-                          _fmt_pct(eff["soft_pct"]),
-                          _fmt_pct(eff["hard_pct"]),
-                          _fmt_pct(trigger_for(cfg, pat))))
-        pat_w = max(len(t[0]) for t in orows)
-        win_w = max(len(t[1]) for t in orows)
-        soft_w = max(len(t[2]) for t in orows)
-        hard_w = max(len(t[3]) for t in orows)
-        for t in orows:
-            lines.append("  %s  %s  %s  %s  %s" % (
-                t[0].ljust(pat_w), t[1].ljust(win_w),
-                t[2].ljust(soft_w), t[3].ljust(hard_w), t[4]))
-    lines.append("")
-    rows = status_rows(cfg)
-    lines.append("watchers (%d)" % len(rows))
-    wrows = []
-    for r in rows:
+    data = {
+        "schema": 1,
+        "generated_at": now,
+        "mode": cfg.get("mode"),
+        "context_window": cfg.get("context_window"),
+        "soft_pct": cfg.get("soft_pct", 0.70),
+        "hard_pct": hard,
+        "managed_trigger_pct": cfg.get("managed_trigger_pct", hard),
+        "models": {},
+        "watchers": [],
+        "sessions": [],
+    }
+    for pat in sorted(cfg.get("models", {})):
+        # window_for/trigger_for give the EFFECTIVE values a matching
+        # model gets (override merged onto globals, clamps applied),
+        # not the raw override fragment.
+        eff = cm.window_for(cfg, pat)
+        data["models"][pat] = {
+            "context_window": eff["context_window"],
+            "soft_pct": eff["soft_pct"],
+            "hard_pct": eff["hard_pct"],
+            "managed_trigger_pct": trigger_for(cfg, pat),
+        }
+    for r in status_rows(cfg):
         flags = []
         if r["state"] in ALERT_STATES:
             flags.append("ATTENTION")
@@ -2011,27 +2003,10 @@ def overview_text(cfg, now=None):
         # can still read live=true unflagged — status.md says so.
         if r["live"] and not pid_ok:
             flags.append("MALFORMED-LEASE")
-        state = r["state"]
-        if isinstance(state, str) and state.startswith("WATCHER_"):
-            state = state[len("WATCHER_"):]
-        status = ("✗ " + ",".join(flags)) if flags \
-            else ("live" if r["live"] else "")
-        if r["reason"]:
-            status = (status + "  " if status else "") \
-                + "reason=%s" % r["reason"]
-        wrows.append((str(r["session_id"])[:8],
-                      "—" if pid is None else str(pid),
-                      str(state), status))
-    if wrows:
-        header = ("session", "watcher pid", "state", "health")
-        id_w = max(len(t[0]) for t in wrows + [header])
-        pid_w = max(len(t[1]) for t in wrows + [header])
-        st_w = max(len(t[2]) for t in wrows + [header])
-        for t in [header] + wrows:
-            lines.append(("  %s  %s  %s  %s" % (
-                t[0].ljust(id_w), t[1].ljust(pid_w),
-                t[2].ljust(st_w), t[3])).rstrip())
-    lines.append("")
+        data["watchers"].append({
+            "session_id": r["session_id"], "pid": r["pid"],
+            "state": r["state"], "live": r["live"],
+            "reason": r["reason"], "flags": flags})
     state_dir = os.path.join(cfg["state_dir"], "state")
     entries = []
     try:
@@ -2053,10 +2028,8 @@ def overview_text(cfg, now=None):
         if isinstance(st, dict):
             entries.append((mtime, name[:-5], st))
     entries.sort(key=lambda e: e[0], reverse=True)
-    label = "sessions touched <24h (%d)" % len(entries)
-    srows = []
-    for i, (mtime, sid, st) in enumerate(entries):
-        marker = "> " if i == 0 else "  "
+    for mtime, sid, st in entries:
+        row = {"session_id": sid}
         # Degrade per-row, never lose the whole readout to one bad
         # state file (verify-round finding).
         try:
@@ -2072,18 +2045,93 @@ def overview_text(cfg, now=None):
 
             current = _token_count(st.get("current"))
             peak = _token_count(st.get("peak"))
+            row.update({
+                "model": st.get("model"),
+                "current": current, "peak": peak, "window": window,
+                "pct": 100.0 * current / window,
+                "updated_epoch": mtime,
+            })
             # A future mtime sorts first and would fake a fresh age —
             # surface the anomaly instead of clamping it to 0s. 1s
             # covers fs-timestamp granularity; beyond that is anomaly.
-            age = (_fmt_age(max(0, int(now - mtime)))
-                   if mtime <= now + 1
-                   else "FUTURE-MTIME(untrustworthy)")
-            srows.append((marker, str(sid)[:8],
-                          str(st.get("model") or "?"),
-                          _fmt_grouped(current), _fmt_grouped(peak),
-                          "%.1f%%" % (100.0 * current / window), age))
+            if mtime <= now + 1:
+                row["age_s"] = max(0, int(now - mtime))
+            else:
+                row["future_mtime"] = True
         except Exception:
-            srows.append((marker, str(sid)[:8], None, "", "", "", ""))
+            row["unreadable"] = True
+        data["sessions"].append(row)
+    return data
+
+
+def overview_text(cfg, now=None):
+    """Deterministic status report: config, watcher rows (with the
+    attention flags status.md used to ask the model to derive), and
+    per-session usage from the advisor's state files. The slash
+    command relays this instead of re-deriving the logic in prose.
+    Session ids print as 8-char prefixes; stop/resolve accept them."""
+    data = overview_data(cfg, now)
+    lines = []
+    lines.append("mode=%s  window=%s  soft=%s  hard=%s  trigger=%s" % (
+        data["mode"], _fmt_grouped(data["context_window"]),
+        _fmt_pct(data["soft_pct"]), _fmt_pct(data["hard_pct"]),
+        _fmt_pct(data["managed_trigger_pct"])))
+    if data["models"]:
+        lines.append("")
+        lines.append("model overrides (%d)" % len(data["models"]))
+        orows = [("pattern", "window", "soft", "hard", "trigger")]
+        for pat, eff in sorted(data["models"].items()):
+            orows.append((pat, _fmt_window_short(eff["context_window"]),
+                          _fmt_pct(eff["soft_pct"]),
+                          _fmt_pct(eff["hard_pct"]),
+                          _fmt_pct(eff["managed_trigger_pct"])))
+        pat_w = max(len(t[0]) for t in orows)
+        win_w = max(len(t[1]) for t in orows)
+        soft_w = max(len(t[2]) for t in orows)
+        hard_w = max(len(t[3]) for t in orows)
+        for t in orows:
+            lines.append("  %s  %s  %s  %s  %s" % (
+                t[0].ljust(pat_w), t[1].ljust(win_w),
+                t[2].ljust(soft_w), t[3].ljust(hard_w), t[4]))
+    lines.append("")
+    lines.append("watchers (%d)" % len(data["watchers"]))
+    wrows = []
+    for w in data["watchers"]:
+        state = w["state"]
+        if isinstance(state, str) and state.startswith("WATCHER_"):
+            state = state[len("WATCHER_"):]
+        status = ("✗ " + ",".join(w["flags"])) if w["flags"] \
+            else ("live" if w["live"] else "")
+        if w["reason"]:
+            status = (status + "  " if status else "") \
+                + "reason=%s" % w["reason"]
+        wrows.append((str(w["session_id"])[:8],
+                      "—" if w["pid"] is None else str(w["pid"]),
+                      str(state), status))
+    if wrows:
+        header = ("session", "watcher pid", "state", "health")
+        id_w = max(len(t[0]) for t in wrows + [header])
+        pid_w = max(len(t[1]) for t in wrows + [header])
+        st_w = max(len(t[2]) for t in wrows + [header])
+        for t in [header] + wrows:
+            lines.append(("  %s  %s  %s  %s" % (
+                t[0].ljust(id_w), t[1].ljust(pid_w),
+                t[2].ljust(st_w), t[3])).rstrip())
+    lines.append("")
+    label = "sessions touched <24h (%d)" % len(data["sessions"])
+    srows = []
+    for i, s in enumerate(data["sessions"]):
+        marker = "> " if i == 0 else "  "
+        if s.get("unreadable"):
+            srows.append((marker, str(s["session_id"])[:8],
+                          None, "", "", "", ""))
+            continue
+        age = ("FUTURE-MTIME(untrustworthy)" if s.get("future_mtime")
+               else _fmt_age(s["age_s"]))
+        srows.append((marker, str(s["session_id"])[:8],
+                      str(s.get("model") or "?"),
+                      _fmt_grouped(s["current"]), _fmt_grouped(s["peak"]),
+                      "%.1f%%" % s["pct"], age))
     if srows:
         lines.append(label)
         id_w = max([len("session")] + [len(t[1]) for t in srows])
@@ -2156,7 +2204,9 @@ def cli_main(argv=None, run_tmux=default_run_tmux):
     adopt.add_argument("-t", dest="pane", required=True)
     adopt.add_argument("--attended", action="store_true")
     sub.add_parser("status")
-    sub.add_parser("overview")
+    overview = sub.add_parser("overview")
+    overview.add_argument("--json", action="store_true",
+                          help="structured output (full session ids)")
     stop = sub.add_parser("stop")
     stop.add_argument("sid")
     resolve = sub.add_parser("resolve")
@@ -2207,7 +2257,10 @@ def cli_main(argv=None, run_tmux=default_run_tmux):
         print(json.dumps(rows, indent=2, sort_keys=True))
         return 0
     elif args.command == "overview":
-        print(overview_text(cfg))
+        if getattr(args, "json", False):
+            print(json.dumps(overview_data(cfg), indent=2, sort_keys=True))
+        else:
+            print(overview_text(cfg))
         return 0
     elif args.command == "stop":
         sid, error = expand_sid(cfg, args.sid)
