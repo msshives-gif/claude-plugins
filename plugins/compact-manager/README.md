@@ -107,7 +107,7 @@ pane at all. Managed mode is Linux/WSL-only in this release.
 
 ## Slash commands and the start-of-session status line
 
-Four slash commands ship in `commands/`:
+Five slash commands ship in `commands/`:
 
 - **setup** — first-run walkthrough: pick a mode, set window
   overrides, learn the other commands (nothing runs automatically at
@@ -116,6 +116,8 @@ Four slash commands ship in `commands/`:
   the result interpreted for you)
 - **detach** — stop this session's watcher
 - **status** — mode, live watchers, and per-session context usage
+- **set** — relay a spoken threshold request ("compact this session at
+  60%") into the `override` subcommand for the current session
 
 Plugin-system installs get them namespaced (`/compact-manager:attach`
 etc.). `scripts/install.sh` installs substituted, marker-tagged copies
@@ -147,7 +149,10 @@ env-honoring, per-model-merged window/soft/hard/trigger into the
 state file, and the overview prefers those stamps over re-deriving
 from its own config — so per-session env overrides
 (`COMPACT_MANAGER_*` at session launch) and per-model overrides both
-display truthfully. The text table's `trig` column and the JSON's
+display truthfully. Keys set via the `override` subcommand (see the
+configuration reference) beat even the stamps, so a mid-session
+change reads truthfully immediately rather than at the session's next
+tool call. The text table's `trig` column and the JSON's
 per-row `soft_pct`/`hard_pct`/`trigger_pct` carry the result. The monorepo's `tools/status.py` is the
 complementary dev-side readout (knob-by-knob config provenance and
 hook wiring across the whole suite); the two deliberately do not
@@ -169,6 +174,26 @@ Advisory and off modes stay silent, as before.
 Config file `~/.claude/compact-manager.json`, or environment variables
 `COMPACT_MANAGER_<NAME>` (env wins; `COMPACT_MANAGER_CONFIG` points at
 an alternate file — handy for per-session configs).
+
+One session's thresholds can also be changed mid-flight, without a
+restart:
+
+```
+bin/compact-manager override <session-id> trigger=60% soft=50% hard=55% window=500000
+```
+
+Any subset of the four keys (percentages accept `60%`, `60`, or
+`0.6`); `--clear` resets, and no assignments at all just shows the
+current state plus the resulting effective thresholds. This writes
+`<state_dir>/overrides/<session-id>.json`, which the advisor, a
+RUNNING watcher, and both readouts all honor — the watcher re-reads it
+within one poll. Values are range-validated (fractions in (0, 1],
+window 10k–1e9) and `soft` is kept ≤ `hard`, but there is no other
+clamping: this is the human's lever. In managed
+mode the start-of-session status line bakes the exact command with the
+real session id, and the `set` slash command translates a spoken
+request into it. Session-id prefixes work here like they do for
+`stop`/`resolve`.
 
 | Knob | Default | Meaning |
 |---|---|---|

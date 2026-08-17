@@ -87,18 +87,30 @@ def _watcher_status(cfg, session_id):
             lease = json.load(fh)
     except (OSError, ValueError):
         lease = None
+    cli = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "..", "bin", "compact-manager"))
     if _lease_attached(managed, lease):
         text = ("compact-manager: managed mode, watcher attached to this "
                 "session (pid %s)." % lease.get("pid"))
     else:
-        adopt = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "..", "bin", "compact-manager")
         text = ("compact-manager: mode is managed but NO watcher holds "
                 "this session — nothing will type /compact for you. "
                 "Attach one with the attach command "
                 "(/compact-manager:attach, or /compact-manager-attach on "
-                "script installs) or: %s adopt -t \"$TMUX_PANE\" "
-                "--attended" % os.path.normpath(adopt))
+                "script installs) or: \"%s\" adopt -t \"$TMUX_PANE\" "
+                "--attended" % cli)
+    # Advertise the per-session threshold mechanism with the exact
+    # command (this hook knows the real session id) so the model never
+    # has to discover it — but only ever uses it when the human asks.
+    # An id the CLI's own validator would reject is not baked into a
+    # copy-pasteable command line.
+    sid = (session_id if managed._SESSION_ID.fullmatch(session_id)
+           else "<session-id>")
+    text += (" If the user asks to change this session's compaction "
+             "thresholds, run: \"%s\" override %s trigger=NN%% "
+             "(keys: trigger/soft/hard/window, any subset; --clear "
+             "resets)." % (cli, sid))
     cm.ledger_append(cfg, {"event": "inject", "hook": "session_start",
                            "kind": "watcher_status"})
     _emit(cfg, text)

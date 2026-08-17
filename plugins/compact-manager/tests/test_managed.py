@@ -1236,6 +1236,26 @@ class TickWiringTests(unittest.TestCase):
         self.assertNotIn("#{", shown[0].replace("##", ""))
         self.assertIn("##{pane_id}", shown[0])
 
+    def test_override_file_changes_trigger_at_tick_time(self):
+        # A RUNNING watcher must honor a mid-flight `override` write:
+        # 130k of 200k (65%) sits below the default 80% trigger, then
+        # the override file drops the trigger to 60% and the very next
+        # tick fires.
+        watcher = self.make_watcher([usage_row(130_000)], EchoTmux())
+        self.assertEqual(watcher.tick(), (True, "below_threshold"))
+        managed._atomic_json(cm.override_path(self.cfg, self.sid),
+                             {"managed_trigger_pct": 0.6})
+        self.assertEqual(watcher.tick(), (True, "SUBMITTED"))
+
+    def test_override_window_changes_pct_at_tick_time(self):
+        # Same shape via the window: 130k of an overridden 150k window
+        # is 86.7%, over the unchanged 80% trigger.
+        watcher = self.make_watcher([usage_row(130_000)], EchoTmux())
+        self.assertEqual(watcher.tick(), (True, "below_threshold"))
+        managed._atomic_json(cm.override_path(self.cfg, self.sid),
+                             {"context_window": 150_000})
+        self.assertEqual(watcher.tick(), (True, "SUBMITTED"))
+
     def test_request_triggers_below_threshold_with_fingerprint(self):
         watcher = self.make_watcher([usage_row(50)], EchoTmux())
         cm._private_makedirs(os.path.dirname(self.paths["request"]))
@@ -1344,6 +1364,86 @@ class CliTests(unittest.TestCase):
 
     def test_adopt_requires_attended(self):
         self.assertEqual(managed.cli_main(["adopt", "-t", "%1"]), 2)
+
+    def _override_cli(self, tmp, argv):
+        env = {"COMPACT_MANAGER_CONFIG": "/nonexistent/cm-test.json",
+               "COMPACT_MANAGER_STATE_DIR": tmp}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(sys, "stdout", new=out), \
+                mock.patch.object(sys, "stderr", new=err):
+            rc = managed.cli_main(["override"] + argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_override_roundtrip_prefix_and_clear(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = dict(cm._DEFAULTS, state_dir=tmp.name)
+        rc, out, err = self._override_cli(
+            tmp.name, ["sess-ovr-1234", "trigger=60%", "soft=0.5",
+                       "hard=55%", "window=500000"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(cm.session_overrides(cfg, "sess-ovr-1234"),
+                         {"managed_trigger_pct": 0.6, "soft_pct": 0.5,
+                          "hard_pct": 0.55, "context_window": 500_000})
+        self.assertIn("effective now", out)
+        self.assertIn("trigger=60%", out)
+        # Writer endpoints match the reader's inclusive bounds.
+        for w, ok in (("10000", True), ("1000000000", True),
+                      ("9999", False), ("1000000001", False),
+                      ("9" * 4000, False)):
+            frag, error = managed._parse_override_assignments(
+                ["window=" + w])
+            self.assertEqual(error is None, ok, w)
+        # Bare percentages read as percentages (65 → 65%), merging onto
+        # the existing file — addressed by unambiguous prefix this time
+        # (the override file itself is an expand_sid source).
+        rc, out, err = self._override_cli(tmp.name,
+                                          ["sess-ovr", "trigger=65"])
+        self.assertEqual(rc, 0, err)
+        merged = cm.session_overrides(cfg, "sess-ovr-1234")
+        self.assertEqual(merged["managed_trigger_pct"], 0.65)
+        self.assertEqual(merged["soft_pct"], 0.5)  # earlier keys survive
+        # Show-only invocation changes nothing.
+        rc, out, err = self._override_cli(tmp.name, ["sess-ovr"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("override file:", out)
+        # --clear removes the file; clearing again reports, exit 0.
+        rc, out, err = self._override_cli(tmp.name,
+                                          ["sess-ovr", "--clear"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(cm.session_overrides(cfg, "sess-ovr-1234"), {})
+        rc, out, err = self._override_cli(tmp.name,
+                                          ["sess-ovr-1234", "--clear"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("no overrides", out)
+
+    def test_override_rejects_bad_input_loudly(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = dict(cm._DEFAULTS, state_dir=tmp.name)
+        for bad in (["sess-bad-1234", "soft=abc"],
+                    ["sess-bad-1234", "window=5000"],
+                    ["sess-bad-1234", "window=1e6"],
+                    ["sess-bad-1234", "pct=0.5"],
+                    ["sess-bad-1234", "trigger"],
+                    ["sess-bad-1234", "trigger=150"],
+                    ["sess-bad-1234", "trigger=0"],
+                    ["sess-bad-1234", "trigger=nan"],
+                    ["sess-bad-1234", "trigger=60%%"],
+                    ["sess-bad-1234", "window=99999999999"],
+                    # path_component canonicalization must not let an
+                    # invalid sid alias a valid one's override file.
+                    [".sess-bad-1234", "trigger=60%"],
+                    ["sess bad 1234", "trigger=60%"],
+                    ["abc", "trigger=60%"],
+                    ["sess-bad-1234", "soft=1%", "--clear"]):
+            rc, out, err = self._override_cli(tmp.name, bad)
+            self.assertEqual(rc, 1, bad)
+            self.assertTrue(err.strip(), bad)
+        self.assertEqual(cm.session_overrides(cfg, "sess-bad-1234"), {})
+        self.assertFalse(
+            os.path.exists(os.path.join(tmp.name, "overrides")))
 
 
 if __name__ == "__main__":
@@ -1896,6 +1996,51 @@ class ThresholdStampTests(unittest.TestCase):
         self.assertIn("12.0%", line)
         self.assertIn("55%", line)  # trig column carries the stamp
         self.assertIn("trig", out)
+
+    def test_override_file_beats_stale_stamps(self):
+        # A mid-session `override` write must read truthfully at once,
+        # not wait for the advisor's next restamp.
+        self._state("sess-ovrd-1234",
+                    {"eff_window": 200_000, "eff_soft_pct": 0.7,
+                     "eff_hard_pct": 0.8, "eff_trigger_pct": 0.8})
+        d = os.path.join(self.temp.name, "overrides")
+        os.makedirs(d)
+        with open(os.path.join(d, "sess-ovrd-1234.json"), "w") as fh:
+            json.dump({"managed_trigger_pct": 0.6, "soft_pct": 0.5,
+                       "hard_pct": 0.55, "context_window": 150_000}, fh)
+        data = managed.overview_data(self.cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        row = data["sessions"][0]
+        self.assertEqual(row["window"], 150_000)
+        self.assertAlmostEqual(row["pct"], 80.0)  # 120k of 150k
+        self.assertEqual((row["soft_pct"], row["hard_pct"],
+                          row["trigger_pct"]), (0.5, 0.55, 0.6))
+        # --clear (file removal) reads truthfully immediately too: the
+        # stamps are the base values, so nothing override-flavored can
+        # linger after the file is gone (audit finding).
+        os.unlink(os.path.join(d, "sess-ovrd-1234.json"))
+        data = managed.overview_data(self.cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        row = data["sessions"][0]
+        self.assertEqual(row["window"], 200_000)
+        self.assertEqual((row["soft_pct"], row["hard_pct"],
+                          row["trigger_pct"]), (0.7, 0.8, 0.8))
+
+    def test_partial_override_on_unstamped_row_reclamps(self):
+        # Only soft overridden, above the config hard: the overlay
+        # applies the same soft<=hard clamp as everything else, and the
+        # untouched values fall back to the readout's derivation.
+        self._state("sess-part-1234", {})
+        d = os.path.join(self.temp.name, "overrides")
+        os.makedirs(d)
+        with open(os.path.join(d, "sess-part-1234.json"), "w") as fh:
+            json.dump({"soft_pct": 0.9}, fh)
+        data = managed.overview_data(self.cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        row = data["sessions"][0]
+        self.assertEqual((row["soft_pct"], row["hard_pct"]), (0.8, 0.8))
+        self.assertEqual(row["window"], 200_000)
+        self.assertEqual(row["trigger_pct"], 0.8)
 
     def test_unstamped_and_garbage_stamps_fall_back(self):
         self._state("sess-none-1234", {})  # pre-stamp state file

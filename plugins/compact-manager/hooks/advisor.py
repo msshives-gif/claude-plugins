@@ -37,11 +37,13 @@ def run(payload, cfg):
         if text:
             parts.append(text)
         eff = cm.window_for(cfg, st.get("model"))
-        # Stamp the EFFECTIVE thresholds this session actually runs
-        # with (env-honoring, per-model merged) into the state file:
-        # readouts (overview text/JSON, dashboards) prefer the stamps
-        # over re-deriving from their own config, which cannot see
-        # this session's env overrides.
+        # Stamp the BASE effective thresholds (env-honoring, per-model
+        # merged, but PRE-override) into the state file: readouts
+        # prefer the stamps over re-deriving from their own config,
+        # which cannot see this session's env overrides — and they
+        # overlay the override file themselves, so overrides must not
+        # be baked into the stamps: a merged stamp would keep showing
+        # an override after --clear removed it (audit finding).
         st["eff_window"] = eff["context_window"]
         st["eff_soft_pct"] = eff["soft_pct"]
         st["eff_hard_pct"] = eff["hard_pct"]
@@ -51,6 +53,9 @@ def run(payload, cfg):
                                                    st.get("model"))
         except Exception:
             st["eff_trigger_pct"] = eff["hard_pct"]
+        # The advisories themselves DO honor the overrides.
+        eff = cm.apply_overrides(eff, cm.session_overrides(cfg,
+                                                           session_id))
         level, advisory = cm.advise(st, eff, paths["handoff"],
                                     cfg["rearm_band_pct"])
         if advisory:

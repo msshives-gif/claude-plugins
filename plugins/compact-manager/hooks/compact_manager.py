@@ -188,6 +188,62 @@ def window_for(cfg, model):
     return eff
 
 
+def override_path(cfg, session_id):
+    return os.path.join(cfg["state_dir"], "overrides",
+                        f"{path_component(session_id)}.json")
+
+
+_OVERRIDE_PCT_KEYS = ("soft_pct", "hard_pct", "managed_trigger_pct")
+
+
+def session_overrides(cfg, session_id):
+    """Validated per-session threshold overrides — written by the CLI
+    `override` subcommand when the human asks for them. Missing or
+    garbage reads as {} (fail open), and each key is validated on its
+    own so one bad value never voids the others. Values are
+    human-initiated, so there is no extra clamping beyond the ranges
+    that keep the math sane: fractions in (0, 1], window in
+    [10k, 1e9]."""
+    try:
+        path = override_path(cfg, session_id)
+        if not os.path.isfile(path) or \
+                os.path.getsize(path) > _CONFIG_MAX_BYTES:
+            return {}
+        with open(path) as fh:
+            raw = json.load(fh)
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        for k in _OVERRIDE_PCT_KEYS:
+            v = raw.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) \
+                    and v == v and 0 < v <= 1:
+                out[k] = float(v)
+        w = raw.get("context_window")
+        # Upper bound too: a huge int survives int math but overflows
+        # float conversion downstream (rearm-band multiplication, pct
+        # division) — 1e9 tokens is far beyond any real window.
+        if isinstance(w, int) and not isinstance(w, bool) \
+                and 10_000 <= w <= 1_000_000_000:
+            out["context_window"] = w
+        return out
+    except Exception:
+        return {}
+
+
+def apply_overrides(eff, overrides):
+    """Merge session_overrides() output onto window_for()'s eff dict
+    (mutating it), re-applying the soft<=hard clamp the same way the
+    loaders do. managed_trigger_pct is not eff's key — callers that
+    care read it from the overrides dict directly."""
+    for k in _PER_MODEL_KEYS:
+        if k in overrides:
+            eff[k] = overrides[k]
+    if eff["soft_pct"] > eff["hard_pct"]:
+        eff["soft_pct"] = eff["hard_pct"]
+    return eff
+
+
 # ---------------------------------------------------------------- text
 
 def sanitize(text, limit=600):
@@ -661,7 +717,8 @@ def prune_state(cfg):
         cutoff = now - cfg["state_ttl_days"] * 86_400
         is_junction = getattr(os.path, "isjunction", lambda p: False)
         for sub, ext in (("state", ".json"), ("packets", ".json"),
-                         ("handoff", ".md"), ("locks", ".lock")):
+                         ("handoff", ".md"), ("locks", ".lock"),
+                         ("overrides", ".json")):
             d = os.path.join(base, sub)
             if os.path.islink(d) or is_junction(d):
                 continue
@@ -678,6 +735,17 @@ def prune_state(cfg):
                 if not stem or stem != path_component(stem):
                     continue
                 p = os.path.join(d, name)
+                # A live session's override must not expire on its own
+                # mtime (it is written once, then read forever): spare
+                # it while the sibling state file is fresh (audit
+                # finding).
+                if sub == "overrides":
+                    try:
+                        if os.lstat(os.path.join(
+                                base, "state", name)).st_mtime >= cutoff:
+                            continue
+                    except OSError:
+                        pass
                 try:
                     stt = os.lstat(p)
                     if not stat_module.S_ISREG(stt.st_mode):

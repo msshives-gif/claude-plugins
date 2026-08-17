@@ -424,6 +424,105 @@ class StateValidationTests(unittest.TestCase):
         self.assertTrue(cm.load_state(paths)["discard_to_newline"])
 
 
+class SessionOverrideTests(unittest.TestCase):
+    """Per-session override file: validated per key, fail open."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.cfg = dict(cm._DEFAULTS, state_dir=self.dir.name)
+
+    def write(self, sid, value):
+        d = os.path.join(self.dir.name, "overrides")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, cm.path_component(sid) + ".json"),
+                  "w") as fh:
+            fh.write(value if isinstance(value, str) else json.dumps(value))
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(cm.session_overrides(self.cfg, "sess-none"), {})
+
+    def test_each_key_validated_independently(self):
+        # hard_pct out of range and an unknown key drop; the rest stay.
+        self.write("sess-mix", {"soft_pct": 0.5, "hard_pct": 2.0,
+                                "managed_trigger_pct": 0.6,
+                                "context_window": 500_000,
+                                "mystery_knob": 1})
+        self.assertEqual(cm.session_overrides(self.cfg, "sess-mix"),
+                         {"soft_pct": 0.5, "managed_trigger_pct": 0.6,
+                          "context_window": 500_000})
+
+    def test_garbage_values_and_shapes_read_as_empty(self):
+        for junk in ("{not json", '"scalar"', "[1, 2]",
+                     json.dumps({"soft_pct": True, "hard_pct": 0,
+                                 "managed_trigger_pct": -0.5,
+                                 "context_window": 9_999}),
+                     json.dumps({"soft_pct": "0.5",
+                                 "context_window": 500_000.0}),
+                     # A huge window survives int math but overflows
+                     # float conversion downstream — reader rejects it.
+                     json.dumps({"context_window": 10**12}),
+                     '{"soft_pct": NaN, "hard_pct": Infinity}'):
+            self.write("sess-junk", junk)
+            self.assertEqual(cm.session_overrides(self.cfg, "sess-junk"),
+                             {}, junk)
+
+    def test_window_bounds_are_inclusive(self):
+        # Exact endpoints accepted; one past either end rejected. The
+        # ceiling keeps a huge int from overflowing float math.
+        for w, want in ((10_000, {"context_window": 10_000}),
+                        (1_000_000_000, {"context_window": 1_000_000_000}),
+                        (9_999, {}), (1_000_000_001, {}),
+                        (10 ** 4000, {})):
+            self.write("sess-bnd", {"context_window": w})
+            self.assertEqual(cm.session_overrides(self.cfg, "sess-bnd"),
+                             want, w)
+
+    def test_apply_overrides_reclamps_soft_to_hard(self):
+        # soft raised above hard clamps down, exactly as the loaders do.
+        out = cm.apply_overrides(
+            {"soft_pct": 0.7, "hard_pct": 0.8, "context_window": 200_000},
+            {"soft_pct": 0.9})
+        self.assertEqual((out["soft_pct"], out["hard_pct"]), (0.8, 0.8))
+        out = cm.apply_overrides(
+            {"soft_pct": 0.7, "hard_pct": 0.8, "context_window": 200_000},
+            {"hard_pct": 0.6, "context_window": 500_000})
+        self.assertEqual((out["soft_pct"], out["hard_pct"],
+                          out["context_window"]), (0.6, 0.6, 500_000))
+
+    def test_prune_reaps_aged_override_files(self):
+        d = os.path.join(self.dir.name, "overrides")
+        os.makedirs(d)
+        dead = os.path.join(d, "dead.json")
+        with open(dead, "w") as fh:
+            fh.write("{}")
+        old = time.time() - 30 * 86_400
+        os.utime(dead, (old, old))
+        cm._write_sentinel(self.cfg)
+        cm.prune_state(dict(self.cfg, state_ttl_days=7))
+        self.assertFalse(os.path.exists(dead))
+
+    def test_prune_spares_override_of_live_session(self):
+        # An override is written once and read forever; its own mtime
+        # goes stale while the session lives. A fresh sibling state
+        # file (the advisor touches it every tool call) must protect
+        # it from the reaper (audit finding).
+        d = os.path.join(self.dir.name, "overrides")
+        sd = os.path.join(self.dir.name, "state")
+        os.makedirs(d)
+        os.makedirs(sd)
+        ovr = os.path.join(d, "livesess.json")
+        with open(ovr, "w") as fh:
+            fh.write("{}")
+        old = time.time() - 30 * 86_400
+        os.utime(ovr, (old, old))
+        with open(os.path.join(sd, "livesess.json"), "w") as fh:
+            fh.write("{}")  # fresh mtime
+        cm._write_sentinel(self.cfg)
+        cm.prune_state(dict(self.cfg, state_ttl_days=7))
+        self.assertTrue(os.path.exists(ovr))
+
+
 class PruneTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -761,6 +860,53 @@ class HookShellTests(unittest.TestCase):
         self.assertEqual(st["eff_trigger_pct"], 0.8)
         # Same state again: hysteresis, no repeat.
         self.assertEqual(self.run_hook("advisor.py", payload), {})
+
+    def test_advisor_honors_session_override_file(self):
+        # 80,510 tokens: silent against the 200k/70% defaults, but the
+        # override file (150k window, 50% soft) makes it a soft
+        # advisory. The stamps stay BASE (pre-override): readouts
+        # overlay the override file themselves, and a merged stamp
+        # would keep showing an override after --clear removed it.
+        d = os.path.join(self.dir.name, "overrides")
+        os.makedirs(d)
+        with open(os.path.join(d, "sO.json"), "w") as fh:
+            json.dump({"soft_pct": 0.5, "hard_pct": 0.55,
+                       "managed_trigger_pct": 0.6,
+                       "context_window": 150_000}, fh)
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 80_000, 0, 500)])
+        payload = {"hook_event_name": "PostToolUse", "session_id": "sO",
+                   "transcript_path": t, "tool_name": "Bash"}
+        out = self.run_hook("advisor.py", payload)
+        self.assertIn("additionalContext", out.get("hookSpecificOutput", {}))
+        with open(os.path.join(self.dir.name, "state", "sO.json")) as fh:
+            st = json.load(fh)
+        self.assertEqual(st["eff_window"], 200_000)
+        self.assertEqual((st["eff_soft_pct"], st["eff_hard_pct"],
+                          st["eff_trigger_pct"]), (0.7, 0.8, 0.8))
+        # Without the override file the same reading is silent (proves
+        # the advisory above came from the merged thresholds).
+        os.unlink(os.path.join(d, "sO.json"))
+        append_jsonl(t, [usage_row(10, 80_100, 0, 500)])
+        self.assertEqual(self.run_hook(
+            "advisor.py", dict(payload, session_id="sP")), {})
+
+    def test_session_start_advertises_override_command(self):
+        base = {"hook_event_name": "SessionStart",
+                "session_id": "sess-adv-1234", "source": "startup"}
+        out = self.run_hook("session_start.py", base, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        # The CLI path is quoted (paths with spaces stay pasteable).
+        self.assertIn('" override sess-adv-1234 trigger=NN%', ctx)
+        self.assertIn('run: "', ctx)
+        self.assertIn("user asks", ctx)
+        # A sid the CLI's validator would reject is never baked into a
+        # copy-pasteable command line.
+        out = self.run_hook("session_start.py",
+                            dict(base, session_id="s W"), mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("override <session-id>", ctx)
+        self.assertNotIn("override s W", ctx)
 
     def test_full_compaction_cycle(self):
         t = os.path.join(self.dir.name, "sess.jsonl")

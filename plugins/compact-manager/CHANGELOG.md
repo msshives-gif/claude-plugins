@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Per-session threshold overrides, changeable mid-flight: a new
+  `override` CLI subcommand writes a validated
+  `<state_dir>/overrides/<sid>.json` (`trigger`/`soft`/`hard`/
+  `window`, any subset, `--clear` resets, sid prefixes accepted). The
+  advisor merges it into its effective thresholds (stamps stay BASE —
+  pre-override — so nothing override-flavored lingers after
+  `--clear`), a RUNNING watcher re-reads one consistent snapshot per
+  decision so a change lands within one poll, and both readouts
+  overlay the file over stamps and derivation — a change (or a clear)
+  displays truthfully immediately.
+  Values are range-validated (fractions in (0, 1], window 10k–1e9,
+  soft kept ≤ hard) but not clamped beyond that: it is the human's
+  lever, and the managed-mode
+  start-of-session status line advertises the exact command (real
+  session id baked in) for use when the user asks. New `set` slash
+  command translates a spoken request into the CLI call. Override
+  files age out with the session's other state (TTL reaper).
+
 - Watchers retire on session-id rotation instead of babysitting the
   dead id: `/clear` and in-app `/resume` keep the claude process but
   rotate its session id, which previously left the watcher holding

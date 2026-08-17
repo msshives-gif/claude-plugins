@@ -1399,6 +1399,22 @@ class Watcher:
                 self.consumed_request_generations.add(key)
                 self.request_history[request_id] = key
 
+    def _thresholds(self):
+        """(eff, trigger) from ONE snapshot of this session's override
+        file — a single decision must never mix two override versions
+        (e.g. an old window with a new trigger; audit finding). Re-read
+        on every call so a RUNNING watcher follows a change the human
+        makes via the CLI `override` subcommand within one poll (tiny
+        file; any error reads as no overrides inside the helper)."""
+        overrides = cm.session_overrides(self.cfg,
+                                         self.binding["session_id"])
+        eff = cm.apply_overrides(
+            cm.window_for(self.cfg, self.cursor.get("model")), overrides)
+        trigger = overrides.get("managed_trigger_pct")
+        if trigger is None:
+            trigger = trigger_for(self.cfg, self.cursor.get("model"))
+        return eff, trigger
+
     def alert_if_needed(self, previous=None):
         if not (self.attempt and self.attempt.get("state") in ALERT_STATES and
                 self.attempt.get("state") != previous):
@@ -1534,10 +1550,9 @@ class Watcher:
                 return True, self.attempt["state"]
             if self.attempt.get("state") == "BOUNDARY_CONFIRMED":
                 self.backoff = BACKOFF_INITIAL_S
-                eff = cm.window_for(self.cfg, self.cursor.get("model"))
+                eff, trigger = self._thresholds()
                 pct = self.cursor.get("current", 0) / eff["context_window"]
-                if pct >= (trigger_for(self.cfg, self.cursor.get("model")) -
-                           self.cfg["rearm_band_pct"]):
+                if pct >= trigger - self.cfg["rearm_band_pct"]:
                     # The completed compaction left the session at/near the
                     # trigger; re-firing immediately would loop. THRESHOLD
                     # latch until meaningful NEW content accumulates (the
@@ -1559,7 +1574,7 @@ class Watcher:
                 self.attempt = None
             elif self.attempt.get("state") == "LATCHED":
                 if self.attempt.get("latch_kind") == "THRESHOLD":
-                    eff = cm.window_for(self.cfg, self.cursor.get("model"))
+                    eff, trigger = self._thresholds()
                     window = eff["context_window"]
                     pct = self.cursor.get("current", 0) / window
                     # Context only grows between compactions, so a pure
@@ -1570,9 +1585,7 @@ class Watcher:
                     # re-arm band of real work, so no compaction churn.
                     grown = (self.cursor.get("current", 0) -
                              self.attempt.get("latch_tokens", 0))
-                    if (pct < (trigger_for(self.cfg,
-                                           self.cursor.get("model")) -
-                               self.cfg["rearm_band_pct"]) or
+                    if (pct < trigger - self.cfg["rearm_band_pct"] or
                             grown >= self.cfg["rearm_band_pct"] * window):
                         self.attempt = transition_attempt(
                             self.attempt, "pct_rearmed", now, self.cfg,
@@ -1611,7 +1624,7 @@ class Watcher:
                 return True, self.attempt["state"]
         if not self.cursor.get("caught_up"):
             return True, "catching_up"
-        eff = cm.window_for(self.cfg, self.cursor.get("model"))
+        eff, trigger = self._thresholds()
         pct = self.cursor.get("current", 0) / eff["context_window"]
         req_generation = generation_key(current_generation)
         # One override per generation regardless of request-id churn.  A file
@@ -1620,8 +1633,7 @@ class Watcher:
         request_id = pending_request_id(self.request_history,
                                         self.consumed_request_generations,
                                         req_generation)
-        if pct < trigger_for(self.cfg, self.cursor.get("model")) \
-                and request_id is None:
+        if pct < trigger and request_id is None:
             return True, "below_threshold"
         floor = packet_seq(packet)
         # An in-flight packet at creation is foreign unless its boundary is
@@ -1742,10 +1754,10 @@ class Watcher:
                                reason=reason)
                 break
             now = self.monotonic()
-            eff = cm.window_for(self.cfg, self.cursor.get("model"))
+            eff, trigger = self._thresholds()
             pct = self.cursor.get("current", 0) / eff["context_window"]
             interval = self.cfg["managed_poll_s"]
-            if pct < trigger_for(self.cfg, self.cursor.get("model")) - 0.20:
+            if pct < trigger - 0.20:
                 interval = 60
             # Floor keeps an overdue heartbeat from degenerating into a
             # zero-sleep hot loop.
@@ -2220,6 +2232,10 @@ def overview_data(cfg, now=None, sessions_dir=None, proc_root="/proc"):
         # Degrade per-row, never lose the whole readout to one bad
         # state file (verify-round finding).
         try:
+            # sid is the state filename's stem — a path_component fixed
+            # point, so it addresses the same override file the advisor
+            # reads.
+            overrides = cm.session_overrides(cfg, sid)
             eff = cm.window_for(cfg, st.get("model"))
 
             def _stamped_pct(key, fallback):
@@ -2239,6 +2255,15 @@ def overview_data(cfg, now=None, sessions_dir=None, proc_root="/proc"):
             hard = _stamped_pct("eff_hard_pct", eff["hard_pct"])
             trig = _stamped_pct("eff_trigger_pct",
                                 trigger_for(cfg, st.get("model")))
+            # Per-session override keys win over stamps AND derivation:
+            # a mid-session `override` write must read truthfully
+            # immediately, not at the advisor's next restamp (which
+            # converges to the same values).
+            window = overrides.get("context_window", window)
+            soft = overrides.get("soft_pct", soft)
+            hard = overrides.get("hard_pct", hard)
+            soft = min(soft, hard)
+            trig = overrides.get("managed_trigger_pct", trig)
 
             def _token_count(value):
                 # 1e11 ceiling: far above any real token count; huge
@@ -2404,7 +2429,8 @@ def expand_sid(cfg, sid):
              "session-", ".json"),
             (os.path.join(base, "managed", "watchers"),
              "", ".journal.jsonl"),
-            (os.path.join(base, "state"), "", ".json")):
+            (os.path.join(base, "state"), "", ".json"),
+            (os.path.join(base, "overrides"), "", ".json")):
         try:
             names = os.listdir(directory)
         except OSError:
@@ -2435,6 +2461,49 @@ def expand_sid(cfg, sid):
     return sid, None
 
 
+_OVERRIDE_KEYMAP = {"trigger": "managed_trigger_pct", "soft": "soft_pct",
+                    "hard": "hard_pct", "window": "context_window"}
+
+
+def _parse_override_assignments(assignments):
+    """key=value args for the override subcommand → validated
+    override-file fragment, or (None, error). The CLI is human-facing,
+    so bad input is loud here — the fail-open silence lives in the
+    readers, not the writer."""
+    out = {}
+    for item in assignments:
+        key, sep, raw = item.partition("=")
+        key = key.strip().lower()
+        if not sep or key not in _OVERRIDE_KEYMAP:
+            return None, ("expected key=value with key one of "
+                          "trigger/soft/hard/window, got %r" % item)
+        raw = raw.strip()
+        if key == "window":
+            try:
+                value = int(raw.replace("_", "").replace(",", ""))
+            except ValueError:
+                return None, ("window must be an integer token count, "
+                              "got %r" % raw)
+            # Same bounds the reader enforces; the ceiling keeps a
+            # huge int from overflowing float math downstream.
+            if not (10_000 <= value <= 1_000_000_000):
+                return None, ("window must land in [10000, 1000000000] "
+                              "tokens, got %r" % raw)
+        else:
+            try:
+                # Exactly one % suffix: "60%%" is a typo, not 60%.
+                value = float(raw[:-1] if raw.endswith("%") else raw)
+            except ValueError:
+                return None, "%s must be a percentage, got %r" % (key, raw)
+            if raw.endswith("%") or value > 1:
+                value /= 100.0
+            if not (0 < value <= 1):
+                return None, ("%s must land in (0%%, 100%%], got %r"
+                              % (key, item))
+        out[_OVERRIDE_KEYMAP[key]] = value
+    return out, None
+
+
 def cli_main(argv=None, run_tmux=default_run_tmux):
     parser = argparse.ArgumentParser(prog="compact-manager")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2453,6 +2522,15 @@ def cli_main(argv=None, run_tmux=default_run_tmux):
     stop.add_argument("sid")
     resolve = sub.add_parser("resolve")
     resolve.add_argument("sid")
+    override = sub.add_parser(
+        "override",
+        help="per-session threshold overrides (trigger/soft/hard/window)")
+    override.add_argument("sid")
+    override.add_argument("assignments", nargs="*", metavar="key=value",
+                          help="trigger=60%% soft=0.5 hard=55%% "
+                               "window=500000 (any subset; none = show)")
+    override.add_argument("--clear", action="store_true",
+                          help="remove this session's overrides")
     args = parser.parse_args(argv)
     cfg = load_config()
     if args.command == "start":
@@ -2517,6 +2595,69 @@ def cli_main(argv=None, run_tmux=default_run_tmux):
         ok, message = stop_session(cfg, sid)
         print(message)
         return 0 if ok else 1
+    elif args.command == "override":
+        sid, error = expand_sid(cfg, args.sid)
+        if error:
+            print("compact-manager: %s" % error, file=sys.stderr)
+            return 1
+        # path_component canonicalizes (".abcdefgh" and "abcdefgh"
+        # address the same file), so an id-shaped-but-invalid sid could
+        # silently write ANOTHER session's override — reject anything
+        # that is not a valid full session id after prefix expansion.
+        if not _SESSION_ID.fullmatch(sid):
+            print("compact-manager: %r is not a valid session id "
+                  "(or an unambiguous prefix of a known one)" % sid,
+                  file=sys.stderr)
+            return 1
+        path = cm.override_path(cfg, sid)
+        if args.clear:
+            if args.assignments:
+                print("compact-manager: --clear takes no key=value "
+                      "assignments", file=sys.stderr)
+                return 1
+            try:
+                os.remove(path)
+                print("overrides cleared for %s" % sid)
+            except FileNotFoundError:
+                print("no overrides were set for %s" % sid)
+            except OSError as e:
+                print("compact-manager: could not clear %s: %s" % (path, e),
+                      file=sys.stderr)
+                return 1
+        elif args.assignments:
+            fragment, error = _parse_override_assignments(args.assignments)
+            if error:
+                print("compact-manager: %s" % error, file=sys.stderr)
+                return 1
+            merged = dict(cm.session_overrides(cfg, sid))
+            merged.update(fragment)
+            try:
+                _atomic_json(path, merged)
+            except OSError as e:
+                print("compact-manager: could not write %s: %s" % (path, e),
+                      file=sys.stderr)
+                return 1
+        current = cm.session_overrides(cfg, sid)
+        st = {}
+        try:
+            with open(cm.state_paths(cfg, sid)["state"]) as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                st = loaded
+        except Exception:
+            st = {}
+        eff = cm.apply_overrides(cm.window_for(cfg, st.get("model")),
+                                 current)
+        trig = current.get("managed_trigger_pct",
+                           trigger_for(cfg, st.get("model")))
+        print("override file: %s" % (json.dumps(current, sort_keys=True)
+                                     if current else "none"))
+        print("effective now: window=%s  soft=%s  hard=%s  trigger=%s" % (
+            _fmt_grouped(eff["context_window"]), _fmt_pct(eff["soft_pct"]),
+            _fmt_pct(eff["hard_pct"]), _fmt_pct(trig)))
+        print("(the session's readout stamps refresh on its next tool "
+              "call; a running watcher re-reads within one poll)")
+        return 0
     else:
         sid, error = expand_sid(cfg, args.sid)
         if error:
