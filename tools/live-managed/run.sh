@@ -23,6 +23,13 @@
 #   s13 /clear rotates the session id in the same claude process; the
 #       watcher retires with reason=session_rotated (registry-transition
 #       invariant pinned live)
+#   s14 fbeb0bf1 starvation topology: background shell + model request
+#       during a long foreground turn — marker pairs/unpairs, zero
+#       mid-turn keystrokes, STARVATION_ALERT, prompt boundary-lane
+#       submit at turn end
+#   s15 half-typed text under background chrome with the boundary lane
+#       armed: zero keystrokes; submits after the composer clears
+#   s16 queued /compact evidence pin (informational; watcher stopped)
 # Deadline expiry is unit-tested (1h floor makes it impractical live).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -72,9 +79,16 @@ sid_of() {  # newest live session_id from compact-manager status
 pane_of() { tmux list-panes -t "$1" -F '#{pane_id}' | head -1; }
 
 pane_idle() {
+  # Ghost suggestions render as plain text after the composer marker, so
+  # "empty" must come from the SGR-aware parser, not a bare-line regex.
   local cap; cap="$(tmux capture-pane -t "$1" -p 2>/dev/null)" || return 1
   echo "$cap" | grep -q "esc to interrupt" && return 1
-  echo "$cap" | grep -qE "^❯.{0,3}$"
+  tmux capture-pane -t "$1" -p -J -e 2>/dev/null | python3 -c "
+import sys
+sys.path.insert(0, '$ROOT/plugins/compact-manager/hooks')
+import managed
+snap = managed.parse_pane(sys.stdin.read())
+sys.exit(0 if snap['composer'] == 'empty' and not snap['modal'] else 1)"
 }
 
 wait_idle() {  # wait_idle <target> [ceiling-s]
@@ -129,6 +143,7 @@ cat > "$WORK/settings.json" <<EOF
   "hooks": {
     "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "python3 $ROOT/plugins/compact-manager/hooks/advisor.py || true", "timeout": 5}]}],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 $ROOT/plugins/compact-manager/hooks/reorient.py || true", "timeout": 5}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "python3 $ROOT/plugins/compact-manager/hooks/stop_marker.py || true", "timeout": 5}]}],
     "PreCompact": [
       {"matcher": "manual", "hooks": [{"type": "command", "command": "python3 $ROOT/plugins/compact-manager/hooks/precompact.py || true", "timeout": 5}]},
       {"matcher": "auto", "hooks": [{"type": "command", "command": "python3 $ROOT/plugins/compact-manager/hooks/precompact.py || true", "timeout": 5}]}
@@ -137,7 +152,7 @@ cat > "$WORK/settings.json" <<EOF
   }
 }
 EOF
-CLAUDE_LINE="env -u ANTHROPIC_API_KEY COMPACT_MANAGER_MODE=managed COMPACT_MANAGER_STATE_DIR=$STATE COMPACT_MANAGER_CONTEXT_WINDOW=100000 COMPACT_MANAGER_SOFT_PCT=0.10 COMPACT_MANAGER_HARD_PCT=0.15 claude --model haiku --settings $WORK/settings.json --allowedTools Read,Write"
+CLAUDE_LINE="env -u ANTHROPIC_API_KEY COMPACT_MANAGER_MODE=managed COMPACT_MANAGER_STATE_DIR=$STATE COMPACT_MANAGER_CONTEXT_WINDOW=100000 COMPACT_MANAGER_SOFT_PCT=0.10 COMPACT_MANAGER_HARD_PCT=0.15 claude --model haiku --settings $WORK/settings.json --allowedTools Read,Write,Edit,Bash"
 
 accept_trust() {  # first run in a fresh workspace shows the trust dialog
   local deadline=$((SECONDS + 60))
@@ -280,6 +295,160 @@ MSG="$("$CMBIN" resolve "$SID" 2>&1)"; RC=$?
 rm -f "$STATE/packets/$SID.json"
 send_turn $SES "/compact clear the deck" 300 || true
 sleep 10
+
+# --- s14: model request during a busy foreground turn (the fbeb0bf1
+#     starvation topology: background shell chrome + running turn).
+#     Pins: activity marker pairs after a turn and unpairs during one;
+#     no keystrokes while the turn runs; STARVATION_ALERT after 120s;
+#     submission via the turn-boundary lane promptly at the turn end.
+JN="$STATE/managed/watchers/$SID.journal.jsonl"
+send_turn $SES "Use the Bash tool with run_in_background set to true to run this exact command: sleep 400. Then reply with exactly one word: ok" 240 || row s14_bg fail "turn timeout"
+tmux capture-pane -t $SES -p -J -S -100 | grep -qi "background" \
+  && row s14_bg_launched pass \
+  || row s14_bg_launched info "no background-launch text visible (model phrasing varies; marker checks below are the topology gate)"
+ACT_PAIRED="$(python3 - "$STATE" "$SID" <<'EOF'
+import json, os, sys
+state, sid = sys.argv[1], sys.argv[2]
+try:
+    r = json.load(open(os.path.join(state, "managed", "activity", f"running-{sid}.json")))
+    e = json.load(open(os.path.join(state, "managed", "activity", f"ended-{sid}.json")))
+    print("y" if r.get("prompt_id") == e.get("prompt_id") else "n")
+except Exception as exc:
+    print("err:%r" % (exc,))
+EOF
+)"
+[ "$ACT_PAIRED" = y ] && row s14_marker_paired pass \
+  || row s14_marker_paired fail "running/ended pair: $ACT_PAIRED"
+LINES0=$(wc -l < "$JN")
+tmux send-keys -t $SES -l "Use the Bash tool to run exactly this command, waiting for it to complete before replying: sleep 150 && echo done-sleeping. After it completes, reply with exactly one word: slept"; sleep 1; tmux send-keys -t $SES Enter
+sleep 5
+# Request written MID-turn: the watcher must hold it to the boundary.
+python3 - "$STATE" "$SID" <<'EOF'
+import json, os, sys
+state, sid = sys.argv[1], sys.argv[2]
+path = os.path.join(state, "managed", "requests", f"{sid}.json")
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+json.dump({"request_id": "live-s14-request"}, open(tmp, "w"))
+os.replace(tmp, path)
+EOF
+act_unpaired() { python3 - "$STATE" "$SID" <<'EOF'
+import json, os, sys
+state, sid = sys.argv[1], sys.argv[2]
+try:
+    r = json.load(open(os.path.join(state, "managed", "activity", f"running-{sid}.json")))
+    e = json.load(open(os.path.join(state, "managed", "activity", f"ended-{sid}.json")))
+    sys.exit(0 if r.get("prompt_id") != e.get("prompt_id") else 1)
+except Exception:
+    sys.exit(1)
+EOF
+}
+if wait_for 60 act_unpaired; then
+  row s14_marker_running pass
+else
+  row s14_marker_running fail "markers never unpaired during the long turn"
+fi
+sleep 90   # deep into the turn: >= STARVATION_ALERT_S with request pending
+# The mid-turn pins are meaningful only if the model actually kept the
+# turn running (haiku sometimes answers instead of sleeping): gate on
+# the topology still holding at assertion time.
+if act_unpaired; then
+  S14="$(tail -n +$((LINES0+1)) "$JN")"
+  if echo "$S14" | grep -qE '"state":"(PREPARED|TYPED_VERIFIED|SUBMITTED)"'; then
+    row s14_no_mid_turn_typing fail "typed during running turn"
+  else
+    row s14_no_mid_turn_typing pass "deferred while foreground ran"
+  fi
+  s14_alert() { tail -n +$((LINES0+1)) "$JN" | grep -q '"state":"STARVATION_ALERT"'; }
+  wait_for 40 s14_alert && row s14_starvation_alert pass \
+    || row s14_starvation_alert fail "no STARVATION_ALERT while request pending"
+else
+  S14="$(tail -n +$((LINES0+1)) "$JN")"
+  if echo "$S14" | grep -q '"reason":"R2_activity_running"'; then
+    row s14_no_mid_turn_typing pass "activity-running defers observed before early turn end"
+  else
+    row s14_no_mid_turn_typing info "turn ended early (model did not sleep); mid-turn window not achieved"
+  fi
+  row s14_starvation_alert info "not applicable: turn ended before the starvation window"
+fi
+s14_submitted() { tail -n +$((LINES0+1)) "$JN" | grep -q '"state":"SUBMITTED"'; }
+if wait_for 120 s14_submitted; then
+  LANE="$(tail -n +$((LINES0+1)) "$JN" | grep '"state":"PREPARED"' | tail -1 | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("lane"))')"
+  row s14_submits_at_boundary pass "lane=$LANE"
+  # The topology is meant to force the boundary lane; a strict-lane
+  # submission means the pane momentarily read fully idle — possible,
+  # but flag it so a silently-disabled lane can't hide behind strict.
+  [ "$LANE" = boundary ] && row s14_lane pass \
+    || row s14_lane info "submitted via lane=$LANE (boundary not exercised this run)"
+else
+  row s14_submits_at_boundary fail "no submit within 120s of turn end: $(tail -3 "$JN" | tr '\n' ' ')"
+fi
+s14_confirmed() { tail -n +$((LINES0+1)) "$JN" | grep -q '"state":"BOUNDARY_CONFIRMED"'; }
+wait_for 240 s14_confirmed && row s14_boundary pass \
+  || row s14_boundary fail "no boundary: $(tail -3 "$JN" | tr '\n' ' ')"
+wait_idle $SES 120 || true
+
+# --- s15: half-typed text under background chrome still gets zero
+#     keystrokes even with the boundary lane armed (request pending).
+LINES0=$(wc -l < "$JN")
+tmux send-keys -t $SES -l "harness half-typed boundary lane do not submit"
+sleep 2
+python3 - "$STATE" "$SID" <<'EOF'
+import json, os, sys
+state, sid = sys.argv[1], sys.argv[2]
+path = os.path.join(state, "managed", "requests", f"{sid}.json")
+tmp = path + ".tmp"
+json.dump({"request_id": "live-s15-request"}, open(tmp, "w"))
+os.replace(tmp, path)
+EOF
+sleep 30
+CAP="$(tmux capture-pane -t $SES -p -J | grep '^❯' | tail -1)"
+if echo "$CAP" | grep -qF "harness half-typed boundary lane do not submit" && ! echo "$CAP" | grep -q "/compact"; then
+  row s15_half_typed_boundary pass "composer intact"
+else
+  row s15_half_typed_boundary fail "composer: $CAP"
+fi
+tmux send-keys -t $SES C-u; sleep 1
+s15_submitted() { tail -n +$((LINES0+1)) "$JN" | grep -q '"state":"SUBMITTED"'; }
+wait_for 180 s15_submitted && row s15_resume pass "submitted after clear" \
+  || row s15_resume fail "states: $(tail -3 "$JN" | tr '\n' ' ')"
+s15_confirmed() { tail -n +$((LINES0+1)) "$JN" | grep -q '"state":"BOUNDARY_CONFIRMED"'; }
+wait_for 240 s15_confirmed || row s15_boundary info "boundary still pending at scenario end"
+wait_idle $SES 120 || true
+
+# --- s16: queued /compact evidence pin (Sol: prerequisite for any
+#     future unattended queue fallback — NOT shipped behavior). Watcher
+#     stopped; harness types /compact mid-turn and records what Claude
+#     Code does with it. Outcome rows are informational either way.
+"$CMBIN" stop "$SID" >/dev/null 2>&1; sleep 2
+"$CMBIN" status 2>/dev/null | python3 -c 'import json,sys; rows=json.load(sys.stdin); sys.exit(1 if any(r.get("live") for r in rows) else 0)' \
+  || row s16_stop fail "a live watcher survived the stop"
+SEQ0="$(python3 -c 'import json,sys,glob; f=glob.glob(sys.argv[1]); print(json.load(open(f[0])).get("seq",0) if f else 0)' "$STATE/packets/$SID.json")"
+tmux send-keys -t $SES -l "Run in the foreground (not background): sleep 20. Then reply with exactly one word: rested"; sleep 1; tmux send-keys -t $SES Enter
+sleep 6
+ACT_S16="$(python3 - "$STATE" "$SID" <<'EOF'
+import json, os, sys
+state, sid = sys.argv[1], sys.argv[2]
+try:
+    r = json.load(open(os.path.join(state, "managed", "activity", f"running-{sid}.json")))
+    e = json.load(open(os.path.join(state, "managed", "activity", f"ended-{sid}.json")))
+    print("unpaired" if r.get("prompt_id") != e.get("prompt_id") else "paired")
+except Exception as exc:
+    print("err:%r" % (exc,))
+EOF
+)"
+[ "$ACT_S16" = unpaired ] || row s16_mid_turn info "turn not provably mid-flight at injection ($ACT_S16); outcome may reflect idle submission"
+tmux send-keys -t $SES -l "/compact queued mid-turn pin"; sleep 1; tmux send-keys -t $SES Enter
+s16_packet() { python3 -c 'import json,sys,glob; f=glob.glob(sys.argv[1]); sys.exit(0 if f and json.load(open(f[0])).get("seq",0) == int(sys.argv[2]) + 1 and json.load(open(f[0])).get("trigger") == "manual" else 1)' "$STATE/packets/$SID.json" "$SEQ0"; }
+if wait_for 300 s16_packet; then
+  row s16_queued_compact info "queued /compact produced exactly one manual packet (seq $SEQ0 -> $((SEQ0+1)))"
+else
+  row s16_queued_compact info "no manual packet within 300s; queued /compact NOT usable as a fallback (packet: $(cat "$STATE/packets/$SID.json" 2>/dev/null | head -c 200))"
+fi
+wait_idle $SES 180 || true
+MSG="$(adopt "$PANE" COMPACT_MANAGER_MANAGED_TRIGGER_PCT=0.99)"; RC=$?
+WPID="$(echo "$MSG" | grep -o 'pid=[0-9]*' | cut -d= -f2)"
+[ $RC -eq 0 ] || row s16_readopt fail "rc=$RC $MSG"
 
 # --- s10: TYPED_VERIFIED crash tail -> SUBMISSION_UNCERTAIN -> resolve flow
 "$CMBIN" stop "$SID" >/dev/null 2>&1; sleep 2

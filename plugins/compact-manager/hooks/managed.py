@@ -40,7 +40,9 @@ ATTEMPT_STATES = {
     "SUBMISSION_UNCERTAIN", "CLEANUP_REQUIRED",
 }
 ALERT_STATES = {"LATCHED", "SUBMISSION_UNCERTAIN", "CLEANUP_REQUIRED"}
-LIFECYCLE_STATES = {"WATCHER_READY", "ALERT_DELIVERY", "WATCHER_RETIRED"}
+LIFECYCLE_STATES = {"WATCHER_READY", "ALERT_DELIVERY", "WATCHER_RETIRED",
+                    "STARVATION_ALERT"}
+STARVATION_ALERT_S = 120.0
 INSTRUCTION_TEMPLATE = ("/compact [cm-{nonce}] Preserve the task list and "
                         "open decisions to the handoff file")
 INSTRUCTION_DENYLIST = ";&|><()\"'$`\n\r"
@@ -921,6 +923,14 @@ def journal_record(path, state, attempt, now_wall=None, **extra):
         "nonces": list(attempt.get("nonces", [])),
         "latch_kind": attempt.get("latch_kind"),
         "latch_tokens": attempt.get("latch_tokens"),
+        # Without this, recovery loses the request/threshold distinction
+        # and a recovered request attempt would drop out of the
+        # turn-boundary lane (Sol round-1 finding).
+        "trigger_source": attempt.get("trigger_source", "threshold"),
+        "lane": attempt.get("lane"),
+        "defer_class": attempt.get("defer_class"),
+        "activity_rev_at_defer": attempt.get("activity_rev_at_defer"),
+        "starvation_alerted": bool(attempt.get("starvation_alerted")),
         "timers": dict(attempt.get("timers", {})),
     }
     record.update(extra)
@@ -1146,58 +1156,317 @@ def composer_idle(capture):
     return _composer_line(capture) == "❯\u00a0"
 
 
-def composer_exact(capture, text):
-    return _composer_line(capture) == "❯\u00a0" + text
-
-
-def capture_pane(binding, run_tmux=default_run_tmux):
+def capture_pane(binding, run_tmux=default_run_tmux, ansi=False):
+    args = ["capture-pane", "-p", "-J"]
+    if ansi:
+        args.append("-e")
     rc, out, _ = _result(run_tmux(_tmux(
-        binding["socket"], ["capture-pane", "-p", "-J", "-t",
-                            binding["pane_id"]])))
+        binding["socket"], args + ["-t", binding["pane_id"]])))
     return out if rc == 0 else None
+
+
+_CSI_PARAM = "0123456789;:"
+# A permission/selection modal's cursor row is "❯ 1. Yes" -- ASCII
+# space, not NBSP (pinned live 2026-08-18) -- but reject the whole
+# layout, not just that row: a modal can leave a stale composer visible
+# elsewhere.
+# Requires leading indentation: the live modal cursor row renders
+# indented, while a history echo of a prompt that BEGINS with "1. "
+# renders at column 0 — matching that would permanently starve the
+# watcher behind a false modal (audit finding).
+_MODAL_ROW = re.compile("^\\s+❯ \\d+\\.\\s")
+
+
+def _strip_ansi_line(raw):
+    """(plain, per-char dim flags, unknown). Interprets ONLY SGR (CSI
+    ... 'm'); any other escape sequence marks the line unknown -- UI
+    drift must classify as unparseable, never be regex-generalized
+    past (Sol round-2)."""
+    plain, dim_flags = [], []
+    dim = False
+    unknown = False
+    i, n = 0, len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "\x1b":
+            if raw[i + 1:i + 2] == "[":
+                j = i + 2
+                while j < n and raw[j] in _CSI_PARAM:
+                    j += 1
+                if j < n and raw[j] == "m":
+                    params = raw[i + 2:j].split(";")
+                    k = 0
+                    while k < len(params):
+                        param = params[k]
+                        # SGR 0/"" reset and 22 end dim; 2 starts it.
+                        # 38/48/58 take grouped color operands (5;n or
+                        # 2;r;g;b) whose literal 2/5/0 values are NOT
+                        # opcodes — treating them as such classified
+                        # colored typed text as dim (audit blocker).
+                        if param in ("", "0"):
+                            dim = False
+                            k += 1
+                        elif param == "2":
+                            dim = True
+                            k += 1
+                        elif param == "22":
+                            dim = False
+                            k += 1
+                        elif param in ("38", "48", "58"):
+                            # Operands must actually be present:
+                            # "38;5" or "38;2;r;g" truncations are
+                            # ambiguous and must fail closed (round-2
+                            # audit: ESC[2;38;5m classified typed text
+                            # as empty).
+                            if (k + 2 < len(params) and
+                                    params[k + 1] == "5" and
+                                    params[k + 2].isdigit()):
+                                k += 3
+                            elif (k + 4 < len(params) and
+                                    params[k + 1] == "2" and
+                                    all(p.isdigit()
+                                        for p in params[k + 2:k + 5])):
+                                k += 5
+                            else:
+                                unknown = True
+                                k = len(params)
+                        else:
+                            # Colon-form tokens ("38:5:2") are single
+                            # self-contained tokens that cannot alter
+                            # dim state; everything else is a non-dim
+                            # attribute.
+                            k += 1
+                    i = j + 1
+                    continue
+                unknown = True
+                i = j + 1 if j < n else n
+                continue
+            unknown = True
+            if raw[i + 1:i + 2] in ("]", "P"):
+                # OSC/DCS: swallow the body to BEL or ST so hyperlink
+                # payloads don't leak into the plain text (the line is
+                # already unknown; this only keeps plain deterministic
+                # and free of address noise).
+                j = i + 2
+                while j < n and raw[j] != "\x07" and \
+                        raw[j:j + 2] != "\x1b\\":
+                    j += 1
+                i = j + (2 if raw[j:j + 2] == "\x1b\\" else 1)
+                continue
+            i += 2
+            continue
+        if ch in ("\x9b", "\x90", "\x9d"):
+            unknown = True
+            i += 1
+            continue
+        plain.append(ch)
+        dim_flags.append(dim)
+        i += 1
+    return "".join(plain), dim_flags, unknown
+
+
+def parse_pane(ansi_capture):
+    """Bottom-anchored structured parse of ONE coherent -J -e snapshot.
+    composer: "empty" (bare composer marker, or marker followed only by
+    whitespace and DIM ghost-suggestion text -- pinned live 2026-08-18:
+    suggestions render ESC[2m-wrapped per word and are byte-identical
+    to typed text once stripped), "nonempty" (any non-dim
+    non-whitespace character after the NBSP -- real typed input),
+    "absent", or "unknown" (unparseable escapes, or a last-marker line
+    without the NBSP signature)."""
+    plain_lines, parsed = [], []
+    for raw in ansi_capture.splitlines():
+        plain, dim_flags, unknown = _strip_ansi_line(raw)
+        plain_lines.append(plain)
+        parsed.append((plain, dim_flags, unknown))
+    out = {"modal": any(_MODAL_ROW.match(p) for p in plain_lines),
+           "plain": "\n".join(plain_lines),
+           "row": None, "text": None, "composer": "absent"}
+    for idx in range(len(plain_lines) - 1, -1, -1):
+        if plain_lines[idx].startswith("❯"):
+            out["row"] = idx
+            break
+    if out["row"] is None:
+        return out
+    plain, dim_flags, unknown = parsed[out["row"]]
+    out["text"] = plain.rstrip("\r ")
+    if unknown:
+        out["composer"] = "unknown"
+        return out
+    if not plain.startswith("❯ "):
+        out["composer"] = "unknown"
+        return out
+    for ch, dim in zip(plain[2:], dim_flags[2:]):
+        if ch not in " \r" and not dim:
+            out["composer"] = "nonempty"
+            return out
+    out["composer"] = "empty"
+    return out
+
+
+def snapshot_exact(snapshot, text):
+    """R5/R6' typed-text verification on the bottom-anchored composer:
+    exact instruction, known layout, no modal."""
+    return (snapshot is not None and not snapshot["modal"] and
+            snapshot["composer"] != "unknown" and
+            snapshot["text"] == "❯ " + text)
+
+
+def _projection(snapshot, dims):
+    """Safety-critical regions only: harmless background repaint
+    (spinners, elapsed counters, footer chrome) must not veto the
+    boundary lane the way the whole-pane digest did (the live
+    R3_changed defer in fbeb0bf1)."""
+    return (snapshot["text"], snapshot["row"], snapshot["composer"],
+            snapshot["modal"], dims)
 
 
 def ladder_preflight(binding, cfg, paths, run_tmux=default_run_tmux,
                      proc_root="/proc", wait=lambda seconds: time.sleep(seconds),
-                     sessions_dir=None):
+                     sessions_dir=None, boundary_ok=False,
+                     activity_reader=None, now_wall=time.time):
+    """R1-R3 with two authorization lanes.
+
+    strict: the original hook-independent contract — exact-empty
+    composer, no busy chrome anywhere, whole-(plain-)pane stability.
+
+    boundary: only for request-triggered or >=hard attempts
+    (boundary_ok).  Accepts an input-empty composer while background
+    chrome stays busy, proven by the paired activity marker (foreground
+    turn ended) plus a safety projection that ignores volatile
+    background repaint.  The fbeb0bf1 starvation fix.
+
+    Returns (ok, reason, defer_class, lane, activity_rev)."""
     ok, facts = validate_binding(binding, cfg, paths, run_tmux, proc_root,
                                  sessions_dir=sessions_dir)
     if not ok:
-        return False, "R1_%s" % facts
-    first = capture_pane(binding, run_tmux)
+        return False, "R1_%s" % facts, "structural", None, None
+    activity = ("unknown", None)
+    if activity_reader is not None:
+        activity = activity_reader()
+    first = capture_pane(binding, run_tmux, ansi=True)
     leases_ok, leases_reason = validate_binding(
         binding, cfg, paths, run_tmux, proc_root, sessions_dir=sessions_dir)
     if not leases_ok:
-        return False, "R2_%s" % leases_reason
-    if first is None or not composer_idle(first):
-        return False, "R2_not_idle"
-    dimensions = (facts["width"], facts["height"])
-    digest = hashlib.sha256(first.encode()).digest()
-    wait(cfg["managed_stable_ms"] / 1000.0)
-    second = capture_pane(binding, run_tmux)
+        return False, "R2_%s" % leases_reason, "structural", None, None
+    if first is None:
+        return False, "R2_capture_failed", "structural", None, None
+    snap1 = parse_pane(first)
+    # The modal veto applies to BOTH lanes: a selection modal's Enter
+    # semantics are unknown, and a stale composer may sit underneath.
+    # So does an AFFIRMATIVE running marker: mid-generation the
+    # composer is byte-identical to idle and "esc to interrupt"
+    # flickers off, so two quiet strict captures can align inside a
+    # running turn (audit blocker). Only positive evidence vetoes —
+    # sessions whose hooks never wrote markers read "unknown" and keep
+    # the original hook-independent strict contract.
+    strict1 = (composer_idle(snap1["plain"]) and not snap1["modal"] and
+               activity[0] != "running")
+    boundary1 = False
+    boundary_block = None
+    if boundary_ok:
+        if activity[0] != "ended":
+            boundary_block = "activity_%s" % activity[0]
+        elif now_wall() - activity[1][3] < 1.0:
+            boundary_block = "activity_unsettled"
+        elif snap1["modal"]:
+            boundary_block = "modal"
+        elif snap1["composer"] == "empty":
+            boundary1 = True
+        else:
+            boundary_block = "composer_%s" % snap1["composer"]
+    if not strict1 and not boundary1:
+        if boundary_block:
+            reason = "R2_%s" % boundary_block
+        elif snap1["modal"]:
+            reason = "R2_modal"
+        elif activity[0] == "running":
+            reason = "R2_activity_running"
+        else:
+            reason = "R2_not_idle"
+        return False, reason, "opportunity", None, None
+    dims = (facts["width"], facts["height"])
+    digest = hashlib.sha256(snap1["plain"].encode()).digest()
+    proj1 = _projection(snap1, dims)
+    stable_ms = cfg["managed_stable_ms"]
+    if boundary1:
+        # The boundary lane's stability window is its substitute for
+        # whole-pane quiet; do not let a tiny configured window weaken it.
+        stable_ms = max(stable_ms, 500)
+    wait(stable_ms / 1000.0)
+    second = capture_pane(binding, run_tmux, ansi=True)
     ok, facts2 = validate_binding(binding, cfg, paths, run_tmux, proc_root,
                                   sessions_dir=sessions_dir)
     if not ok:
-        return False, "R3_%s" % facts2
-    if (second is None or hashlib.sha256(second.encode()).digest() != digest or
-            (facts2["width"], facts2["height"]) != dimensions):
-        return False, "R3_changed"
-    return True, "ready"
+        return False, "R3_%s" % facts2, "structural", None, None
+    if second is None:
+        return False, "R3_capture_failed", "structural", None, None
+    if (facts2["width"], facts2["height"]) != dims:
+        return False, "R3_dimension_changed", "structural", None, None
+    snap2 = parse_pane(second)
+    if (strict1 and composer_idle(snap2["plain"]) and not snap2["modal"] and
+            hashlib.sha256(snap2["plain"].encode()).digest() == digest):
+        if activity_reader is not None and activity_reader()[0] == "running":
+            return False, "R3_activity_running", "opportunity", None, None
+        return True, "ready", None, "strict", activity[1]
+    if boundary1:
+        check = activity_reader()
+        if (check[0] == "ended" and check[1] == activity[1] and
+                _projection(snap2, dims) == proj1):
+            return True, "ready", None, "boundary", activity[1]
+    return False, "R3_changed", "opportunity", None, None
+
+
+def _activity_unchanged(activity_reader, activity_rev):
+    """The boundary lane's evidence must be the SAME ended turn at every
+    later rail; any revision change means a prompt started or evidence
+    decayed (Sol round-2: re-read immediately before R4 and at R6')."""
+    check = activity_reader()
+    return check[0] == "ended" and check[1] == activity_rev
+
+
+def _boundary_still_safe(binding, run_tmux, activity_reader, activity_rev):
+    """Pre-R4 revalidation: same ended turn AND a still-input-safe,
+    still-empty composer at the moment before the first typed byte.
+    (At R6' the typed-text snapshot already proves the layout; only the
+    activity revision needs re-proving there.)"""
+    capture = capture_pane(binding, run_tmux, ansi=True)
+    if capture is None:
+        return False
+    snap = parse_pane(capture)
+    if snap["modal"] or snap["composer"] != "empty":
+        return False
+    # Marker read LAST — as close to the first typed byte as possible,
+    # so a prompt submitted after the capture still skews the revision
+    # (audit blocker: marker-before-capture ordering).
+    return _activity_unchanged(activity_reader, activity_rev)
 
 
 def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
                packet_loader, run_tmux=default_run_tmux, proc_root="/proc",
                wait=lambda seconds: time.sleep(seconds), now_mono=time.monotonic,
-               sessions_dir=None):
+               sessions_dir=None, boundary_ok=False, activity_reader=None,
+               now_wall=time.time):
     """Execute R1-R6'.  Never sends a clearing key."""
-    ok, reason = ladder_preflight(binding, cfg, paths, run_tmux, proc_root, wait,
-                                  sessions_dir=sessions_dir)
+    ok, reason, defer_class, lane, activity_rev = ladder_preflight(
+        binding, cfg, paths, run_tmux, proc_root, wait,
+        sessions_dir=sessions_dir, boundary_ok=boundary_ok,
+        activity_reader=activity_reader, now_wall=now_wall)
     if not ok:
-        return dict(attempt, state="DEFERRED", reason=reason)
+        return dict(attempt, state="DEFERRED", reason=reason,
+                    defer_class=defer_class)
+    attempt = dict(attempt, lane=lane)
     ok, reason = validate_binding(binding, cfg, paths, run_tmux, proc_root,
                                   sessions_dir=sessions_dir)
     if not ok:
-        return dict(attempt, state="DEFERRED", reason="R4_%s" % reason)
+        return dict(attempt, state="DEFERRED", reason="R4_%s" % reason,
+                    defer_class="structural")
+    if lane == "boundary" and not _boundary_still_safe(
+            binding, run_tmux, activity_reader, activity_rev):
+        # Still pre-typing: a new prompt or modal appearing after the
+        # preflight is an input opportunity that closed, not a hazard.
+        return dict(attempt, state="DEFERRED", reason="R4_boundary_changed",
+                    defer_class="opportunity")
     attempt = transition_attempt(attempt, "prepared", now_mono(), cfg)
     journal_record(journal_path, "PREPARED", attempt)
     text = instruction_text(attempt["nonce"])
@@ -1209,10 +1478,11 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
                        reason=attempt["reason"])
         return attempt
     wait(0.4)
-    capture = capture_pane(binding, run_tmux)
+    capture = capture_pane(binding, run_tmux, ansi=True)
+    snap = parse_pane(capture) if capture is not None else None
     ok, reason = validate_binding(binding, cfg, paths, run_tmux, proc_root,
                                   sessions_dir=sessions_dir)
-    if not ok or capture is None or not composer_exact(capture, text):
+    if not ok or not snapshot_exact(snap, text):
         detail = reason if not ok else "composer_mismatch"
         attempt.update(state="CLEANUP_REQUIRED", reason="R5_%s" % detail)
         journal_record(journal_path, "CLEANUP_REQUIRED", attempt,
@@ -1222,7 +1492,8 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
     journal_record(journal_path, "TYPED_VERIFIED", attempt)
     ok, why = validate_binding(binding, cfg, paths, run_tmux, proc_root,
                                sessions_dir=sessions_dir)
-    capture = capture_pane(binding, run_tmux)
+    capture = capture_pane(binding, run_tmux, ansi=True)
+    snap = parse_pane(capture) if capture is not None else None
     packet = packet_loader()
     # R6' re-OBSERVES the transcript rather than trusting the tick's
     # cursor (which is stale by the whole ladder duration), and uses the
@@ -1240,11 +1511,14 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
                             fresh.get("caught_up") and
                             generation_key(generation(fresh)) ==
                             generation_key(attempt["generation"]))
-    if (not ok or capture is None or not composer_exact(capture, text) or
-            classification != "NONE" or not generation_unchanged):
+    boundary_safe = (lane != "boundary" or _activity_unchanged(
+        activity_reader, activity_rev))
+    if (not ok or not snapshot_exact(snap, text) or
+            classification != "NONE" or not generation_unchanged or
+            not boundary_safe):
         if not ok:
             detail = str(why)
-        elif capture is None or not composer_exact(capture, text):
+        elif not snapshot_exact(snap, text):
             detail = "composer_mismatch"
         elif classification == "OWN":
             detail = "own_packet_late"
@@ -1254,6 +1528,8 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
             detail = "scan_unavailable"
         elif not fresh.get("caught_up"):
             detail = "scan_incomplete"
+        elif not boundary_safe:
+            detail = "activity_changed"
         else:
             detail = "boundary_advanced"
         attempt.update(state="CLEANUP_REQUIRED", reason="R6_prime_%s" % detail)
@@ -1272,12 +1548,13 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
     attempt = transition_attempt(attempt, "submitted", now_mono(), cfg)
     journal_record(journal_path, "SUBMITTED", attempt)
     wait(1.0)
-    after = capture_pane(binding, run_tmux)
+    after = capture_pane(binding, run_tmux, ansi=True)
+    snap_after = parse_pane(after) if after is not None else None
     if after is None:
         attempt.update(state="SUBMISSION_UNCERTAIN", reason="submit_unverifiable")
         journal_record(journal_path, "SUBMISSION_UNCERTAIN", attempt,
                        reason=attempt["reason"])
-    elif composer_exact(after, text):
+    elif snapshot_exact(snap_after, text):
         attempt.update(state="SUBMISSION_UNCERTAIN", reason="composer_not_cleared")
         journal_record(journal_path, "SUBMISSION_UNCERTAIN", attempt,
                        reason=attempt["reason"])
@@ -1311,6 +1588,155 @@ def validate_request(path, now=None):
         return {"request_id": request_id, "receipt_mtime": info.st_mtime}
     except Exception:
         return None
+
+
+ACTIVITY_MAX_BYTES = 4096
+_PROMPT_ID = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+
+
+def activity_paths(cfg, session_id):
+    sid = cm.path_component(session_id)
+    base = os.path.join(cfg["state_dir"], "managed", "activity")
+    return {"running": os.path.join(base, "running-%s.json" % sid),
+            "ended": os.path.join(base, "ended-%s.json" % sid)}
+
+
+def write_activity(cfg, payload, phase):
+    """Hook-side half of the paired turn marker: UserPromptSubmit writes
+    running-<sid>.json, Stop writes ended-<sid>.json.  Each hook owns
+    exactly one file and never reads the other, so no lock is needed —
+    the pairing (ended iff ended.prompt_id == running.prompt_id) happens
+    at watcher read time, where a stale Stop simply fails to pair.
+    Callers are fail-open; a refused write leaves the lane unavailable,
+    never authorizes it."""
+    if phase not in ("running", "ended"):
+        return False
+    session_id = payload.get("session_id")
+    prompt_id = payload.get("prompt_id")
+    transcript = payload.get("transcript_path")
+    if not (isinstance(session_id, str) and _SESSION_ID.match(session_id)):
+        return False
+    if not (isinstance(prompt_id, str) and _PROMPT_ID.match(prompt_id)):
+        return False
+    if not isinstance(transcript, str) or not transcript:
+        return False
+    device = inode = None
+    try:
+        info = os.stat(transcript)
+        device, inode = info.st_dev, info.st_ino
+    except OSError:
+        pass
+    record = {
+        "schema": SCHEMA, "session_id": session_id, "prompt_id": prompt_id,
+        "transcript_path": transcript, "transcript_device": device,
+        "transcript_inode": inode, "written_at": time.time()}
+    if phase == "ended":
+        # Diagnostic only: a co-installed BLOCKING Stop hook can force
+        # the turn to continue after this write, making the pair read
+        # "ended" during live generation — a documented boundary-lane
+        # limitation no marker protocol can self-detect (audit 6eb959e).
+        record["stop_hook_active"] = bool(payload.get("stop_hook_active"))
+    _atomic_json(activity_paths(cfg, session_id)[phase], record)
+    return True
+
+
+def _read_activity_file(path, session_id, now):
+    try:
+        info = os.lstat(path)
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or
+                info.st_size > ACTIVITY_MAX_BYTES):
+            return None
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            raw = os.read(fd, ACTIVITY_MAX_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > ACTIVITY_MAX_BYTES:
+            return None
+        value = json.loads(raw)
+        if not isinstance(value, dict) or value.get("schema") != SCHEMA:
+            return None
+        if value.get("session_id") != session_id:
+            return None
+        prompt_id = value.get("prompt_id")
+        if not (isinstance(prompt_id, str) and _PROMPT_ID.match(prompt_id)):
+            return None
+        written_at = value.get("written_at")
+        if (not isinstance(written_at, (int, float)) or
+                isinstance(written_at, bool) or not math.isfinite(written_at)):
+            return None
+        if written_at > now + 30:
+            return None
+        if not isinstance(value.get("transcript_path"), str):
+            return None
+        return value
+    except Exception:
+        return None
+
+
+def read_activity(cfg, session_id, transcript_path, now=None):
+    """Watcher-side pairing, three-valued.
+
+    ("ended", revision) — a coherent, identity-bound running/ended pair
+    proves the foreground turn ended for THIS session and transcript.
+    ("running", None) — valid marker evidence AFFIRMATIVELY shows a
+    turn in flight (unpaired running, or ended older than running):
+    used to veto even the strict lane, since an empty composer is
+    byte-identical mid-generation (audit blocker).
+    ("unknown", None) — missing, corrupt, mismatched, torn, or
+    future-dated evidence: never authorizes anything.
+
+    The re-read of running after ended linearizes the two lock-free
+    files: a new prompt landing between the reads skews the re-read
+    and degrades the result (audit blocker: torn A/A read after B
+    installed).  No max age on ended: it is semantic state, not a
+    freshness lease (Sol round-2/3)."""
+    now = time.time() if now is None else now
+    paths = activity_paths(cfg, session_id)
+    running = _read_activity_file(paths["running"], session_id, now)
+    ended = _read_activity_file(paths["ended"], session_id, now)
+    running2 = _read_activity_file(paths["running"], session_id, now)
+    if running is None or running2 is None:
+        return "unknown", None
+    coherent = (running2["prompt_id"] == running["prompt_id"] and
+                running2["written_at"] == running["written_at"])
+    try:
+        info = os.stat(transcript_path)
+        identity = (info.st_dev, info.st_ino)
+    except OSError:
+        return "unknown", None
+
+    def bound(record):
+        # Identity must be present AND match: a record stat'd before
+        # the transcript existed carries (None, None) and is not
+        # acceptable PAIRING evidence (audit major).
+        return (record.get("transcript_path") == transcript_path and
+                (record.get("transcript_device"),
+                 record.get("transcript_inode")) == identity)
+
+    if not coherent:
+        return "unknown", None
+    running_identity = (running.get("transcript_device"),
+                        running.get("transcript_inode"))
+    if running.get("transcript_path") != transcript_path:
+        return "unknown", None
+    if running_identity != (None, None) and running_identity != identity:
+        # Positively mismatched running identity: stale evidence from a
+        # replaced transcript — trust nothing.
+        return "unknown", None
+    # From here the running half is trustworthy: bound, or identity-less
+    # because the FIRST prompt's hook fired before the transcript file
+    # existed (round-2 audit blocker: calling that "unknown" let the
+    # strict lane type mid-first-turn, and starved the lane until a
+    # second prompt). Weak identity is acceptable for the VETO side;
+    # pairing to "ended" still demands a fully bound ended half.
+    if ended is None or not bound(ended):
+        return "running", None
+    if (ended["prompt_id"] != running["prompt_id"] or
+            ended["written_at"] < running["written_at"]):
+        return "running", None
+    return "ended", (running["prompt_id"], running["written_at"],
+                     ended["prompt_id"], ended["written_at"])
 
 
 def request_fingerprint(generation_value, request_id):
@@ -1451,6 +1877,7 @@ class Watcher:
         if self.attempt and self.attempt.get("state") == "TRIGGERED":
             self.attempt["state"] = "DEFERRED"
             self.attempt["reason"] = reason
+            self.attempt["defer_class"] = "structural"
             self.attempt.setdefault("timers", {})["next_attempt_at"] = (
                 now + self.backoff)
             journal_record(self.paths["journal"], "DEFERRED",
@@ -1574,6 +2001,24 @@ class Watcher:
                 self.attempt = None
             elif self.attempt.get("state") == "LATCHED":
                 if self.attempt.get("latch_kind") == "THRESHOLD":
+                    # An explicit model request is NEW intent (a fresh
+                    # handoff was just written): it must override the
+                    # anti-churn latch, or the request starves until
+                    # the re-arm band fills (live-suite catch: a
+                    # REQUEST_OBSERVED during still_above_rearm_band
+                    # was ignored for 250+ seconds).
+                    if pending_request_id(
+                            self.request_history,
+                            self.consumed_request_generations,
+                            generation_key(current_generation)) is not None:
+                        self.attempt = transition_attempt(
+                            self.attempt, "pct_rearmed", now, self.cfg,
+                            generation_value=current_generation)
+                        journal_record(self.paths["journal"], "READY",
+                                       self.attempt,
+                                       reason="request_overrides_latch")
+                        self.attempt = None
+                        return True, "latched"
                     eff, trigger = self._thresholds()
                     window = eff["context_window"]
                     pct = self.cursor.get("current", 0) / window
@@ -1594,34 +2039,18 @@ class Watcher:
                         self.attempt = None
                 return True, "latched"
             elif self.attempt.get("state") in ("SUBMITTED", "ACKED", "DEFERRED"):
+                if self.attempt["state"] == "DEFERRED" and \
+                        self.attempt.get("reason") != "foreign_packet":
+                    self._maybe_starvation_alert(now)
                 if self.attempt["state"] != "DEFERRED" or \
                         self.attempt.get("reason") == "foreign_packet" or \
-                        now < self.attempt.get("timers", {}).get("next_attempt_at", float("inf")):
+                        (now < self.attempt.get("timers", {}).get(
+                            "next_attempt_at", float("inf")) and
+                         not self._activity_advanced()):
                     return True, self.attempt["state"]
                 self.attempt["state"] = "TRIGGERED"
             if self.attempt and self.attempt.get("state") == "TRIGGERED":
-                previous = "TRIGGERED"
-                self.typed_critical = True
-                try:
-                    self.attempt = run_ladder(
-                        self.binding, self.cfg, self.paths, self.attempt,
-                        self.cursor, self.paths["journal"],
-                        lambda: load_layer1_packet(
-                            self.cfg, self.binding["session_id"]),
-                        self.run_tmux, self.proc_root, self.wait,
-                        self.monotonic, sessions_dir=self.sessions_dir)
-                finally:
-                    self.typed_critical = False
-                if self.attempt["state"] == "DEFERRED":
-                    self.attempt["timers"]["next_attempt_at"] = now + self.backoff
-                    self.backoff = min(BACKOFF_MAX_S, self.backoff * 2)
-                    journal_record(self.paths["journal"], "DEFERRED",
-                                   self.attempt,
-                                   reason=self.attempt.get("reason"))
-                self.alert_if_needed(previous)
-                if "lease_lost" in str(self.attempt.get("reason", "")):
-                    return False, "lease_lost_after_r4"
-                return True, self.attempt["state"]
+                return self._execute_attempt(now)
         if not self.cursor.get("caught_up"):
             return True, "catching_up"
         eff, trigger = self._thresholds()
@@ -1658,7 +2087,108 @@ class Watcher:
                                current_generation, request_id))
         else:
             journal_record(self.paths["journal"], "TRIGGERED", self.attempt)
-        previous = self.attempt["state"]
+        return self._execute_attempt(now)
+
+    def _activity_reader(self):
+        return read_activity(self.cfg, self.binding["session_id"],
+                             self.binding["transcript_path"], self.wall())
+
+    def _activity_advanced(self):
+        """A new ended turn marker makes an opportunity-deferred attempt
+        due immediately — the input window just opened, and waiting out
+        next_attempt_at would waste it (Sol round-2)."""
+        if not self.attempt or self.attempt.get("defer_class") != "opportunity":
+            return False
+        stored = self.attempt.get("activity_rev_at_defer")
+        phase, revision = self._activity_reader()
+        if phase != "ended" or revision is None:
+            return False
+        return stored is None or tuple(stored) != revision
+
+    def _boundary_ok(self):
+        """Recomputed on EVERY attempt run from one threshold snapshot:
+        a threshold attempt created below hard is promoted to the
+        turn-boundary lane the moment usage reaches hard, instead of
+        inheriting the strict lane's starvation (Sol round-1)."""
+        eff, _ = self._thresholds()
+        pct = self.cursor.get("current", 0) / eff["context_window"]
+        return (self.attempt.get("trigger_source") == "request" or
+                pct >= eff["hard_pct"])
+
+    def _schedule_defer(self, now):
+        """Reason-aware scheduling: input-opportunity failures retry at
+        the poll cadence — a fleeting composer window must not decay
+        into a five-minute sampler (the fbeb0bf1 starvation); structural
+        failures keep bounded exponential backoff."""
+        if (self._boundary_ok() and
+                "eligible_mono" not in self.attempt.setdefault("timers", {})):
+            # The starvation clock starts at the first eligible defer —
+            # lazy init inside the alert check alone started it one
+            # poll late (round-2 audit).
+            self.attempt["timers"]["eligible_mono"] = now
+        if self.attempt.get("defer_class") == "opportunity":
+            delay = self.cfg["managed_poll_s"]
+            phase, revision = self._activity_reader()
+            self.attempt["activity_rev_at_defer"] = (
+                list(revision) if revision else None)
+        else:
+            delay = self.backoff
+            self.backoff = min(BACKOFF_MAX_S, self.backoff * 2)
+        self.attempt["timers"]["next_attempt_at"] = now + delay
+        journal_record(self.paths["journal"], "DEFERRED", self.attempt,
+                       reason=self.attempt.get("reason"))
+
+    def _maybe_starvation_alert(self, now):
+        """Starvation must not be invisible, but it is attention, not a
+        resolvable hazard latch — safe conditions may still appear, so
+        the attempt keeps retrying (Sol rounds 1-2)."""
+        if not self.attempt or self.attempt.get("starvation_alerted"):
+            return
+        if not self._boundary_ok():
+            return
+        # Clock starts at first ELIGIBILITY (request observed, or hard
+        # crossed), not attempt creation: a threshold attempt blocked
+        # below hard for ten minutes has not been starved-while-urgent.
+        since = self.attempt.setdefault("timers", {}).get("eligible_mono")
+        if since is None:
+            self.attempt["timers"]["eligible_mono"] = now
+            return
+        if not isinstance(since, (int, float)) or \
+                now - since < STARVATION_ALERT_S:
+            return
+        self.attempt["starvation_alerted"] = True
+        journal_record(self.paths["journal"], "STARVATION_ALERT", self.attempt,
+                       reason=self.attempt.get("reason"),
+                       starved_for_s=round(now - since, 1))
+        # Recovery reads only ATTEMPT rows; without re-journaling the
+        # DEFERRED tail the flag would be lost on crash and the alert
+        # (and display message) would re-fire after recovery.
+        journal_record(self.paths["journal"], "DEFERRED", self.attempt,
+                       reason=self.attempt.get("reason"))
+        try:
+            self.run_tmux(_tmux(self.binding["socket"], [
+                "display-message", "-t", self.binding["pane_id"],
+                "compact-manager: compaction pending %ds; composer "
+                "unavailable" % int(now - since)]))
+        except Exception:
+            pass
+
+    def _poll_interval(self):
+        """Fast cadence whenever an attempt is in flight — including
+        SUBMITTED/ACKED, whose ack/boundary/timeout handling would
+        otherwise wait out the slow idle interval (round-2 audit).
+        Slow only when far below the trigger with nothing pending."""
+        eff, trigger = self._thresholds()
+        pct = self.cursor.get("current", 0) / eff["context_window"]
+        pending = (self.attempt is not None and self.attempt.get("state")
+                   in ("TRIGGERED", "DEFERRED", "SUBMITTED", "ACKED"))
+        if pct < trigger - 0.20 and not pending:
+            return 60
+        return self.cfg["managed_poll_s"]
+
+    def _execute_attempt(self, now):
+        previous = "TRIGGERED"
+        boundary_ok = self._boundary_ok()
         self.typed_critical = True
         try:
             self.attempt = run_ladder(
@@ -1666,14 +2196,12 @@ class Watcher:
                 self.paths["journal"],
                 lambda: load_layer1_packet(self.cfg, self.binding["session_id"]),
                 self.run_tmux, self.proc_root, self.wait, self.monotonic,
-                sessions_dir=self.sessions_dir)
+                sessions_dir=self.sessions_dir, boundary_ok=boundary_ok,
+                activity_reader=self._activity_reader, now_wall=self.wall)
         finally:
             self.typed_critical = False
         if self.attempt["state"] == "DEFERRED":
-            self.attempt["timers"]["next_attempt_at"] = now + self.backoff
-            self.backoff = min(BACKOFF_MAX_S, self.backoff * 2)
-            journal_record(self.paths["journal"], "DEFERRED", self.attempt,
-                           reason=self.attempt.get("reason"))
+            self._schedule_defer(now)
         self.alert_if_needed(previous)
         if "lease_lost" in str(self.attempt.get("reason", "")):
             return False, "lease_lost_after_r4"
@@ -1754,14 +2282,10 @@ class Watcher:
                                reason=reason)
                 break
             now = self.monotonic()
-            eff, trigger = self._thresholds()
-            pct = self.cursor.get("current", 0) / eff["context_window"]
-            interval = self.cfg["managed_poll_s"]
-            if pct < trigger - 0.20:
-                interval = 60
             # Floor keeps an overdue heartbeat from degenerating into a
             # zero-sleep hot loop.
-            self.wait(max(0.5, min(interval, self.next_heartbeat - now)))
+            self.wait(max(0.5, min(self._poll_interval(),
+                                   self.next_heartbeat - now)))
 
 
 def _write_handshake(fd, value):
@@ -1982,15 +2506,28 @@ def status_rows(cfg):
                 # — a retirement record never masks a recovered hazard.
                 state = "WATCHER_RETIRED"
                 reason = last.get("reason")
+            starved = None
+            if state in ("TRIGGERED", "DEFERRED") and tail and \
+                    tail.get("attempt_id"):
+                # Attention, not a resolvable hazard: shown only while
+                # the SAME attempt is still pending; a submission or a
+                # new attempt clears it by construction.
+                for record in reversed(records):
+                    if (record.get("state") == "STARVATION_ALERT" and
+                            record.get("attempt_id") == tail.get("attempt_id")):
+                        starved = record.get("starved_for_s")
+                        break
         except Exception:
             state = None
             reason = "journal unreadable (malformed record)"
+            starved = None
         rows.append({"session_id": sid, "run_token": lease.get("run_token"),
                      "pid": lease.get("pid"),
                      "live": bool(lease) and lease_is_live(lease),
                      "has_lease": bool(lease),
                      "state": state or "WATCHER_READY",
-                     "reason": reason})
+                     "reason": reason,
+                     "starved_for_s": starved})
     return rows
 
 
@@ -2193,10 +2730,13 @@ def overview_data(cfg, now=None, sessions_dir=None, proc_root="/proc"):
         # can still read live=true unflagged — status.md says so.
         if r["live"] and not pid_ok:
             flags.append("MALFORMED-LEASE")
+        if r.get("starved_for_s") is not None:
+            flags.append("ATTENTION")
         data["watchers"].append({
             "session_id": r["session_id"], "pid": r["pid"],
             "state": r["state"], "live": r["live"],
-            "reason": r["reason"], "flags": flags})
+            "reason": r["reason"], "flags": flags,
+            "starved_for_s": r.get("starved_for_s")})
     state_dir = os.path.join(cfg["state_dir"], "state")
     entries = []
     try:

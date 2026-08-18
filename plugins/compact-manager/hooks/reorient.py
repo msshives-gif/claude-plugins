@@ -21,6 +21,16 @@ def main():
     cfg = cm.load_config()
     if cfg["mode"] == "off":
         return
+    try:
+        # Paired turn marker, running half (ended half: stop_marker.py).
+        # Written before the advisory work so the marker can't lag the
+        # turn it describes. Fail-open: a failed write only leaves the
+        # watcher's turn-boundary lane unavailable.
+        import managed
+        managed.write_activity(cfg, payload, "running")
+    except Exception as e:
+        print(f"compact-manager reorient: activity write failed: {e!r}",
+              file=sys.stderr)
     text = advisor.run(payload, cfg)
     if text:
         print(json.dumps({

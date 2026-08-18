@@ -1,0 +1,88 @@
+env -u ANTHROPIC_API_KEY claude --model haiku --settings /tmp/claude-1000/-home-user-Projects-claude-plugins/dc35475e-c8ba-4b6d-9056-43ed01b61552/scratchpad/hook-order-exp/settings.json --allowedTools Bash
+[1m[32muser@user-claude-test[0m:[1m[34m/tmp/claude-1000/-home-user-Projects-claude-plugins/dc35475e-c8ba-4b6d-9056-43ed01b61552/scratchpad/hook-order-exp[0m$ env -u ANTHROPIC_API_KEY claude --model haiku --settings /tmp/claude-1000/-home-user-Projects-claude-plugins/dc35475e-c8ba-4b6d-9056-43ed01b61552/scratchpad/hook-order-exp/settings.json --allowedTools Bash
+[38;5;174m╭───[39m [38;5;174mClaude[39m [38;5;174mCode[39m [38;5;246mv2.1.234[39m [38;5;174m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[39m                                                    [2m[38;5;174m│[0m [1m[38;5;174mTips[0m [1m[38;5;174mfor[0m [1m[38;5;174mgetting[0m [1m[38;5;174mstarted[0m                                                                                                                                                                       [38;5;174m│
+│[39m                 [1mWelcome[0m [1mback[0m [1muser![0m                 [2m[38;5;174m│[0m Run /init to create a CLAUDE.md file with instructions for Claude                                                                                                                              [38;5;174m│
+│[39m                                                    [2m[38;5;174m│[0m [38;5;174m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m [38;5;174m│
+│[39m                       [38;5;174m▐[48;5;16m▛███▜[49m▌[39m                      [2m[38;5;174m│[0m [1m[38;5;174mWhat's[0m [1m[38;5;174mnew[0m                                                                                                                                                                                     [38;5;174m│
+│[39m                      [38;5;174m▝▜[48;5;16m█████[49m▛▘[39m                     [2m[38;5;174m│[0m Added the optional `CLAUDE_CODE_PROJECT_DIR_NAME` environment variable: hosts that give each session its own config directory can choose a short name for the per-project transcript directory [38;5;174m│
+│[39m                        [38;5;174m▘▘[39m [38;5;174m▝▝[39m                       [2m[38;5;174m│[0m Added the `selection:clear` keybinding action, so a key can be bound to clear an in-app text selection; also works in the agents view                                                          [38;5;174m│
+│[39m   [38;5;246mHaiku[39m [38;5;246m4.5[39m [38;5;246m·[39m [38;5;246mClaude[39m [38;5;246mMax[39m [38;5;246m·[39m [38;5;246muser@example.com's[39m    [2m[38;5;174m│[0m Added a GitLab merge request badge to the footer and statusline: repos with a GitLab remote and an authenticated glab CLI show MR !N with draft/pending/green states                           [38;5;174m│
+│[39m   [38;5;246mOrganization[39m                                     [2m[38;5;174m│[0m [3m[38;5;246m/release-notes[0m [3m[38;5;246mfor[0m [3m[38;5;246mmore[0m                                                                                                                                                                        [38;5;174m│
+│[39m            [38;5;246m/…/scratchpad/hook-order-exp[39m            [2m[38;5;174m│[0m                                                                                                                                                                                                [38;5;174m│
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+[39m [38;5;220m⚠[39m [38;5;220m1 MCP server needs authentication[38;5;246m · run /mcp
+
+[38;5;239m[48;5;237m❯ [38;5;231mReply with exactly one word: ready[39m                                                                                                                                                                                                                                                                                                
+
+[38;5;231m[49m●[39m ready                                                                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                                                  
+[38;5;246m✻[39m [38;5;246mBaked for 2s · 1 shell still running[39m                                                                                                                                                                                                                                                                                              
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the Bash tool with run_in_background=true to run: sleep 300. Then immediately reply with the word done. Do not wait for the sleep.[39m                                                                                                                                                                                            
+
+[38;5;114m[49m●[39m [1mBash[0m(sleep 300)                                                                                                                                                                                                                                                                                                                   
+[38;5;246m  ⎿  Running in the background (↓ to manage)[39m                                                                                                                                                                                                                                                                                      
+                                     
+[38;5;231m●[39m done                                                                                                                                                                                                                                                                                                                              
+
+[38;5;246m✻[39m [38;5;246mSautéed for 5s · 1 shell still running[39m                               
+
+[38;5;239m[48;5;237m❯ [38;5;231mRun in the foreground (not background): sleep 15. Then reply slept.[39m                                                                                                                                                                                                                                                               
+
+[38;5;114m[49m●[39m [1mBash[0m(sleep 15)                                                                                                                                                                                                                                                                                                                    
+[38;5;246m  ⎿  (No output)[39m                                                                                                                                                                                                                                                                                                                    
+                                                 
+[38;5;239m[48;5;237m❯ [38;5;231mQueued while running: reply with the word second.[39m                                                                                                                                                                                                                                                                                 
+
+[38;5;231m[49m●[39m second                                     
+
+[38;5;246m✻[39m [38;5;246mBrewed for 23s · 1 shell still running[39m                                                                                                                                                                                                                                                                                          
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the Write tool to create a file named modal-test.txt containing hello[39m                                                                                                                                                                                                                                                         
+
+[49m  [38;5;246mMade [1m1[0m[38;5;246m scratchpad edit [38;5;72m+1[38;5;246m (ctrl+o to expand)[39m                                                                                                                                                                                                                                                                                      
+
+[38;5;231m●[39m Done. Created modal-test.txt with the content "hello" in the scratchpad directory.
+
+[38;5;246m✻[39m [38;5;246mCogitated for 6s · 1 shell still running[39m                                                                                                                          
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse the Write tool to create /home/user/hookexp-modal-test.txt containing hello[39m                                                                                                                                                                                                                                                   
+
+[38;5;211m[49m●[39m [1mWrite[0m(]8;id=1g5bqv7;file:///home/user/hookexp-modal-test.txt\~/hookexp-modal-test.txt]8;;\)                                                                                                                                                                                                                                                                                                   
+[38;5;246m  ⎿  [38;5;239mUser rejected write to [1m../../../../../../home/user/hookexp-modal-test.txt
+[0m     [2m[38;5;231m 1 hello[0m                                                                                                                                                                                                                                                                                                                       
+                                                                                                                                                                                                                                                                                                                                    
+[38;5;246m✻[39m [38;5;246mCooked for 24s · 1 shell still running[39m           
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ half typed text never submitted                                                                                                                                                                                                                                                                                                   
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [1m[34m/t/c/-/d/s/hook-order-exp[0m          
+  [36m[Haiku 4.5][38;5;246m [33m[tokens: 158 | ctx: 23%][39m                             
+  [38;5;246m⏸ manual mode on · [38;5;44m1 shell[39m               
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

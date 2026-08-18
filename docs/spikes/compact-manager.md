@@ -47,7 +47,21 @@ counting isCompactSummary alone).
 - Idle: a line matching `^❯.{0,3}$` — NOTE the "empty" composer is
   `❯` + a NO-BREAK SPACE (U+00A0), not an ASCII space — AND no
   "esc to interrupt" anywhere in the pane.
-- Busy: "esc to interrupt" present (spinner line).
+- Busy: "esc to interrupt" present (spinner line). **Qualified
+  2026-08-18 (live captures, fixtures in
+  plugins/compact-manager/tests/fixtures/):** the phrase FLICKERS —
+  it can be absent mid-generation (spinner line without it) and can
+  appear for background tasks after the foreground turn ended. It is
+  therefore not a turn-end discriminator in either direction; the
+  paired UserPromptSubmit/Stop activity marker (shared `prompt_id`)
+  is the semantic turn-end source, and mid-generation safety rests on
+  R3 stability plus the marker reading "running".
+- Ghost suggestions (2026-08-18): after a turn ends with background
+  tasks running, the composer may render a dim suggestion — plain
+  capture shows `❯`+NBSP+text, byte-identical to typed input. With
+  `capture-pane -e`, suggestion text is ESC[2m-wrapped (per word when
+  soft-wrapped, plain spaces between words); typed text carries no
+  dim. Modal selection rows are `❯ `+ASCII-space (`❯ 1. Yes`).
 - Footer carries `[tokens: N | ctx: NN%]` — a live context readout
   (nulls to 0% right after compaction until the next call).
 - Typed text echoes in the composer after `send-keys -l` (submission

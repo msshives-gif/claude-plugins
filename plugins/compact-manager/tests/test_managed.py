@@ -813,9 +813,16 @@ class LadderPredicateTests(unittest.TestCase):
 
     def test_exact_composer(self):
         text = managed.instruction_text("a" * 16)
-        self.assertTrue(managed.composer_exact("x\n❯\u00a0" + text, text))
-        self.assertFalse(managed.composer_exact("x\n❯\u00a0BAD" + text, text))
-        self.assertFalse(managed.composer_exact("x\n❯\u00a0" + text + "x", text))
+        self.assertTrue(managed.snapshot_exact(
+            managed.parse_pane("x\n❯\u00a0" + text), text))
+        self.assertFalse(managed.snapshot_exact(
+            managed.parse_pane("x\n❯\u00a0BAD" + text), text))
+        self.assertFalse(managed.snapshot_exact(
+            managed.parse_pane("x\n❯\u00a0" + text + "x"), text))
+        # A modal anywhere in the layout vetoes even an exact match.
+        self.assertFalse(managed.snapshot_exact(
+            managed.parse_pane(" ❯ 1. Yes\n❯\u00a0" + text), text))
+        self.assertFalse(managed.snapshot_exact(None, text))
 
     def test_trailing_capture_padding_is_ignored(self):
         # capture-pane -J preserves trailing spaces (live-gate catch):
@@ -824,10 +831,10 @@ class LadderPredicateTests(unittest.TestCase):
         self.assertTrue(managed.composer_idle("❯ " + " " * 40))
         self.assertFalse(managed.composer_idle("❯" + " " * 40))
         text = managed.instruction_text("a" * 16)
-        self.assertTrue(managed.composer_exact(
-            "x\n❯ " + text + " " * 30, text))
-        self.assertFalse(managed.composer_exact(
-            "x\n❯ user " + text + " " * 30, text))
+        self.assertTrue(managed.snapshot_exact(managed.parse_pane(
+            "x\n❯ " + text + " " * 30), text))
+        self.assertFalse(managed.snapshot_exact(managed.parse_pane(
+            "x\n❯ user " + text + " " * 30), text))
 
     def test_s6_capture_half_typed_predicate(self):
         capture_path = os.path.abspath(os.path.join(
@@ -2055,3 +2062,716 @@ class ThresholdStampTests(unittest.TestCase):
             self.assertEqual((row["soft_pct"], row["hard_pct"],
                               row["trigger_pct"]), (0.7, 0.8, 0.8))
         json.loads(json.dumps(data))
+
+
+DIM = "\x1b[2m"
+RESET = "\x1b[0m"
+FIXTURES = os.path.join(HERE, "fixtures")
+
+
+class PaneParserTests(unittest.TestCase):
+    """parse_pane / snapshot_exact against synthetic lines and the live
+    fixtures captured 2026-08-18 (Claude Code 2.1.x, tmux)."""
+
+    def test_bare_composer_is_empty(self):
+        self.assertEqual(managed.parse_pane("x\n❯ ")["composer"], "empty")
+
+    def test_ghost_suggestion_is_empty(self):
+        # Suggestions render dim; plain-stripped they are byte-identical
+        # to typed text, so only the SGR-aware parse may call them empty.
+        cap = "header\n❯ %scheck if it's still running%s" % (DIM, RESET)
+        self.assertEqual(managed.parse_pane(cap)["composer"], "empty")
+
+    def test_per_word_dim_wrap_is_empty(self):
+        # Narrow panes wrap the suggestion per word with PLAIN spaces
+        # between the dim words (live fixture): whitespace need not be
+        # dim, every other character must be.
+        cap = "❯ %sIs%s %sit%s %srunning?%s" % (
+            DIM, RESET, DIM, RESET, DIM, RESET)
+        self.assertEqual(managed.parse_pane(cap)["composer"], "empty")
+
+    def test_typed_text_is_nonempty(self):
+        self.assertEqual(
+            managed.parse_pane("❯ half typed")["composer"], "nonempty")
+
+    def test_typed_after_ghost_is_nonempty(self):
+        cap = "❯ %sghost%s typed" % (DIM, RESET)
+        self.assertEqual(managed.parse_pane(cap)["composer"], "nonempty")
+
+    def test_sgr22_ends_dim(self):
+        cap = "❯ %sa\x1b[22mb" % DIM
+        self.assertEqual(managed.parse_pane(cap)["composer"], "nonempty")
+
+    def test_unknown_escape_is_unknown(self):
+        for cap in ("❯ \x1b[2Ax", "❯ \x1b]0;titlex", "❯ \x9bmx"):
+            self.assertEqual(managed.parse_pane(cap)["composer"], "unknown")
+
+    def test_ascii_space_marker_is_unknown(self):
+        # A shell prompt or history echo ("❯ text", ASCII space) must
+        # never classify as a live composer.
+        self.assertEqual(managed.parse_pane("❯ text")["composer"], "unknown")
+
+    def test_modal_selection_row_flags_modal(self):
+        snap = managed.parse_pane("stuff\n ❯ 1. Yes\n   2. No")
+        self.assertTrue(snap["modal"])
+
+    def test_column_zero_history_echo_is_not_modal(self):
+        # A user prompt beginning "1. " echoes at column 0; calling it
+        # a modal would starve the watcher forever (audit finding).
+        snap = managed.parse_pane("❯ 1. first item of my list\n❯\u00a0")
+        self.assertFalse(snap["modal"])
+        self.assertEqual(snap["composer"], "empty")
+
+    def test_extended_color_params_are_not_dim(self):
+        # 38;5;2 / 38;2;r;g;b operands must not read as SGR 2 (audit
+        # blocker: colored typed text classified empty).
+        for cap in ("❯\u00a0\x1b[38;5;2mtyped",
+                    "❯\u00a0\x1b[38;2;10;20;30mtyped",
+                    "❯\u00a0\x1b[48;5;22mtyped"):
+            self.assertEqual(managed.parse_pane(cap)["composer"],
+                             "nonempty", cap)
+        # dim + extended color together still reads dim.
+        self.assertEqual(managed.parse_pane(
+            "❯\u00a0\x1b[2;38;5;196mghost")["composer"], "empty")
+        # malformed extended color is ambiguous -> unknown.
+        self.assertEqual(managed.parse_pane(
+            "❯\u00a0\x1b[38mx")["composer"], "unknown")
+
+    def test_bottom_anchored_takes_last_marker_line(self):
+        # History echoes its prompts with "❯ "; only the LAST marker
+        # line is the live composer.
+        cap = "❯ old prompt echoed\n● reply\n❯ "
+        snap = managed.parse_pane(cap)
+        self.assertEqual(snap["composer"], "empty")
+        self.assertEqual(snap["row"], 2)
+
+    def test_absent_composer(self):
+        snap = managed.parse_pane("no prompt here\nat all")
+        self.assertEqual(snap["composer"], "absent")
+
+    def _fixture(self, name):
+        with open(os.path.join(FIXTURES, name)) as fh:
+            return fh.read()
+
+    def test_live_suggestion_fixtures_are_empty(self):
+        for name in ("bg-suggestion.ansi.txt",
+                     "bg-suggestion-narrow60.ansi.txt"):
+            snap = managed.parse_pane(self._fixture(name))
+            self.assertEqual(snap["composer"], "empty", name)
+            self.assertFalse(snap["modal"], name)
+
+    def test_live_half_typed_fixture_is_nonempty(self):
+        snap = managed.parse_pane(
+            self._fixture("half-typed-bg-running.ansi.txt"))
+        self.assertEqual(snap["composer"], "nonempty")
+
+    def test_live_modal_fixture_vetoes(self):
+        snap = managed.parse_pane(self._fixture("permission-modal.ansi.txt"))
+        self.assertTrue(snap["modal"])
+        self.assertNotEqual(snap["composer"], "empty")
+
+    def test_live_foreground_generating_plain_fixture(self):
+        # Foreground generation renders a byte-identical empty composer,
+        # and this live capture caught the footer with NO "esc to
+        # interrupt" (it flickers off between repaints): the strict
+        # lane's R2 veto is NOT reliable mid-generation — its real
+        # guards are R3 whole-pane stability (the spinner's elapsed
+        # counter repaints every second) and, for the boundary lane,
+        # the activity marker still reading "running".
+        cap = self._fixture("foreground-generating.txt")
+        snap = managed.parse_pane(cap)
+        self.assertEqual(snap["composer"], "empty")
+        self.assertFalse(snap["modal"])
+
+
+class ActivityMarkerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cfg = managed.load_config(
+            base=dict(cm._DEFAULTS, state_dir=self.temp.name), environ={})
+        self.sid = "session-1234"
+        self.transcript = os.path.join(self.temp.name, "t.jsonl")
+        with open(self.transcript, "w") as fh:
+            fh.write("{}\n")
+
+    def payload(self, prompt_id, **kw):
+        value = {"session_id": self.sid, "prompt_id": prompt_id,
+                 "transcript_path": self.transcript}
+        value.update(kw)
+        return value
+
+    def read(self):
+        return managed.read_activity(self.cfg, self.sid, self.transcript)
+
+    def test_pairing_happy_path(self):
+        self.assertTrue(managed.write_activity(
+            self.cfg, self.payload("prompt-aaa1"), "running"))
+        self.assertTrue(managed.write_activity(
+            self.cfg, self.payload("prompt-aaa1"), "ended"))
+        phase, revision = self.read()
+        self.assertEqual(phase, "ended")
+        self.assertEqual(revision[0], "prompt-aaa1")
+
+    def test_missing_files_unknown_then_running(self):
+        # No evidence at all: unknown. A valid bound running half with
+        # no ended half is AFFIRMATIVE turn-in-flight evidence: it
+        # vetoes even the strict lane (audit blocker fix).
+        self.assertEqual(self.read(), ("unknown", None))
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "running")
+        self.assertEqual(self.read(), ("running", None))
+
+    def test_new_running_unpairs_old_ended(self):
+        # The stale-Stop interleaving that blocked the single-file
+        # protocol: ended(A) landing while running(B) exists must not
+        # read as ended.
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "running")
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "ended")
+        managed.write_activity(self.cfg, self.payload("prompt-bbb2"), "running")
+        self.assertEqual(self.read(), ("running", None))
+
+    def test_write_refuses_bad_payloads(self):
+        for bad in ({}, {"session_id": self.sid},
+                    self.payload("x"),                      # short prompt_id
+                    self.payload("prompt-aaa1", session_id="bad/../id"),
+                    dict(self.payload("prompt-aaa1"), transcript_path=None)):
+            self.assertFalse(managed.write_activity(self.cfg, bad, "running"))
+        self.assertFalse(managed.write_activity(
+            self.cfg, self.payload("prompt-aaa1"), "elsewhere"))
+
+    def test_reader_rejects_corrupt_and_hostile_files(self):
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "running")
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "ended")
+        paths = managed.activity_paths(self.cfg, self.sid)
+        # An unusable ended half never pairs; the still-valid running
+        # half reads as affirmative turn-in-flight.
+        with open(paths["ended"], "w") as fh:
+            fh.write("{nope")
+        self.assertEqual(self.read(), ("running", None))
+        with open(paths["ended"], "w") as fh:
+            fh.write("x" * (managed.ACTIVITY_MAX_BYTES + 10))
+        self.assertEqual(self.read(), ("running", None))
+        os.unlink(paths["ended"])
+        target = os.path.join(self.temp.name, "target.json")
+        with open(target, "w") as fh:
+            fh.write("{}")
+        os.symlink(target, paths["ended"])
+        self.assertEqual(self.read(), ("running", None))
+        # A corrupt RUNNING half is not affirmative anything: unknown.
+        os.unlink(paths["ended"])
+        with open(paths["running"], "w") as fh:
+            fh.write("{nope")
+        self.assertEqual(self.read(), ("unknown", None))
+
+    def test_reader_rejects_future_and_mismatched_records(self):
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "running")
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "ended")
+        paths = managed.activity_paths(self.cfg, self.sid)
+        with open(paths["ended"]) as fh:
+            record = json.load(fh)
+        # Each unusable/unbound ended half degrades to running (the
+        # valid running half is affirmative), never to ended.
+        managed._atomic_json(paths["ended"],
+                             dict(record, written_at=time.time() + 3600))
+        self.assertEqual(self.read(), ("running", None))
+        managed._atomic_json(paths["ended"],
+                             dict(record, session_id="session-9999"))
+        self.assertEqual(self.read(), ("running", None))
+        managed._atomic_json(paths["ended"],
+                             dict(record, transcript_path="/elsewhere.jsonl"))
+        self.assertEqual(self.read(), ("running", None))
+        # ended OLDER than running: a stale Stop's write reordered
+        # after a newer prompt — turn in flight.
+        managed._atomic_json(paths["ended"],
+                             dict(record, written_at=record["written_at"] - 60))
+        self.assertEqual(self.read(), ("running", None))
+
+    def test_reader_rejects_transcript_identity_change(self):
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "running")
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "ended")
+        # A marker recorded against a different file identity (the
+        # transcript was replaced) must not pair. Rewrite the recorded
+        # inode rather than recreating the file — filesystems happily
+        # reuse a just-freed inode.
+        paths = managed.activity_paths(self.cfg, self.sid)
+        with open(paths["ended"]) as fh:
+            record = json.load(fh)
+        managed._atomic_json(
+            paths["ended"],
+            dict(record, transcript_inode=record["transcript_inode"] + 1))
+        self.assertEqual(self.read(), ("running", None))
+        # And an identity-less record (stat failed at write time) is
+        # not pairing evidence either (audit major).
+        managed._atomic_json(
+            paths["ended"],
+            dict(record, transcript_device=None, transcript_inode=None))
+        self.assertEqual(self.read(), ("running", None))
+
+    def test_torn_read_degrades_to_unknown(self):
+        # The audit-blocker interleaving: running A read; UPS installs
+        # running B; ended A read. The coherence re-read of running
+        # must skew and the result must never be "ended".
+        self.assertTrue(managed.write_activity(
+            self.cfg, self.payload("prompt-aaa1"), "running"))
+        self.assertTrue(managed.write_activity(
+            self.cfg, self.payload("prompt-aaa1"), "ended"))
+        paths = managed.activity_paths(self.cfg, self.sid)
+        real = managed._read_activity_file
+        state = {"n": 0}
+
+        def interleaved(path, session_id, now):
+            record = real(path, session_id, now)
+            state["n"] += 1
+            if state["n"] == 1:
+                # After the first (running) read, a new prompt lands.
+                managed.write_activity(
+                    self.cfg, self.payload("prompt-bbb2"), "running")
+            return record
+
+        import unittest.mock as mock
+        with mock.patch.object(managed, "_read_activity_file",
+                               side_effect=interleaved):
+            phase, revision = managed.read_activity(
+                self.cfg, self.sid, self.transcript)
+        self.assertNotEqual(phase, "ended")
+
+    def test_no_max_age_on_ended(self):
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "running")
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"), "ended")
+        paths = managed.activity_paths(self.cfg, self.sid)
+        for name in ("running", "ended"):
+            with open(paths[name]) as fh:
+                record = json.load(fh)
+            managed._atomic_json(
+                paths[name], dict(record, written_at=time.time() - 7200))
+        phase, _ = self.read()
+        self.assertEqual(phase, "ended")
+
+
+BUSY_IDLE = "esc to interrupt\n❯ "
+
+
+class BoundaryLaneTests(RunLadderTests):
+    """run_ladder with the turn-boundary lane armed. Inherits the
+    RunLadderTests fixtures; its inherited tests also re-run with the
+    default strict-only arguments, pinning that the lane is opt-in."""
+
+    def setUp(self):
+        super().setUp()
+        self.marker_payload = {"session_id": self.sid,
+                               "prompt_id": "prompt-aaa1",
+                               "transcript_path": self.transcript}
+
+    def write_pair(self):
+        managed.write_activity(self.cfg, self.marker_payload, "running")
+        managed.write_activity(self.cfg, self.marker_payload, "ended")
+
+    def run_boundary(self, tmux, packet=None, reader=None):
+        reader = reader or (lambda: managed.read_activity(
+            self.cfg, self.sid, self.transcript))
+        return managed.run_ladder(
+            self.binding, self.cfg, self.paths, self.attempt, self.cursor,
+            self.paths["journal"], lambda: packet, tmux, self.proc,
+            wait=lambda seconds: None, now_mono=lambda: 0.0,
+            boundary_ok=True, activity_reader=reader,
+            now_wall=lambda: time.time() + 5)
+
+    def test_boundary_submits_through_busy_chrome(self):
+        # The fbeb0bf1 starvation topology: busy footer, empty composer,
+        # foreground turn provably ended.
+        self.write_pair()
+        tmux = LadderTmux([BUSY_IDLE, BUSY_IDLE, BUSY_IDLE,
+                           BUSY_IDLE + self.text, BUSY_IDLE + self.text,
+                           BUSY_IDLE])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(out.get("lane"), "boundary")
+        self.assertEqual(len(tmux.enters()), 1)
+
+    def test_boundary_accepts_ghost_suggestion(self):
+        self.write_pair()
+        ghost = "esc to interrupt\n❯ %ssuggested%s" % (DIM, RESET)
+        tmux = LadderTmux([ghost, ghost, ghost, BUSY_IDLE + self.text,
+                           BUSY_IDLE + self.text, BUSY_IDLE])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "SUBMITTED")
+
+    def test_busy_chrome_defers_without_marker(self):
+        tmux = LadderTmux([BUSY_IDLE])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_activity_unknown")
+        self.assertEqual(out.get("defer_class"), "opportunity")
+        self.assertEqual(tmux.sent, [])
+
+    def test_unpaired_marker_defers(self):
+        self.write_pair()
+        managed.write_activity(
+            self.cfg, dict(self.marker_payload, prompt_id="prompt-bbb2"),
+            "running")
+        tmux = LadderTmux([BUSY_IDLE])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_activity_running")
+
+    def test_unsettled_marker_defers(self):
+        self.write_pair()
+        tmux = LadderTmux([BUSY_IDLE])
+        out = managed.run_ladder(
+            self.binding, self.cfg, self.paths, self.attempt, self.cursor,
+            self.paths["journal"], lambda: None, tmux, self.proc,
+            wait=lambda seconds: None, now_mono=lambda: 0.0,
+            boundary_ok=True,
+            activity_reader=lambda: managed.read_activity(
+                self.cfg, self.sid, self.transcript),
+            now_wall=time.time)  # real clock: marker written <1s ago
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_activity_unsettled")
+
+    def test_half_typed_defers_in_boundary_lane(self):
+        self.write_pair()
+        tmux = LadderTmux([BUSY_IDLE + "half typed"])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_composer_nonempty")
+        self.assertEqual(tmux.sent, [])
+
+    def test_modal_defers_in_boundary_lane(self):
+        self.write_pair()
+        tmux = LadderTmux([" ❯ 1. Yes\n❯ "])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_modal")
+        self.assertEqual(tmux.sent, [])
+
+    def test_busy_chrome_still_defers_without_boundary_authorization(self):
+        # boundary_ok=False (below hard, no request): unchanged contract.
+        self.write_pair()
+        tmux = LadderTmux([BUSY_IDLE])
+        out = self.run_ladder(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_not_idle")
+
+    def test_marker_flip_before_typing_defers(self):
+        # A new prompt starting between preflight and R4 must close the
+        # window BEFORE the first byte.
+        self.write_pair()
+        revisions = [self.read_revision()] * 2 + [("unknown", None)]
+        reader = lambda: revisions.pop(0) if revisions else ("unknown", None)
+        tmux = LadderTmux([BUSY_IDLE, BUSY_IDLE, BUSY_IDLE])
+        out = self.run_boundary(tmux, reader=reader)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R4_boundary_changed")
+        self.assertEqual(tmux.sent, [])
+
+    def test_marker_flip_after_typing_is_cleanup(self):
+        # After typing, a changed marker means unprovable input state:
+        # CLEANUP_REQUIRED, never Enter.
+        self.write_pair()
+        good = self.read_revision()
+        revisions = [good, good, good, ("unknown", None)]
+        reader = lambda: revisions.pop(0) if revisions else ("unknown", None)
+        tmux = LadderTmux([BUSY_IDLE, BUSY_IDLE, BUSY_IDLE,
+                           BUSY_IDLE + self.text, BUSY_IDLE + self.text])
+        out = self.run_boundary(tmux, reader=reader)
+        self.assertEqual(out["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(out["reason"], "R6_prime_activity_changed")
+        self.assertEqual(tmux.enters(), [])
+
+    def test_strict_lane_still_works_with_lane_armed(self):
+        # No marker at all: quiet pane authorizes via strict as before.
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text,
+                           IDLE])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(out.get("lane"), "strict")
+
+    def test_running_marker_vetoes_strict_lane(self):
+        # Mid-generation the pane can look strict-idle (empty composer,
+        # footer flicker); an affirmative running marker must veto it.
+        managed.write_activity(self.cfg, self.marker_payload, "running")
+        tmux = LadderTmux([IDLE])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_activity_running")
+        self.assertEqual(tmux.sent, [])
+
+    def test_no_marker_evidence_keeps_strict_contract(self):
+        # Sessions whose hooks never wrote markers (unknown phase) keep
+        # the original hook-independent strict lane.
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text,
+                           IDLE])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(out.get("lane"), "strict")
+
+    def read_revision(self):
+        return managed.read_activity(self.cfg, self.sid, self.transcript)
+
+
+class SchedulerTests(TickWiringTests):
+    """Reason-aware defer scheduling, hard promotion, activity due-now,
+    starvation attention, and the pending fast poll."""
+
+    def make_deferred_watcher(self, defer_class):
+        watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+        watcher.cursor = managed.scan_cursor(
+            watcher.cursor, self.transcript)
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(watcher.cursor), 0, 0.0, "boot",
+            "request")
+        watcher.attempt["state"] = "DEFERRED"
+        watcher.attempt["reason"] = "R2_activity_unknown"
+        watcher.attempt["defer_class"] = defer_class
+        return watcher
+
+    def test_opportunity_defer_never_grows_backoff(self):
+        watcher = self.make_deferred_watcher("opportunity")
+        watcher.attempt["state"] = "DEFERRED"
+        before = watcher.backoff
+        watcher._schedule_defer(100.0)
+        self.assertEqual(watcher.backoff, before)
+        self.assertEqual(watcher.attempt["timers"]["next_attempt_at"],
+                         100.0 + watcher.cfg["managed_poll_s"])
+
+    def test_structural_defer_keeps_exponential_backoff(self):
+        watcher = self.make_deferred_watcher("structural")
+        before = watcher.backoff
+        watcher._schedule_defer(100.0)
+        self.assertEqual(watcher.attempt["timers"]["next_attempt_at"],
+                         100.0 + before)
+        self.assertEqual(watcher.backoff,
+                         min(managed.BACKOFF_MAX_S, before * 2))
+
+    def test_new_ended_marker_makes_attempt_due(self):
+        watcher = self.make_deferred_watcher("opportunity")
+        watcher.attempt["activity_rev_at_defer"] = None
+        self.assertFalse(watcher._activity_advanced())  # no marker yet
+        payload = {"session_id": self.sid, "prompt_id": "prompt-aaa1",
+                   "transcript_path": self.transcript}
+        managed.write_activity(self.cfg, payload, "running")
+        managed.write_activity(self.cfg, payload, "ended")
+        self.assertTrue(watcher._activity_advanced())
+
+    def test_same_revision_is_not_due(self):
+        # Watcher (and transcript) first: markers stat the transcript
+        # at write time, and identity-less markers never pair.
+        watcher = self.make_deferred_watcher("opportunity")
+        payload = {"session_id": self.sid, "prompt_id": "prompt-aaa1",
+                   "transcript_path": self.transcript}
+        managed.write_activity(self.cfg, payload, "running")
+        managed.write_activity(self.cfg, payload, "ended")
+        phase, revision = watcher._activity_reader()
+        watcher.attempt["activity_rev_at_defer"] = list(revision)
+        self.assertFalse(watcher._activity_advanced())
+
+    def test_request_attempt_is_boundary_authorized_below_hard(self):
+        watcher = self.make_deferred_watcher("opportunity")
+        self.assertTrue(watcher._boundary_ok())
+
+    def test_threshold_attempt_promotes_at_hard(self):
+        watcher = self.make_deferred_watcher("opportunity")
+        watcher.attempt["trigger_source"] = "threshold"
+        watcher.cursor["current"] = int(0.5 * 200_000)
+        self.assertFalse(watcher._boundary_ok())
+        watcher.cursor["current"] = int(0.85 * 200_000)
+        self.assertTrue(watcher._boundary_ok())
+
+    def test_starvation_alert_fires_once_and_is_informational(self):
+        watcher = self.make_deferred_watcher("opportunity")
+        watcher._maybe_starvation_alert(0.0)  # starts the eligibility clock
+        self.assertEqual(watcher.attempt["timers"].get("eligible_mono"), 0.0)
+        watcher._maybe_starvation_alert(managed.STARVATION_ALERT_S + 1)
+        watcher._maybe_starvation_alert(managed.STARVATION_ALERT_S + 2)
+        records = [r for r in managed.read_journal(self.paths["journal"])
+                   if r.get("state") == "STARVATION_ALERT"]
+        self.assertEqual(len(records), 1)
+        self.assertGreaterEqual(records[0].get("starved_for_s", 0),
+                                managed.STARVATION_ALERT_S)
+        # Not an attempt state: recovery must not resurrect it.
+        self.assertNotIn("STARVATION_ALERT", managed.ATTEMPT_STATES)
+        self.assertIn("STARVATION_ALERT", managed.LIFECYCLE_STATES)
+        # The attempt keeps retrying: no latch.
+        self.assertEqual(watcher.attempt["state"], "DEFERRED")
+
+    def test_starvation_alert_requires_eligibility(self):
+        watcher = self.make_deferred_watcher("opportunity")
+        watcher.attempt["trigger_source"] = "threshold"
+        watcher.cursor["current"] = 100  # far below hard
+        watcher._maybe_starvation_alert(0.0)
+        watcher._maybe_starvation_alert(managed.STARVATION_ALERT_S + 1)
+        records = [r for r in managed.read_journal(self.paths["journal"])
+                   if r.get("state") == "STARVATION_ALERT"]
+        self.assertEqual(records, [])
+
+    def test_trigger_source_survives_journal_roundtrip(self):
+        watcher = self.make_deferred_watcher("opportunity")
+        managed.journal_record(self.paths["journal"], "DEFERRED",
+                               watcher.attempt, reason="R2_activity_unknown")
+        recovered = managed.recover_attempt(self.paths["journal"], "boot")
+        self.assertEqual(recovered.get("trigger_source"), "request")
+
+
+class RoundTwoFixTests(unittest.TestCase):
+    """Pins for the round-2 audit fixes (virgin markers, SGR arity,
+    eligibility clock, starvation recovery, poll interval)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cfg = managed.load_config(
+            base=dict(cm._DEFAULTS, state_dir=self.temp.name), environ={})
+        self.sid = "session-1234"
+        self.transcript = os.path.join(self.temp.name, "t.jsonl")
+
+    def payload(self, prompt_id):
+        return {"session_id": self.sid, "prompt_id": prompt_id,
+                "transcript_path": self.transcript}
+
+    def read(self):
+        return managed.read_activity(self.cfg, self.sid, self.transcript)
+
+    def test_virgin_running_marker_is_affirmative_running(self):
+        # First prompt of a session: the hook fires BEFORE the
+        # transcript file exists, so the running marker carries
+        # (None, None) identity. That must still veto (phase running),
+        # not fall to unknown (round-2 audit blocker: strict lane could
+        # type mid-first-turn).
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"),
+                               "running")
+        with open(self.transcript, "w") as fh:
+            fh.write("{}\n")
+        self.assertEqual(self.read(), ("running", None))
+
+    def test_virgin_running_pairs_with_bound_ended(self):
+        # ...and when the first turn ends (transcript now exists, ended
+        # is fully bound), the identity-less running half may pair — the
+        # boundary lane must not starve until a second prompt.
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"),
+                               "running")
+        with open(self.transcript, "w") as fh:
+            fh.write("{}\n")
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"),
+                               "ended")
+        phase, revision = self.read()
+        self.assertEqual(phase, "ended")
+        self.assertEqual(revision[0], "prompt-aaa1")
+
+    def test_mismatched_running_identity_is_unknown(self):
+        with open(self.transcript, "w") as fh:
+            fh.write("{}\n")
+        managed.write_activity(self.cfg, self.payload("prompt-aaa1"),
+                               "running")
+        paths = managed.activity_paths(self.cfg, self.sid)
+        with open(paths["running"]) as fh:
+            record = json.load(fh)
+        managed._atomic_json(
+            paths["running"],
+            dict(record, transcript_inode=record["transcript_inode"] + 1))
+        self.assertEqual(self.read(), ("unknown", None))
+
+    def test_truncated_extended_color_fails_closed(self):
+        # "38;5" / "38;2;r;g" truncations are ambiguous: unknown, never
+        # a dim misread (round-2 audit: ESC[2;38;5m read typed as empty).
+        for cap in ("❯ \x1b[2;38;5mtyped",
+                    "❯ \x1b[38;5mtyped",
+                    "❯ \x1b[38;2;1;2mtyped",
+                    "❯ \x1b[58;9mtyped",
+                    # EMPTY operands are just as ambiguous as missing
+                    # ones (a terminal may read a trailing ";" as an
+                    # extra reset param) — round-4 Sol catch.
+                    "❯ \x1b[2;38;5;mtyped",
+                    "❯ \x1b[38;5;;2mtyped",
+                    "❯ \x1b[2;38;2;1;2;mtyped"):
+            self.assertEqual(managed.parse_pane(cap)["composer"],
+                             "unknown", cap)
+
+    def test_colon_form_colors_do_not_affect_dim(self):
+        self.assertEqual(managed.parse_pane(
+            "❯ \x1b[38:5:2mtyped")["composer"], "nonempty")
+        self.assertEqual(managed.parse_pane(
+            "❯ \x1b[2m\x1b[38:5:2mghost")["composer"], "empty")
+
+
+class RoundTwoWatcherTests(TickWiringTests):
+    def make_request_watcher(self):
+        watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+        watcher.cursor = managed.scan_cursor(watcher.cursor, self.transcript)
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(watcher.cursor), 0, 0.0, "boot",
+            "request")
+        watcher.attempt["state"] = "DEFERRED"
+        watcher.attempt["reason"] = "R2_activity_unknown"
+        watcher.attempt["defer_class"] = "opportunity"
+        return watcher
+
+    def test_schedule_defer_starts_eligibility_clock(self):
+        # The clock must start at the first ELIGIBLE defer, not one
+        # poll later inside the alert check (round-2 audit).
+        watcher = self.make_request_watcher()
+        watcher._schedule_defer(50.0)
+        self.assertEqual(watcher.attempt["timers"].get("eligible_mono"), 50.0)
+        watcher._schedule_defer(60.0)  # never restarted
+        self.assertEqual(watcher.attempt["timers"].get("eligible_mono"), 50.0)
+
+    def test_starvation_flag_survives_recovery(self):
+        # The alert re-journals the DEFERRED tail so a crashed watcher
+        # does not re-alert the same attempt after recovery.
+        watcher = self.make_request_watcher()
+        watcher._maybe_starvation_alert(0.0)
+        watcher._maybe_starvation_alert(managed.STARVATION_ALERT_S + 1)
+        recovered = managed.recover_attempt(self.paths["journal"], "boot")
+        self.assertTrue(recovered.get("starvation_alerted"))
+        self.assertEqual(recovered.get("state"), "DEFERRED")
+
+    def test_poll_interval_fast_for_all_pending_states(self):
+        watcher = self.make_request_watcher()
+        watcher.cursor["current"] = 100  # far below trigger
+        for state in ("TRIGGERED", "DEFERRED", "SUBMITTED", "ACKED"):
+            watcher.attempt["state"] = state
+            self.assertEqual(watcher._poll_interval(),
+                             watcher.cfg["managed_poll_s"], state)
+        watcher.attempt = None
+        self.assertEqual(watcher._poll_interval(), 60)
+
+
+class RequestOverridesLatchTests(TickWiringTests):
+    def latched_watcher(self):
+        watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+        watcher.cursor = managed.scan_cursor(watcher.cursor, self.transcript)
+        # Post-compaction plateau: pct above the re-arm line with no new
+        # growth, so the ordinary re-arm cannot fire.
+        watcher.cursor["current"] = 180_000
+        watcher.attempt = {
+            "state": "LATCHED", "latch_kind": "THRESHOLD",
+            "run_token": self.token,
+            "generation": managed.generation(watcher.cursor),
+            "latch_tokens": 180_000, "nonces": [], "nonce": "",
+            "attempt_packet_seq_floor": 0, "retry_n": 0,
+            "timers": {"boot_id": "boot"}}
+        return watcher
+
+    def test_threshold_latch_holds_without_request(self):
+        watcher = self.latched_watcher()
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertEqual(watcher.attempt["state"], "LATCHED")
+
+    def test_request_overrides_threshold_latch(self):
+        # A model request during still_above_rearm_band must clear the
+        # latch (live-suite catch: the request starved 250+s otherwise).
+        watcher = self.latched_watcher()
+        watcher.request_history["req-override-1"] = managed.generation_key(
+            managed.generation(watcher.cursor))
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertIsNone(watcher.attempt)
+        records = managed.read_journal(self.paths["journal"])
+        ready = [r for r in records if r.get("state") == "READY"]
+        self.assertTrue(ready)
+        self.assertEqual(ready[-1].get("reason"), "request_overrides_latch")
+        # Next tick creates the request-triggered attempt.
+        keep, reason = watcher.tick()
+        self.assertTrue(keep)
+        self.assertIsNotNone(watcher.attempt)
+        self.assertEqual(watcher.attempt.get("trigger_source"), "request")

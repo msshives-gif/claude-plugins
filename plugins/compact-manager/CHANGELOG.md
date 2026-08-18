@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+- Turn-boundary lane: the watcher can now type a requested (or
+  hard-threshold) `/compact` at a foreground turn boundary even while
+  background tasks keep the pane busy — the failure that let a
+  marathon session starve a written handoff for 28 minutes until
+  native auto-compact fired stale (live case fbeb0bf1, 2026-08-17).
+  Proof comes from a paired activity marker (UserPromptSubmit writes
+  `running-<sid>.json`, Stop writes `ended-<sid>.json`, paired by the
+  shared `prompt_id`; two lock-free atomic files, compared at watcher
+  read time, so a stale Stop can never authorize a newer turn) plus a
+  structured SGR-aware pane parse: bottom-anchored composer, dim
+  ghost-suggestion text counts as empty, typed text and modals veto,
+  unknown escapes veto. The strict whole-pane-idle lane keeps its
+  typing contract for ordinary below-hard threshold attempts, with
+  two deliberate changes: an affirmative "running" marker or a modal
+  layout now vetoes it too (mid-generation panes can look
+  byte-identical to idle), and its input-opportunity retries use the
+  fast poll cadence instead of exponential backoff. Supporting changes: reason-aware defer scheduling (input
+  opportunities retry at `managed_poll_s`; only structural failures
+  back off exponentially — the old blanket 30→300s backoff was half
+  the starvation), `trigger_source` persisted through the journal,
+  dynamic promotion to the lane when usage crosses hard mid-retry, a
+  pending attempt pins the outer loop to the fast poll cadence, a new
+  ended marker makes a deferred attempt due immediately, and a
+  non-latching STARVATION_ALERT (journal row + ATTENTION flag in
+  status/overview + best-effort tmux display-message) after two
+  minutes of blocked eligibility. Live-pinned UI facts (fixtures in
+  tests/fixtures/): suggestions render ESC[2m-dim per word and are
+  byte-identical to typed text once stripped; `esc to interrupt`
+  flickers off mid-generation (the R2 veto alone was never a reliable
+  turn discriminator); modal selection rows use "❯ "+ASCII-space.
+  Post-commit audit round (fresh Sol + 2 Opus lanes) hardened the
+  first cut: extended-color SGR params (38;5;n / 38;2;r;g;b) no
+  longer misread as dim; the two-file marker read is linearized by a
+  coherence re-read and is three-valued (an unpaired running marker
+  is affirmative turn-in-flight evidence and vetoes both lanes);
+  marker identity requires a matching transcript device/inode and
+  ended >= running ordering; the pre-typing revalidation captures
+  before its final marker read; SUBMITTED/ACKED attempts keep the
+  fast poll cadence; the modal pattern requires indentation so a
+  history echo of a prompt starting "1. " can't starve the watcher;
+  starvation timing runs from first eligibility. Documented
+  limitations: co-installed BLOCKING Stop hooks can fake a turn end
+  (bounded: the typed /compact queues to the real boundary); modal
+  coverage is the numbered-selection shape.
+  Live-suite catches, fixed: an explicit model request now overrides
+  a THRESHOLD latch (still_above_rearm_band) instead of starving until
+  the re-arm band fills; the harness allows the Bash tool so the s14
+  topology can actually run. (s16's queued-/compact pin
+  stayed inconclusive in that run — the turn ended before injection —
+  and remains an informational scenario.)
+  Design: GPT-5.6 Sol rounds 1-4 (2026-08-18), two-file marker
+  protocol green-lit round 3, final sign-off round 4; Opus + Sol
+  audit rounds same date.
+
 - Per-session threshold overrides, changeable mid-flight: a new
   `override` CLI subcommand writes a validated
   `<state_dir>/overrides/<sid>.json` (`trigger`/`soft`/`hard`/

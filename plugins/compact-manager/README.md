@@ -10,8 +10,12 @@ two stages:
   after compaction. Pure hooks, any platform, zero risk.
 - **managed** (opt-in, per session) — additionally runs `/compact` for
   you at the right moment, by typing it into the session's tmux pane
-  only when it has verified the pane is idle and safe. For autonomous
-  sessions that must keep working past one context window.
+  only when it has verified the composer is input-safe: either the
+  whole pane is idle, or — for a model-requested or hard-threshold
+  compaction — the foreground turn has provably ended (paired hook
+  markers) and the composer is empty, even while background tasks keep
+  the pane busy. For autonomous sessions that must keep working past
+  one context window.
 
 ## Quick start
 
@@ -224,12 +228,23 @@ Managed-mode knobs (all clamped to safe ranges):
 ## How it works / limitations
 
 Five thin hooks (PostToolUse, UserPromptSubmit, PreCompact,
-SessionStart, and a reserved Stop no-op), all fail-open — any error
-means silence, never a blocked session. Measurement parses the
-session's transcript file incrementally; compaction is detected from
-the transcript's own boundary records, and in managed mode the typed
-command carries a one-time tag that must round-trip through the
-PreCompact hook before the watcher believes its compaction happened.
+SessionStart, and Stop), all fail-open — any error means silence,
+never a blocked session. UserPromptSubmit and Stop additionally write
+a paired turn marker (running/ended, keyed by the turn's `prompt_id`):
+the watcher trusts "the foreground turn ended" only when the two
+halves pair, which lets a requested compaction type into a session
+whose background tasks never leave the pane idle — the composer must
+still be exactly empty (dim ghost-suggestion text counts as empty; a
+half-typed prompt or a modal never does), and input-opportunity
+retries stay at the poll cadence instead of decaying into exponential
+backoff. If a requested or hard-threshold compaction stays blocked
+for two minutes, the watcher journals a starvation alert and flags
+ATTENTION in `status`/`overview` while continuing to retry.
+Measurement parses the session's transcript file incrementally;
+compaction is detected from the transcript's own boundary records,
+and in managed mode the typed command carries a one-time tag that
+must round-trip through the PreCompact hook before the watcher
+believes its compaction happened.
 Watcher ownership is leased per session and pane, so two watchers can
 never fight over one pane, and a crashed watcher is recovered
 conservatively — anything uncertain becomes an alert for a human, not
@@ -238,6 +253,22 @@ a retry.
 - Built on undocumented Claude Code internals (transcript format,
   session registry); format drift degrades to silence, and the
   measured shapes are pinned in `docs/spikes/compact-manager.md`.
+- The turn-boundary lane's turn-end proof cannot survive a
+  co-installed BLOCKING Stop hook (one that returns
+  `decision: "block"` to force the turn to continue): the ended
+  marker is written before the block takes effect, so the lane may
+  treat a forcibly-continued turn as ended. Worst case is bounded —
+  the typed `/compact` queues to the real turn boundary — but if you
+  run blocking Stop hooks, don't rely on the boundary lane's timing.
+  The marker records `stop_hook_active` for diagnosis. Conversely, a
+  flaky Stop hook (missed or timed-out writes) leaves the marker
+  reading "running" until the next turn completes, deferring both
+  lanes in the interim — the safe direction, surfaced by the
+  starvation alert rather than by unsafe typing.
+- The modal veto recognizes the numbered-selection dialog shape
+  (indented `❯ 1. …` rows); other dialogs are covered only by the
+  composer checks (a dialog that hides the composer vetoes as
+  absent/unknown).
 - Measurement reflects the last completed model call.
 - Headless (`-p`) sessions get the post-compaction state on their next
   prompt rather than instantly.
