@@ -242,6 +242,166 @@ class LeaseTests(unittest.TestCase):
         self.assertTrue(ok, detail)
         self.assertTrue(managed.leases_owned(self.paths, self.token))
 
+    def test_prune_defers_journal_while_session_state_fresh(self):
+        # A marathon session can outlive its dead watcher's lease TTL;
+        # reaping its journal then would flip a real fired-compacts
+        # count to null ("never watched") while the session is still on
+        # the overview (Sol round-1). Cleanup must wait for the state
+        # file to age out of the 24h window.
+        now = 10_000_000
+        lease_dir = os.path.join(self.temp.name, "managed", "leases")
+        cm._private_makedirs(lease_dir)
+        dead = {"run_token": "t" * 16, "pid": 999, "proc_start": 1,
+                "heartbeat_at": now - 8 * 86_400}
+        managed._atomic_json(
+            os.path.join(lease_dir, "session-oldsid.json"), dead)
+        managed._atomic_json(os.path.join(lease_dir, "pane-x.json"), dead)
+        journal = os.path.join(self.temp.name, "managed", "watchers",
+                               "oldsid.journal.jsonl")
+        managed.journal_record(journal, "ACKED",
+                               {"attempt_id": "a", "nonces": []})
+        state_dir = os.path.join(self.temp.name, "state")
+        os.makedirs(state_dir)
+        state_path = os.path.join(state_dir, "oldsid.json")
+        with open(state_path, "w") as fh:
+            fh.write("{}")
+        os.utime(state_path, (now - 100, now - 100))
+        managed._prune_managed_locked(self.cfg, now=now,
+                                      proc_root=self.proc)
+        self.assertTrue(os.path.exists(journal))
+        os.utime(state_path, (now - 86_401, now - 86_401))
+        managed._prune_managed_locked(self.cfg, now=now,
+                                      proc_root=self.proc)
+        self.assertFalse(os.path.exists(journal))
+
+    def test_prune_leaves_tokenless_lease_and_artifacts_untouched(self):
+        # A dead, stale lease MISSING run_token has no cleanup
+        # authority: deleting its artifacts and then KeyErroring out of
+        # acquire_leases would poison every later adoption (Sol
+        # round-3 blocker). It must be skipped entirely, no exception.
+        now = 10_000_000
+        lease_dir = os.path.join(self.temp.name, "managed", "leases")
+        cm._private_makedirs(lease_dir)
+        managed._atomic_json(
+            os.path.join(lease_dir, "session-oldsid.json"),
+            {"pid": 999, "proc_start": 1,
+             "heartbeat_at": now - 8 * 86_400})
+        journal = os.path.join(self.temp.name, "managed", "watchers",
+                               "oldsid.journal.jsonl")
+        managed.journal_record(journal, "ACKED",
+                               {"attempt_id": "a", "nonces": []})
+        managed._prune_managed_locked(self.cfg, now=now,
+                                      proc_root=self.proc)
+        self.assertTrue(os.path.exists(journal))
+        self.assertTrue(os.path.exists(
+            os.path.join(lease_dir, "session-oldsid.json")))
+
+    def test_prune_sweeps_leaseless_stale_artifacts(self):
+        # Clean retirement releases both leases but leaves the journal;
+        # nothing ever revisited those files (Sol round-3). Past the
+        # TTL, with the session off the overview, they are swept — but
+        # a fresh state file, a recent mtime, or the session being
+        # acquired all keep them.
+        now = 10_000_000
+        cm._private_makedirs(
+            os.path.join(self.temp.name, "managed", "leases"))
+        wdir = os.path.join(self.temp.name, "managed", "watchers")
+        old = now - 8 * 86_400
+        swept = os.path.join(wdir, "gone.journal.jsonl")
+        managed.journal_record(swept, "WATCHER_RETIRED",
+                               {"attempt_id": None, "nonces": []})
+        os.utime(swept, (old, old))
+        recent = os.path.join(wdir, "recent.journal.jsonl")
+        managed.journal_record(recent, "WATCHER_RETIRED",
+                               {"attempt_id": None, "nonces": []})
+        fresh_state = os.path.join(wdir, "freshstate.journal.jsonl")
+        managed.journal_record(fresh_state, "WATCHER_RETIRED",
+                               {"attempt_id": None, "nonces": []})
+        os.utime(fresh_state, (old, old))
+        state_dir = os.path.join(self.temp.name, "state")
+        os.makedirs(state_dir)
+        with open(os.path.join(state_dir, "freshstate.json"), "w") as fh:
+            fh.write("{}")
+        acquiring = os.path.join(wdir, "session-1234.journal.jsonl")
+        managed.journal_record(acquiring, "SUBMITTED",
+                               {"attempt_id": "x", "nonces": []})
+        os.utime(acquiring, (old, old))
+        managed._prune_managed_locked(
+            self.cfg,
+            exclude_session_lease=self.paths["session_lease"],
+            now=now, proc_root=self.proc)
+        self.assertFalse(os.path.exists(swept))
+        self.assertTrue(os.path.exists(recent))
+        self.assertTrue(os.path.exists(fresh_state))
+        self.assertTrue(os.path.exists(acquiring))
+
+    def test_prune_sweep_respects_last_instant_identity(self):
+        # The advisor's atomic replace is NOT under the txn lock: if
+        # the pathname holds a different file by unlink time (inode or
+        # mtime changed), eligibility was judged on a different file
+        # and the sweep must leave it alone (Sol round-4).
+        now = 10_000_000
+        cm._private_makedirs(
+            os.path.join(self.temp.name, "managed", "leases"))
+        wdir = os.path.join(self.temp.name, "managed", "watchers")
+        target = os.path.join(wdir, "gone.journal.jsonl")
+        managed.journal_record(target, "WATCHER_RETIRED",
+                               {"attempt_id": None, "nonces": []})
+        old = now - 8 * 86_400
+        os.utime(target, (old, old))
+        real_lstat = os.lstat
+        seen = {"n": 0}
+
+        def replaced_between_checks(path, *args, **kwargs):
+            res = real_lstat(path, *args, **kwargs)
+            if os.fspath(path).endswith("gone.journal.jsonl"):
+                seen["n"] += 1
+                if seen["n"] == 2:  # the pre-unlink re-proof
+                    return os.stat_result(
+                        (res.st_mode, res.st_ino + 1, res.st_dev,
+                         res.st_nlink, res.st_uid, res.st_gid,
+                         res.st_size, res.st_atime, res.st_mtime,
+                         res.st_ctime))
+            return res
+
+        with mock.patch.object(managed.os, "lstat",
+                               side_effect=replaced_between_checks):
+            managed._prune_managed_locked(self.cfg, now=now,
+                                          proc_root=self.proc)
+        self.assertEqual(seen["n"], 2)
+        self.assertTrue(os.path.exists(target))
+
+    def test_prune_reaps_session_lease_orphaned_by_pane_reuse(self):
+        # While the fresh-state deferral holds a dead pair, another
+        # session's acquisition can reuse the pane and overwrite the
+        # pane lease with a new token. Once the state ages out, the
+        # old session lease has ZERO matching pane leases — it must
+        # still be reclaimable, not orphaned forever (Sol round-2).
+        now = 10_000_000
+        lease_dir = os.path.join(self.temp.name, "managed", "leases")
+        cm._private_makedirs(lease_dir)
+        dead = {"run_token": "t" * 16, "pid": 999, "proc_start": 1,
+                "heartbeat_at": now - 8 * 86_400}
+        managed._atomic_json(
+            os.path.join(lease_dir, "session-oldsid.json"), dead)
+        # The pane lease now belongs to a LIVE successor token.
+        managed._atomic_json(
+            os.path.join(lease_dir, "pane-x.json"),
+            {"run_token": "u" * 16, "pid": 50, "proc_start": 5050,
+             "heartbeat_at": now})
+        journal = os.path.join(self.temp.name, "managed", "watchers",
+                               "oldsid.journal.jsonl")
+        managed.journal_record(journal, "ACKED",
+                               {"attempt_id": "a", "nonces": []})
+        managed._prune_managed_locked(self.cfg, now=now,
+                                      proc_root=self.proc)
+        self.assertFalse(os.path.exists(journal))
+        self.assertFalse(os.path.exists(
+            os.path.join(lease_dir, "session-oldsid.json")))
+        # The successor's pane lease is untouched.
+        self.assertTrue(os.path.exists(
+            os.path.join(lease_dir, "pane-x.json")))
+
     def test_second_failure_rolls_back_first(self):
         cm._private_makedirs(os.path.dirname(self.paths["pane_lease"]))
         managed._atomic_json(
@@ -468,6 +628,39 @@ class StateMachineTests(unittest.TestCase):
         out = self.step("TYPED_VERIFIED", "submission_uncertain")
         self.assertEqual(out["state"], "SUBMISSION_UNCERTAIN")
 
+    def test_fast_completion_carries_own_proof(self):
+        # OWN packet and boundary land inside ONE poll: SUBMITTED jumps
+        # straight to BOUNDARY_CONFIRMED with no ACKED journal record,
+        # so the record itself must carry the proof the confirmed
+        # compaction was ours (Sol round-1 blocker: the fired-compacts
+        # counter read 0 for a normal fast success).
+        own = {"seq": 1, "custom_instructions":
+               "[cm-%s] ok" % self.attempt["nonce"]}
+        out = self.step("SUBMITTED", "timer", now=103, packet=own,
+                        gen=dict(self.gen, file_epoch=2))
+        self.assertEqual(out["state"], "BOUNDARY_CONFIRMED")
+        self.assertIs(out.get("own_packet_proof"), True)
+
+    def test_uncertain_submission_fast_boundary_carries_own_proof(self):
+        # SUBMISSION_UNCERTAIN also reaches the generation branch: an
+        # own packet plus boundary inside one poll proves the uncertain
+        # submission actually fired.
+        own = {"seq": 1, "custom_instructions":
+               "[cm-%s] ok" % self.attempt["nonce"]}
+        out = self.step("SUBMISSION_UNCERTAIN", "timer", now=103,
+                        packet=own, gen=dict(self.gen, file_epoch=2))
+        self.assertEqual(out["state"], "BOUNDARY_CONFIRMED")
+        self.assertIs(out.get("own_packet_proof"), True)
+
+    def test_foreign_fast_boundary_carries_no_own_proof(self):
+        # A native compaction resolving a deferred attempt is NOT the
+        # manager's compact — no own-proof may be fabricated.
+        foreign = {"seq": 99, "trigger": "auto", "custom_instructions": ""}
+        out = self.step("DEFERRED", "timer", now=103, packet=foreign,
+                        gen=dict(self.gen, file_epoch=2))
+        self.assertEqual(out["state"], "BOUNDARY_CONFIRMED")
+        self.assertFalse(out.get("own_packet_proof"))
+
     def test_own_nonce_ignores_sequence_floor(self):
         self.attempt["state"] = "SUBMISSION_UNCERTAIN"
         packet = {"seq": 0, "custom_instructions":
@@ -475,6 +668,50 @@ class StateMachineTests(unittest.TestCase):
         out = managed.transition_attempt(self.attempt, "timer", 100,
                                          self.cfg, packet, self.gen)
         self.assertEqual(out["state"], "ACKED")
+
+    def test_journal_never_launders_hostile_proof_values(self):
+        # bool("false") is True; a hostile journal value replayed
+        # through recovery must not upgrade into real proof (Sol
+        # round-3). Only the exact True survives serialization.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "j.jsonl")
+        managed.journal_record(path, "CLEANUP_REQUIRED",
+                               {"attempt_id": "a", "nonces": [],
+                                "own_packet_proof": "false"})
+        managed.journal_record(path, "CLEANUP_REQUIRED",
+                               {"attempt_id": "b", "nonces": [],
+                                "own_packet_proof": True})
+        records = managed.read_journal(path)
+        self.assertIs(records[0]["own_packet_proof"], False)
+        self.assertIs(records[1]["own_packet_proof"], True)
+
+    def test_stamp_recovered_proof(self):
+        # Recovery-time classification: a crashed retry's terminal
+        # mapping keeps the first submission's own-packet proof; a
+        # foreign packet stamps nothing; hostile journal-derived
+        # fields never raise (Sol round-3).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = dict(cm._DEFAULTS, state_dir=tmp.name)
+        sid = "sid-1"
+        packet_file = managed.packet_path(cfg, sid)
+        cm._private_makedirs(os.path.dirname(packet_file))
+        with open(packet_file, "w") as fh:
+            json.dump({"seq": 3, "custom_instructions": "[cm-n1] x"}, fh)
+        recovered = {"state": "CLEANUP_REQUIRED", "nonces": ["n1", "n2"],
+                     "attempt_packet_seq_floor": 5}
+        managed._stamp_recovered_proof(recovered, cfg, sid)
+        self.assertIs(recovered.get("own_packet_proof"), True)
+        foreign = {"state": "CLEANUP_REQUIRED", "nonces": ["zz"],
+                   "attempt_packet_seq_floor": 0}
+        managed._stamp_recovered_proof(foreign, cfg, sid)
+        self.assertNotIn("own_packet_proof", foreign)
+        hostile = {"state": "CLEANUP_REQUIRED", "nonces": ["zz"],
+                   "attempt_packet_seq_floor": "not-an-int"}
+        managed._stamp_recovered_proof(hostile, cfg, sid)  # must not raise
+        self.assertNotIn("own_packet_proof", hostile)
+        managed._stamp_recovered_proof(None, cfg, sid)  # must not raise
 
     def test_floor_immutable_across_single_retry(self):
         submitted = self.step("TRIGGERED", "submitted")
@@ -983,6 +1220,29 @@ class RunLadderTests(unittest.TestCase):
         self.assertEqual(out["state"], "CLEANUP_REQUIRED")
         self.assertEqual(out["reason"], "R6_prime_own_packet_late")
         self.assertEqual(tmux.enters(), [])
+        # The late own packet proves the first submission fired: the
+        # terminal CLEANUP_REQUIRED record must carry the proof so the
+        # fired-compacts counter keeps it (Sol round-2 major).
+        self.assertIs(out.get("own_packet_proof"), True)
+        tail = managed.read_journal(self.paths["journal"])[-1]
+        self.assertEqual(tail["state"], "CLEANUP_REQUIRED")
+        self.assertIs(tail["own_packet_proof"], True)
+
+    def test_r6_own_proof_survives_competing_abort(self):
+        # Binding/composer failures take precedence over the
+        # own_packet_late detail — but the OWN packet in hand is still
+        # proof the first submission fired, and CLEANUP_REQUIRED never
+        # re-inspects the packet (Sol round-3).
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE])
+        packet = {"seq": 7,
+                  "custom_instructions": "[cm-%s]" % self.attempt["nonce"]}
+        out = self.run_ladder(tmux, packet=packet)
+        self.assertEqual(out["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(out["reason"], "R6_prime_composer_mismatch")
+        self.assertEqual(tmux.enters(), [])
+        self.assertIs(out.get("own_packet_proof"), True)
+        tail = managed.read_journal(self.paths["journal"])[-1]
+        self.assertIs(tail["own_packet_proof"], True)
 
     def test_r6_reobserves_boundary_advance(self):
         tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text])
@@ -1223,6 +1483,33 @@ class TickWiringTests(unittest.TestCase):
                   managed.read_journal(self.paths["journal"])]
         for want in ("TRIGGERED", "PREPARED", "TYPED_VERIFIED", "SUBMITTED"):
             self.assertIn(want, states)
+
+    def test_fast_own_completion_counts_end_to_end(self):
+        # Full pipeline pin (Sol round-2): tick 1 runs the real ladder
+        # to SUBMITTED; the OWN packet AND the boundary then land
+        # inside one poll; tick 2 journals BOUNDARY_CONFIRMED carrying
+        # own proof, no ACKED record ever exists, and the counter still
+        # sees the fired compact.
+        watcher = self.make_watcher([usage_row(170000)], EchoTmux())
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "SUBMITTED"))
+        nonce = watcher.attempt["nonce"]
+        packet_file = managed.packet_path(self.cfg, self.sid)
+        cm._private_makedirs(os.path.dirname(packet_file))
+        with open(packet_file, "w") as fh:
+            json.dump({"seq": 1, "custom_instructions": "[cm-%s]" % nonce,
+                       "base_compaction_count": 0}, fh)
+        append_rows(self.transcript, [boundary_row(post=5000)])
+        keep, _ = watcher.tick()
+        self.assertTrue(keep)
+        records = list(managed.read_journal(self.paths["journal"]))
+        states = [r["state"] for r in records]
+        self.assertIn("BOUNDARY_CONFIRMED", states)
+        self.assertNotIn("ACKED", states)
+        confirmed = [r for r in records
+                     if r["state"] == "BOUNDARY_CONFIRMED"][-1]
+        self.assertIs(confirmed["own_packet_proof"], True)
+        self.assertEqual(managed.cm_compact_count(self.cfg, self.sid), 1)
 
     def test_notify_escapes_tmux_format_expansion(self):
         shown = []
@@ -1555,6 +1842,96 @@ class OverviewTests(unittest.TestCase):
             self.assertNotIn("Infinity", json.dumps(s))
         # text renderer consumes the same data without crashing
         self.assertIn("aaaa-ful", managed.overview_text(cfg, now=now))
+
+    def test_overview_counts_manager_fired_compacts(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=tmp.name,
+                   context_window=200_000)
+        state_dir = os.path.join(tmp.name, "state")
+        os.makedirs(state_dir)
+        for sid in ("watched-sid", "plain-sid"):
+            with open(os.path.join(state_dir, sid + ".json"), "w") as fh:
+                json.dump({"model": "claude-opus-5", "current": 10_000,
+                           "peak": 10_000}, fh)
+        journal = os.path.join(tmp.name, "managed", "watchers",
+                               "watched-sid.journal.jsonl")
+        # Attempt A fired and completed; the recovery replay of ACKED
+        # must not double-count the same attempt.
+        a = {"attempt_id": "aaa", "nonce": "n1", "nonces": ["n1"]}
+        for state in ("TRIGGERED", "SUBMITTED", "ACKED", "ACKED",
+                      "BOUNDARY_CONFIRMED"):
+            managed.journal_record(journal, state, a)
+        # Attempt B fired (own nonce reached PreCompact); completion
+        # still pending — already a fired compact.
+        managed.journal_record(journal, "ACKED",
+                               {"attempt_id": "bbb", "nonces": ["n2"]})
+        # Attempt C: deferred-foreign resolved by a NATIVE compaction —
+        # BOUNDARY_CONFIRMED without own proof is not the manager's.
+        c = {"attempt_id": "ccc", "nonces": ["n3"]}
+        managed.journal_record(journal, "DEFERRED", c,
+                               reason="foreign_packet")
+        managed.journal_record(journal, "BOUNDARY_CONFIRMED", c)
+        # Attempt D: fast completion — packet and boundary inside one
+        # poll journals BOUNDARY_CONFIRMED with own proof, never ACKED.
+        managed.journal_record(journal, "BOUNDARY_CONFIRMED",
+                               {"attempt_id": "ddd", "nonces": ["n4"],
+                                "own_packet_proof": True})
+        # Attempt E: retry aborted at R6' on a late own packet — the
+        # proof-stamped CLEANUP_REQUIRED still counts the fired compact.
+        managed.journal_record(journal, "CLEANUP_REQUIRED",
+                               {"attempt_id": "eee", "nonces": ["n5"],
+                                "own_packet_proof": True},
+                               reason="R6_prime_own_packet_late")
+        # Hostile schema-valid records: non-string attempt ids must
+        # neither crash the count nor fabricate fired compacts.
+        for bad_id in (["x"], 7, True, ""):
+            managed.journal_record(journal, "ACKED",
+                                   {"attempt_id": bad_id, "nonces": []})
+        # A watched session whose journal holds no fired attempt is 0,
+        # not blank.
+        idle_journal = os.path.join(tmp.name, "managed", "watchers",
+                                    "plain-sid.journal.jsonl")
+        managed.journal_record(idle_journal, "WATCHER_READY",
+                               {"attempt_id": None, "nonces": []})
+        now = time.time()
+        data = managed.overview_data(cfg, now=now)
+        json.dumps(data)
+        rows = {s["session_id"]: s for s in data["sessions"]}
+        self.assertEqual(rows["watched-sid"]["cm_compacts"], 4)
+        self.assertEqual(rows["plain-sid"]["cm_compacts"], 0)
+        # No journal at all means unmanaged, not zero fired compacts.
+        with open(os.path.join(state_dir, "nojournal-sid.json"), "w") as fh:
+            json.dump({"model": "claude-opus-5", "current": 1,
+                       "peak": 1}, fh)
+        data = managed.overview_data(cfg, now=time.time())
+        rows = {s["session_id"]: s for s in data["sessions"]}
+        self.assertIsNone(rows["nojournal-sid"]["cm_compacts"])
+        out = managed.overview_text(cfg, now=now)
+        self.assertIn("  cm  ", out)
+        watched = [l for l in out.splitlines()
+                   if "watched-" in l and "opus" in l][0]
+        # Row tail is: ... trig cm "Ns ago" alive — cm sits 4th from end.
+        self.assertEqual(watched.split()[-4], "4")
+        self.assertIn("(cm = compactions", out)
+        # Torn/garbage journal bytes degrade to what parses, never raise.
+        with open(journal, "ab") as fh:
+            fh.write(b"\x00garbage\n")
+        self.assertEqual(managed.cm_compact_count(cfg, "watched-sid"), 4)
+        # A PRESENT journal that cannot be read is unknown (None),
+        # never a definite 0 (Sol round-3).
+        os.chmod(journal, 0)
+        try:
+            self.assertIsNone(
+                managed.cm_compact_count(cfg, "watched-sid"))
+        finally:
+            os.chmod(journal, 0o600)
+        # The outer guard: an unexpected reader explosion degrades to
+        # None, never an exception out of the readout.
+        with mock.patch.object(managed, "_journal_records",
+                               side_effect=RuntimeError("boom")):
+            self.assertIsNone(
+                managed.cm_compact_count(cfg, "watched-sid"))
 
     def test_per_model_trigger_override(self):
         tmp = tempfile.TemporaryDirectory()

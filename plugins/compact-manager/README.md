@@ -157,7 +157,27 @@ display truthfully. Keys set via the `override` subcommand (see the
 configuration reference) beat even the stamps, so a mid-session
 change reads truthfully immediately rather than at the session's next
 tool call. The text table's `trig` column and the JSON's
-per-row `soft_pct`/`hard_pct`/`trigger_pct` carry the result. The monorepo's `tools/status.py` is the
+per-row `soft_pct`/`hard_pct`/`trigger_pct` carry the result.
+The `cm` column (JSON: `cm_compacts`) counts the compactions the
+manager itself fired for that session, from the watcher journal:
+attempts whose `[cm-…]` nonce provably reached PreCompact — journaled
+as ACKED, or as any record stamped `own_packet_proof` (a fast
+completion where packet and boundary landed inside one poll, or a
+retry aborted at R6′ by its first submission's late own packet) —
+deduped per attempt so retries and recovery replays count once. The
+proof is kept even when another abort outranks the own-packet detail
+at R6′, and watcher recovery re-classifies the packet once before
+journaling a terminal mapping. Native auto-compactions and human
+`/compact`s never carry the nonce proof and are not counted; an
+attempt that safety-latched or terminalized without its packet ever
+being observed (rare crash/abort races) is conservatively not
+counted — the number is a floor, never an overcount.
+Blank/`null` means the count is unavailable: no retained watcher
+journal (unmanaged, or long since reaped) or a journal that could
+not be read — distinct from a watched session at `0`. The managed TTL reaper defers deleting a dead watcher's
+journal while the session's state file is still inside the
+overview's 24h window, so a displayed count can't flip to `null`
+mid-display. The monorepo's `tools/status.py` is the
 complementary dev-side readout (knob-by-knob config provenance and
 hook wiring across the whole suite); the two deliberately do not
 overlap.

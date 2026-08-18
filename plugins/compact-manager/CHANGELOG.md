@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Overview: per-session count of compactions the manager itself fired
+  (`cm` column in the text table, `cm_compacts` in `overview --json`).
+  Derived read-only from the watcher journal — attempts with own-nonce
+  proof: ACKED, or the new `own_packet_proof` journal field stamped on
+  a fast completion's BOUNDARY_CONFIRMED (packet and boundary inside
+  one poll — Sol round-1 blocker) and on a retry's CLEANUP_REQUIRED
+  whose late own packet proved the first submission fired (Sol
+  round-2). Deduped by attempt_id so retries/recovery replays count
+  once; deferred-foreign attempts resolved by native compactions do
+  not count, and hostile non-string attempt ids neither crash nor
+  count. `null`/blank = no retained watcher journal, distinct from a
+  watched session at 0. The managed TTL reaper now defers a dead
+  watcher's journal cleanup while the session's state file is inside
+  the overview's 24h window, so a displayed count can't flip to null
+  (Sol round-1) — and a session lease orphaned by pane reuse during
+  that deferral stays reclaimable (zero-pane-match reap, Sol
+  round-2). Round-3 hardening: a tokenless (malformed) lease is
+  skipped entirely instead of deleting artifacts and KeyErroring out
+  of acquisition; own proof survives a competing R6′ abort and is
+  re-classified once at watcher recovery; journal writes persist
+  `own_packet_proof` only for the exact True (no bool() laundering);
+  a present-but-unreadable journal reports null, not 0 (null/blank =
+  "count unavailable", covering absent AND unreadable journals); and
+  the pruner sweeps lease-less journal/scan/request files past the
+  TTL once their session ages off the overview (they previously
+  accumulated forever), re-proving each file's identity (inode +
+  mtime) at the last instant so a concurrent atomic replace can't
+  lose a fresh file (Sol round-4).
+
 - Turn-boundary lane: the watcher can now type a requested (or
   hard-threshold) `/compact` at a foreground turn boundary even while
   background tasks keep the pane busy — the failure that let a

@@ -333,6 +333,14 @@ def _prune_managed_locked(cfg, exclude_session_lease=None, now=None,
         lease, session_inode = read_json_inode(session_path)
         if not lease or lease_is_live(lease, now, proc_root):
             continue
+        # Cleanup authority needs a real token BEFORE anything is
+        # deleted: a malformed tokenless lease must stay untouched, not
+        # have its artifacts removed and then KeyError out of
+        # acquire_leases, poisoning every later adoption (Sol round-3
+        # blocker). It would also make token-less pane leases "match".
+        token = lease.get("run_token")
+        if not isinstance(token, str) or not token:
+            continue
         matches = []
         ambiguous = False
         for pane_name in pane_names:
@@ -343,14 +351,32 @@ def _prune_managed_locked(cfg, exclude_session_lease=None, now=None,
                 break
             if pane and pane.get("run_token") == lease.get("run_token"):
                 matches.append((pane_path, pane, pane_inode))
-        if (ambiguous or len(matches) != 1 or
-                lease_is_live(matches[0][1], now, proc_root)):
+        # Zero matches is reclaimable too: the fresh-state deferral
+        # below can hold a dead pair across a pane reuse, whose
+        # acquisition overwrites the pane lease with a new token — the
+        # session lease would then be orphaned forever if exactly one
+        # match were required (Sol round-2). More than one match, or
+        # any unreadable pane lease, stays ambiguous and untouched.
+        if ambiguous or len(matches) > 1 or (
+                matches and lease_is_live(matches[0][1], now, proc_root)):
             continue
         # Retention age keys off the last heartbeat, not merely an old scan.
         heartbeat = _finite_number(lease.get("heartbeat_at"))
         if heartbeat is None or heartbeat >= cutoff:
             continue
         sid = name[len("session-"):-len(".json")]
+        # A session still on the overview (state file touched <24h, the
+        # window overview_data uses) keeps its journal even though its
+        # watcher is long dead: deleting it would flip a real fired-
+        # compacts count to null ("never watched") mid-display (Sol
+        # round-1). Cleanup just waits until the session ages out.
+        try:
+            state_mtime = os.path.getmtime(
+                os.path.join(cfg["state_dir"], "state", sid + ".json"))
+            if now - state_mtime <= 86_400:
+                continue
+        except OSError:
+            pass
         session_paths = managed_paths(cfg, sid)
         for artifact in (session_paths["journal"], session_paths["scan"],
                          session_paths["request"]):
@@ -360,10 +386,74 @@ def _prune_managed_locked(cfg, exclude_session_lease=None, now=None,
                     os.unlink(artifact)
             except OSError:
                 pass
-        conditional_remove(matches[0][0], lease["run_token"],
-                           matches[0][2], locked=True)
-        conditional_remove(session_path, lease["run_token"], session_inode,
+        if matches:
+            conditional_remove(matches[0][0], token,
+                               matches[0][2], locked=True)
+        conditional_remove(session_path, token, session_inode,
                            locked=True)
+    # Journal/scan/request files whose session lease is already gone
+    # (clean retirement releases both leases; the fresh-state deferral
+    # above can also outlive its lease) would otherwise accumulate
+    # forever — nothing ever revisits them once the lease loop can't
+    # see them (Sol round-3). Sweep them once their own mtime passes
+    # the same TTL and the session has aged off the overview. The
+    # session being acquired stays untouched: its journal tail may
+    # require recovery.
+    exclude_sid = ""
+    if exclude_session_lease:
+        base_name = os.path.basename(exclude_session_lease)
+        if base_name.startswith("session-") and base_name.endswith(".json"):
+            exclude_sid = base_name[len("session-"):-len(".json")]
+    for directory, suffix in (
+            (os.path.join(cfg["state_dir"], "managed", "watchers"),
+             ".journal.jsonl"),
+            (os.path.join(cfg["state_dir"], "managed", "watchers"),
+             ".scan.json"),
+            (os.path.join(cfg["state_dir"], "managed", "requests"),
+             ".json")):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(suffix):
+                continue
+            sid = name[:len(name) - len(suffix)]
+            if (not sid or sid == exclude_sid or
+                    ("session-%s.json" % sid) in session_names):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                before = os.lstat(path)
+                if stat.S_ISLNK(before.st_mode) or \
+                        not stat.S_ISREG(before.st_mode):
+                    continue
+                if before.st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            try:
+                state_mtime = os.path.getmtime(os.path.join(
+                    cfg["state_dir"], "state", sid + ".json"))
+                if now - state_mtime <= 86_400:
+                    continue
+            except OSError:
+                pass  # no state file — nothing keeps the artifact alive
+            try:
+                # Re-prove identity at the last instant: the advisor's
+                # atomic replace and the model's request writes are NOT
+                # under this txn lock, so the pathname may now hold a
+                # FRESH file (Sol round-4). A changed inode or mtime
+                # means eligibility was judged on a different file —
+                # leave it for a future prune.
+                after = os.lstat(path)
+                if (after.st_ino != before.st_ino or
+                        after.st_mtime != before.st_mtime or
+                        not stat.S_ISREG(after.st_mode)):
+                    continue
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def acquire_leases(paths, run_token, pid, proc_start, now=None,
@@ -931,6 +1021,12 @@ def journal_record(path, state, attempt, now_wall=None, **extra):
         "defer_class": attempt.get("defer_class"),
         "activity_rev_at_defer": attempt.get("activity_rev_at_defer"),
         "starvation_alerted": bool(attempt.get("starvation_alerted")),
+        # Own-packet proof (fast completion in transition_attempt, or a
+        # late own packet at ladder R6'): without persisting it,
+        # cm_compact_count loses the fired compact. `is True`, not
+        # bool(): a hostile journal value like "false" replayed through
+        # recovery must not launder into true (Sol round-3).
+        "own_packet_proof": attempt.get("own_packet_proof") is True,
         "timers": dict(attempt.get("timers", {})),
     }
     record.update(extra)
@@ -938,13 +1034,8 @@ def journal_record(path, state, attempt, now_wall=None, **extra):
     return record
 
 
-def read_journal(path):
+def _journal_records(lines):
     records = []
-    try:
-        with open(path, "rb") as fh:
-            lines = fh.readlines()
-    except OSError:
-        return records
     for raw in lines:
         if not raw.endswith(b"\n"):
             continue
@@ -955,6 +1046,56 @@ def read_journal(path):
         except Exception:
             continue
     return records
+
+
+def read_journal(path):
+    try:
+        with open(path, "rb") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    return _journal_records(lines)
+
+
+def cm_compact_count(cfg, session_id):
+    """Compactions this manager fired for the session, from its watcher
+    journal: attempts with own-packet proof — ACKED (the [cm-nonce]
+    instruction provably arrived at PreCompact) or any record stamped
+    own_packet_proof (a fast completion's BOUNDARY_CONFIRMED when
+    packet and boundary landed inside one poll, or a retry's
+    CLEANUP_REQUIRED whose late own packet proved the first submission
+    fired). Deduped by attempt_id (retries re-nonce within one
+    attempt; recovery replays re-journal a state), so each fired
+    compact counts once. Deferred-foreign attempts (native
+    auto-compact, a human /compact) never carry own proof and never
+    count. None = count unavailable: no retained journal (unmanaged)
+    or a journal that cannot be read — never a definite zero. A
+    malformed-but-readable journal degrades to whatever parses, never
+    an exception."""
+    path = os.path.join(cfg["state_dir"], "managed", "watchers",
+                        session_id + ".journal.jsonl")
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return None
+        # Read directly (not via read_journal) so a PRESENT journal
+        # that cannot be read reports unknown, never a definite 0
+        # (Sol round-3).
+        with open(path, "rb") as fh:
+            lines = fh.readlines()
+        fired = set()
+        for r in _journal_records(lines):
+            if r.get("state") != "ACKED" and \
+                    r.get("own_packet_proof") is not True:
+                continue
+            # Only manager-shaped ids count: a hostile schema-valid
+            # record with a list/int/bool attempt_id must neither
+            # crash the readout nor fabricate a fired compact.
+            attempt_id = r.get("attempt_id")
+            if isinstance(attempt_id, str) and attempt_id:
+                fired.add(attempt_id)
+        return len(fired)
+    except Exception:
+        return None
 
 
 def attempt_tail(path):
@@ -974,6 +1115,24 @@ def boot_id(proc_root="/proc"):
 
 def recover_attempt(path, current_boot_id):
     return recover_attempt_records(read_journal(path), current_boot_id)
+
+
+def _stamp_recovered_proof(recovered, cfg, session_id):
+    """A recovered attempt that terminalizes (e.g. PREPARED ->
+    CLEANUP_REQUIRED after a retry crash) never re-inspects the packet
+    — but the FIRST submission's own packet may have landed while the
+    watcher was down. Classify once at recovery so the durable record
+    keeps the fired-compact proof (Sol round-3). Fail-open: journal-
+    derived fields are untrusted and must not break watcher startup
+    for a metadata stamp."""
+    if recovered is None or recovered.get("own_packet_proof") is True:
+        return
+    try:
+        if packet_classification(
+                recovered, load_layer1_packet(cfg, session_id)) == "OWN":
+            recovered["own_packet_proof"] = True
+    except Exception:
+        pass
 
 
 def recover_attempt_records(records, current_boot_id):
@@ -1066,6 +1225,13 @@ def transition_attempt(attempt, event, now_mono, cfg, packet=None,
                        generation_key(out.get("generation")))
     if not same_generation:
         out["state"] = "BOUNDARY_CONFIRMED"
+        # A fast completion can land the OWN packet and the boundary
+        # inside one poll, so ACKED is never journaled; without this
+        # flag the durable record loses the only proof that the
+        # confirmed compaction was OURS (Sol round-1 blocker: the
+        # fired-compacts counter read 0 for a normal fast success).
+        if packet_classification(out, packet) == "OWN":
+            out["own_packet_proof"] = True
         return out
     classification = packet_classification(out, packet)
     if classification == "OWN" and state != "CLEANUP_REQUIRED":
@@ -1503,6 +1669,15 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
     # submission already landed). A scan error means the boundary state
     # is unprovable — same abort.
     classification = packet_classification(attempt, packet)
+    if classification == "OWN":
+        # The late own packet proves the FIRST submission of this
+        # attempt reached PreCompact — the compact fired no matter
+        # which abort below wins (binding loss and composer mismatch
+        # take precedence over the own_packet_late detail, but must
+        # not discard the proof; Sol round-3). CLEANUP_REQUIRED is
+        # terminal and never re-inspects the packet, so this is the
+        # last chance to stamp it.
+        attempt["own_packet_proof"] = True
     fresh = scan_cursor(dict(cursor), binding["transcript_path"])
     # The rescan must COMPLETE: caught_up=False means bytes beyond the
     # budget were not examined and could hold a boundary — an explicitly
@@ -2327,6 +2502,7 @@ def watcher_entry(args):
             release_leases(paths, run_token)
             return 1
         recovered = recover_attempt(paths["journal"], boot_id())
+        _stamp_recovered_proof(recovered, cfg, binding["session_id"])
         # A synthesized conservative mapping (PREPARED->CLEANUP_REQUIRED,
         # TYPED_VERIFIED->SUBMISSION_UNCERTAIN, unproven/cross-boot->
         # LATCHED) must be DURABLE before readiness: otherwise the raw
@@ -2825,6 +3001,11 @@ def overview_data(cfg, now=None, sessions_dir=None, proc_root="/proc"):
                 "current": current, "peak": peak, "window": window,
                 "pct": 100.0 * current / window,
                 "soft_pct": soft, "hard_pct": hard, "trigger_pct": trig,
+                # None = count unavailable: no watcher journal
+                # (unmanaged session) OR a journal that could not be
+                # read. Either way distinct from a managed session at
+                # 0 fired compacts.
+                "cm_compacts": cm_compact_count(cfg, sid),
                 "updated_epoch": mtime,
             })
             # A future mtime sorts first and would fake a fresh age —
@@ -2912,14 +3093,16 @@ def overview_text(cfg, now=None, sessions_dir=None, proc_root="/proc"):
             # alive verdict stays under its header (audit finding).
             srows.append((marker, str(s["session_id"])[:8],
                           "(unreadable state row)", "", "", "", "", "",
-                          alive))
+                          "", alive))
             continue
         age = ("FUTURE-MTIME(untrustworthy)" if s.get("future_mtime")
                else _fmt_age(s["age_s"]))
+        cm_count = s.get("cm_compacts")
         srows.append((marker, str(s["session_id"])[:8],
                       str(s.get("model") or "?"),
                       _fmt_grouped(s["current"]), _fmt_grouped(s["peak"]),
                       "%.1f%%" % s["pct"], _fmt_pct(s.get("trigger_pct")),
+                      "" if cm_count is None else str(cm_count),
                       age, alive))
     if srows:
         lines.append(label)
@@ -2929,22 +3112,26 @@ def overview_text(cfg, now=None, sessions_dir=None, proc_root="/proc"):
         peak_w = max([len("peak")] + [len(t[4]) for t in srows])
         pct_w = max([len("pct")] + [len(t[5]) for t in srows])
         trig_w = max([len("trig")] + [len(t[6]) for t in srows])
-        age_w = max([len("updated")] + [len(t[7]) for t in srows])
-        lines.append("  %s  %s  %s  %s  %s  %s  %s  %s" % (
+        cm_w = max([len("cm")] + [len(t[7]) for t in srows])
+        age_w = max([len("updated")] + [len(t[8]) for t in srows])
+        lines.append("  %s  %s  %s  %s  %s  %s  %s  %s  %s" % (
             "session".ljust(id_w), "model".ljust(model_w),
             "current".rjust(cur_w), "peak".rjust(peak_w),
             "pct".rjust(pct_w), "trig".rjust(trig_w),
-            "updated".rjust(age_w), "alive"))
+            "cm".rjust(cm_w), "updated".rjust(age_w), "alive"))
         for t in srows:
-            lines.append(("%s%s  %s  %s  %s  %s  %s  %s  %s" % (
+            lines.append(("%s%s  %s  %s  %s  %s  %s  %s  %s  %s" % (
                 t[0], t[1].ljust(id_w), t[2].ljust(model_w),
                 t[3].rjust(cur_w), t[4].rjust(peak_w),
                 t[5].rjust(pct_w), t[6].rjust(trig_w),
-                t[7].rjust(age_w), t[8])).rstrip())
+                t[7].rjust(cm_w), t[8].rjust(age_w), t[9])).rstrip())
         lines.append("(> = most recently updated; the advisor touches "
                      "it on every tool call, so a seconds-old age is "
                      "almost certainly the invoking session)")
-        alives = {t[8] for t in srows}
+        lines.append("(cm = compactions this manager fired for the "
+                     "session; blank = count unavailable — no or "
+                     "unreadable watcher journal)")
+        alives = {t[9] for t in srows}
         if "GONE" in alives:
             lines.append("(GONE = no live claude process for this "
                          "session; its state file just lingers and "
