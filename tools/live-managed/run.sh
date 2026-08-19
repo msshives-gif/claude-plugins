@@ -293,8 +293,16 @@ fi
 MSG="$("$CMBIN" resolve "$SID" 2>&1)"; RC=$?
 [ $RC -eq 0 ] && row s09_resolve pass "$MSG" || row s09_resolve fail "rc=$RC $MSG"
 rm -f "$STATE/packets/$SID.json"
+L9=$(wc -l < "$STATE/managed/watchers/$SID.journal.jsonl")
 send_turn $SES "/compact clear the deck" 300 || true
-sleep 10
+# Barrier: the deck is clear only once the WATCHER OBSERVES the clearing
+# boundary. The resolved SAFETY latch consumes any request that lands
+# before that observation (one override per generation), so starting s14
+# early starved its request and flaked s14_submits_at_boundary (seen
+# 3/3 runs on 2026-08-18: request at +317s, boundary at +347s).
+s09_cleared() { tail -n +$((L9+1)) "$STATE/managed/watchers/$SID.journal.jsonl" | grep -q '"state":"BOUNDARY_CONFIRMED"'; }
+wait_for 240 s09_cleared || row s09_cleared info "clearing boundary not observed in 240s; s14 may inherit the latch"
+sleep 6
 
 # --- s14: model request during a busy foreground turn (the fbeb0bf1
 #     starvation topology: background shell chrome + running turn).
