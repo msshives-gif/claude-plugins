@@ -599,11 +599,11 @@ class StateMachineTests(unittest.TestCase):
         self.attempt = managed.new_attempt("a" * 16, self.gen, 7, 100,
                                            "boot-a")
 
-    def step(self, state, event, now=100, packet=None, gen=None):
+    def step(self, state, event, now=100, packet=None, gen=None, cursor=None):
         self.attempt["state"] = state
         return managed.transition_attempt(
             self.attempt, event, now, self.cfg, packet,
-            self.gen if gen is None else gen)
+            self.gen if gen is None else gen, cursor=cursor)
 
     def test_happy_transitions(self):
         prepared = self.step("TRIGGERED", "prepared")
@@ -765,6 +765,56 @@ class StateMachineTests(unittest.TestCase):
                                             packet, self.gen)
         self.assertEqual(second["timers"]["foreign_deadline_mono"],
                          first["timers"]["foreign_deadline_mono"])
+
+    def test_completed_packet_does_not_reclassify_deferred_foreign(self):
+        # A leftover packet whose compaction already completed (cursor
+        # boundary count past its base) must not flip a deferred attempt
+        # to foreign_packet: the retry gate excludes foreign_packet and
+        # the reason change is never journaled, so a finished
+        # auto-compact's packet silently wedged a live watcher forever
+        # (fbeb0bf1: 590k tokens, idle pane, no compact, no alert).
+        self.attempt["reason"] = "R3_changed"
+        packet = {"seq": 7, "trigger": "auto", "base_compaction_count": 2,
+                  "custom_instructions": ""}
+        out = self.step("DEFERRED", "timer", packet=packet,
+                        cursor={"boundary_count": 3})
+        self.assertEqual((out["state"], out["reason"]),
+                         ("DEFERRED", "R3_changed"))
+
+    def test_unconfirmed_auto_packet_still_foreign(self):
+        # Boundary count equal to the base means the packet's compaction
+        # has NOT completed — the in-flight protection must hold.
+        packet = {"seq": 7, "trigger": "auto", "base_compaction_count": 3,
+                  "custom_instructions": ""}
+        out = self.step("DEFERRED", "timer", packet=packet,
+                        cursor={"boundary_count": 3})
+        self.assertEqual((out["state"], out["reason"]),
+                         ("DEFERRED", "foreign_packet"))
+
+    def test_own_packet_acks_even_when_boundary_confirmed(self):
+        # Staleness must never outrank OWN: the fired-compact proof
+        # (cm_compacts) depends on the own-nonce classification.
+        packet = {"seq": 1, "base_compaction_count": 0,
+                  "custom_instructions":
+                      "[cm-%s] ok" % self.attempt["nonce"]}
+        out = self.step("SUBMITTED", "timer", packet=packet,
+                        cursor={"boundary_count": 5})
+        self.assertEqual(out["state"], "ACKED")
+
+    def test_foreign_deadline_latches_while_packet_persists(self):
+        # The FOREIGN branch returns before the timer branch, so the
+        # deadline must fire inside it: a foreign packet that never
+        # resolves (failed compact, epoch-crossed base count) would
+        # otherwise defer forever with no alert.
+        packet = {"seq": 8, "custom_instructions": "human"}
+        first = self.step("TRIGGERED", "timer", now=100, packet=packet)
+        self.assertEqual((first["state"], first["reason"]),
+                         ("DEFERRED", "foreign_packet"))
+        deadline = first["timers"]["foreign_deadline_mono"]
+        out = managed.transition_attempt(first, "timer", deadline,
+                                         self.cfg, packet, self.gen)
+        self.assertEqual((out["state"], out["latch_kind"], out["reason"]),
+                         ("LATCHED", "SAFETY", "foreign_uncertain"))
 
     def test_foreign_post_r4_requires_cleanup(self):
         packet = {"seq": 8, "custom_instructions": "human"}
@@ -969,6 +1019,28 @@ class RequestConfigInstructionTests(unittest.TestCase):
         self.assertIn("]", text)
         for char in managed.INSTRUCTION_DENYLIST:
             self.assertNotIn(char, text, repr(char))
+
+    def test_instruction_shortens_when_pane_cannot_render_unwrapped(self):
+        # R5/R6' verify the single bottom-anchored composer line, so an
+        # instruction that soft-wraps can never verify: every attempt in
+        # a narrow pane ended CLEANUP_REQUIRED/R5_composer_mismatch
+        # (observed live at 76 cols, fbeb0bf1). Narrow panes get the
+        # nonce-only form; wide panes keep the guidance tail.
+        nonce = "a" * 16
+        full = managed.instruction_text(nonce)
+        self.assertEqual(managed.instruction_text(nonce, width=200), full)
+        short = managed.instruction_text(nonce, width=76)
+        self.assertEqual(short, "/compact [cm-%s]" % nonce)
+        self.assertLessEqual(len("❯ " + short),
+                             76 - managed.WRAP_MARGIN_COLS)
+        for char in managed.INSTRUCTION_DENYLIST:
+            self.assertNotIn(char, short, repr(char))
+        # exact boundary: the widest pane that still forces the short
+        # form, and the narrowest that fits the full form
+        fits = len("❯ " + full) + managed.WRAP_MARGIN_COLS
+        self.assertEqual(managed.instruction_text(nonce, width=fits), full)
+        self.assertEqual(managed.instruction_text(nonce, width=fits - 1),
+                         short)
 
     def test_instruction_guard_rejects_each_denylisted_character(self):
         original = managed.INSTRUCTION_TEMPLATE
@@ -1212,6 +1284,36 @@ class RunLadderTests(unittest.TestCase):
         self.assertEqual(out["reason"], "R6_prime_foreign_packet")
         self.assertEqual(tmux.enters(), [])
 
+    def test_narrow_pane_types_short_instruction_and_submits(self):
+        # 60-col pane: the full instruction would soft-wrap and fail R5
+        # forever; the ladder must type the nonce-only form instead.
+        short = "/compact [cm-%s]" % self.attempt["nonce"]
+        tmux = LadderTmux([IDLE, IDLE, IDLE + short, IDLE + short, IDLE])
+        tmux.facts = "%1\t/dev/pts/7\t10\tclaude\t0\t60\t40\t$1\n"
+        out = self.run_ladder(tmux)
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(len(tmux.enters()), 1)
+        self.assertTrue(any(a[-1] == short for a in tmux.sent))
+        self.assertFalse(any(a[-1] == self.text for a in tmux.sent))
+
+    def test_r6_completed_compactions_packet_is_not_foreign(self):
+        # A leftover packet from an already-completed compaction (fresh
+        # cursor shows the boundary advanced past its base) must not
+        # abort the ladder as foreign — that terminal CLEANUP_REQUIRED
+        # was the second half of the fbeb0bf1 wedge.
+        append_rows(self.transcript, [boundary_row(post=50), usage_row(60)])
+        self.cursor = managed.initial_scan(managed.default_cursor(),
+                                           self.transcript)
+        self.attempt = managed.new_attempt(
+            self.token, managed.generation(self.cursor), 1, 0.0, "boot")
+        self.text = managed.instruction_text(self.attempt["nonce"])
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text,
+                           IDLE])
+        out = self.run_ladder(tmux, packet={"seq": 1, "trigger": "auto",
+                                            "base_compaction_count": 0})
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(len(tmux.enters()), 1)
+
     def test_r6_own_late_packet_aborts_before_enter(self):
         tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text])
         packet = {"seq": 7,
@@ -1404,6 +1506,31 @@ class TickWiringTests(unittest.TestCase):
         # WATCHER_READY + DEAD-LEASE for a watcher that left cleanly.
         self.assertEqual(records[-1]["state"], "WATCHER_RETIRED")
         self.assertEqual(records[-1].get("reason"), "tty_changed")
+
+    def test_stale_auto_packet_does_not_wedge_deferred_attempt(self):
+        # End-to-end wedge regression (fbeb0bf1): an auto-compact's
+        # leftover packet, boundary long confirmed, plus a deferred
+        # attempt whose retry is due. The tick must retry and submit —
+        # not reclassify the attempt DEFERRED/foreign_packet and skip
+        # the retry gate forever.
+        rows = [usage_row(100), boundary_row(post=100), usage_row(170000)]
+        tmux = EchoTmux()
+        watcher = self.make_watcher(rows, tmux)
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      self.transcript)
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(cursor), 4, 0.0, "boot")
+        watcher.attempt.update(state="DEFERRED", reason="R3_changed",
+                               defer_class="opportunity")
+        watcher.attempt["timers"]["next_attempt_at"] = 0.0
+        packet_file = managed.packet_path(self.cfg, self.sid)
+        cm._private_makedirs(os.path.dirname(packet_file))
+        with open(packet_file, "w") as fh:
+            json.dump({"seq": 4, "trigger": "auto",
+                       "base_compaction_count": 0,
+                       "custom_instructions": ""}, fh)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "SUBMITTED"))
 
     def test_boundary_confirmed_latches_threshold_when_still_full(self):
         rows = [usage_row(170000), boundary_row(post=170000)]

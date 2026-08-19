@@ -45,6 +45,10 @@ LIFECYCLE_STATES = {"WATCHER_READY", "ALERT_DELIVERY", "WATCHER_RETIRED",
 STARVATION_ALERT_S = 120.0
 INSTRUCTION_TEMPLATE = ("/compact [cm-{nonce}] Preserve the task list and "
                         "open decisions to the handoff file")
+INSTRUCTION_TEMPLATE_SHORT = "/compact [cm-{nonce}]"
+# Columns kept free at the right edge when deciding whether the full
+# instruction can render unwrapped (the composer pads before wrapping).
+WRAP_MARGIN_COLS = 4
 INSTRUCTION_DENYLIST = ";&|><()\"'$`\n\r"
 ADOPT_ACKNOWLEDGEMENT = (
     "In adopt mode, the automation may in a worst-case race deliver the "
@@ -1188,12 +1192,19 @@ def packet_seq(packet):
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def packet_classification(attempt, packet):
+def packet_classification(attempt, packet, cursor=None):
     if not isinstance(packet, dict):
         return "NONE"
     custom = str(packet.get("custom_instructions") or "")
     if any("[cm-%s]" % nonce in custom for nonce in attempt.get("nonces", [])):
         return "OWN"
+    # A packet whose compaction already completed (boundary advanced past
+    # its base count) is a leftover file, not an in-flight compaction —
+    # without this, a finished auto-compact's packet reclassifies every
+    # later attempt FOREIGN forever (the fbeb0bf1 wedge). OWN is checked
+    # first: staleness must never erase fired-compact proof.
+    if cursor is not None and boundary_confirmed_for_packet(packet, cursor):
+        return "NONE"
     if (packet_seq(packet) > attempt["attempt_packet_seq_floor"] or
             packet.get("trigger") == "auto"):
         return "FOREIGN"
@@ -1209,7 +1220,7 @@ def boundary_confirmed_for_packet(packet, cursor):
 
 
 def transition_attempt(attempt, event, now_mono, cfg, packet=None,
-                       generation_value=None):
+                       generation_value=None, cursor=None):
     """Pure attempt state machine used by the daemon and clock tests."""
     out = dict(attempt)
     out["timers"] = dict(attempt.get("timers", {}))
@@ -1233,7 +1244,7 @@ def transition_attempt(attempt, event, now_mono, cfg, packet=None,
         if packet_classification(out, packet) == "OWN":
             out["own_packet_proof"] = True
         return out
-    classification = packet_classification(out, packet)
+    classification = packet_classification(out, packet, cursor)
     if classification == "OWN" and state != "CLEANUP_REQUIRED":
         out["state"] = "ACKED"
         out["timers"].setdefault(
@@ -1251,6 +1262,13 @@ def transition_attempt(attempt, event, now_mono, cfg, packet=None,
             out["timers"].setdefault(
                 "foreign_deadline_mono",
                 now_mono + cfg["managed_completion_timeout_s"])
+            # The deadline must fire even while the packet persists: this
+            # early return skips the timer branch below, and a foreign
+            # packet that never resolves (failed compact, epoch-crossed
+            # base count) would otherwise defer forever with no alert.
+            if now_mono >= out["timers"]["foreign_deadline_mono"]:
+                out["state"], out["latch_kind"] = "LATCHED", "SAFETY"
+                out["reason"] = "foreign_uncertain"
         elif state not in ("READY", "BOUNDARY_CONFIRMED", "LATCHED"):
             out["state"] = "CLEANUP_REQUIRED"
             out["reason"] = "foreign_after_r4"
@@ -1296,10 +1314,18 @@ def transition_attempt(attempt, event, now_mono, cfg, packet=None,
     return out
 
 
-def instruction_text(nonce):
+def instruction_text(nonce, width=None):
     if not re.match(r"^[0-9a-f]{16}$", nonce):
         raise ValueError("invalid nonce")
     text = INSTRUCTION_TEMPLATE.format(nonce=nonce)
+    # The composer soft-wraps long input in narrow panes, and R5/R6'
+    # verify against the single bottom-anchored "❯ " line — a wrapped
+    # instruction can NEVER verify, so every attempt ends
+    # CLEANUP_REQUIRED/R5_composer_mismatch (observed live: 76-col
+    # pane, fbeb0bf1). The nonce marker is the load-bearing part; drop
+    # the guidance tail when the full line cannot render unwrapped.
+    if width is not None and len("❯ " + text) > width - WRAP_MARGIN_COLS:
+        text = INSTRUCTION_TEMPLATE_SHORT.format(nonce=nonce)
     if any(ch in text for ch in INSTRUCTION_DENYLIST):
         raise ValueError("instruction contains shell metacharacter")
     return text
@@ -1622,10 +1648,10 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
         return dict(attempt, state="DEFERRED", reason=reason,
                     defer_class=defer_class)
     attempt = dict(attempt, lane=lane)
-    ok, reason = validate_binding(binding, cfg, paths, run_tmux, proc_root,
-                                  sessions_dir=sessions_dir)
+    ok, r4_facts = validate_binding(binding, cfg, paths, run_tmux, proc_root,
+                                    sessions_dir=sessions_dir)
     if not ok:
-        return dict(attempt, state="DEFERRED", reason="R4_%s" % reason,
+        return dict(attempt, state="DEFERRED", reason="R4_%s" % r4_facts,
                     defer_class="structural")
     if lane == "boundary" and not _boundary_still_safe(
             binding, run_tmux, activity_reader, activity_rev):
@@ -1635,7 +1661,7 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
                     defer_class="opportunity")
     attempt = transition_attempt(attempt, "prepared", now_mono(), cfg)
     journal_record(journal_path, "PREPARED", attempt)
-    text = instruction_text(attempt["nonce"])
+    text = instruction_text(attempt["nonce"], width=r4_facts["width"])
     rc, _, _ = _result(run_tmux(_tmux(
         binding["socket"], ["send-keys", "-t", binding["pane_id"], "-l", text])))
     if rc != 0:
@@ -1667,8 +1693,11 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
     # after a Layer-1 seq reset, and a late own-nonce packet also means
     # do-not-press-Enter (our retry text is typed but the first
     # submission already landed). A scan error means the boundary state
-    # is unprovable — same abort.
-    classification = packet_classification(attempt, packet)
+    # is unprovable — same abort. The fresh cursor feeds classification
+    # so a leftover packet from an already-completed compaction cannot
+    # abort the ladder as "foreign" (the fbeb0bf1 wedge).
+    fresh = scan_cursor(dict(cursor), binding["transcript_path"])
+    classification = packet_classification(attempt, packet, cursor=fresh)
     if classification == "OWN":
         # The late own packet proves the FIRST submission of this
         # attempt reached PreCompact — the compact fired no matter
@@ -1678,7 +1707,6 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
         # terminal and never re-inspects the packet, so this is the
         # last chance to stamp it.
         attempt["own_packet_proof"] = True
-    fresh = scan_cursor(dict(cursor), binding["transcript_path"])
     # The rescan must COMPLETE: caught_up=False means bytes beyond the
     # budget were not examined and could hold a boundary — an explicitly
     # incomplete view must not authorize Enter.
@@ -2142,7 +2170,7 @@ class Watcher:
             previous = self.attempt.get("state")
             self.attempt = transition_attempt(
                 self.attempt, "timer", now, self.cfg, packet,
-                current_generation)
+                current_generation, cursor=self.cursor)
             if self.attempt.get("state") != previous:
                 journal_record(self.paths["journal"], self.attempt["state"],
                                self.attempt, reason=self.attempt.get("reason"))
