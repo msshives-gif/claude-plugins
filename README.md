@@ -8,6 +8,7 @@ plugins for context-size awareness, each installable independently.
 | [subagent-context](plugins/subagent-context/README.md) | Reports each subagent's context size to the orchestrating agent; warns before an overloaded agent gets re-tasked | `subagent-context@claude-plugins` |
 | [cross-session-send-guard](plugins/cross-session-send-guard/README.md) | Warns before, and can gate, messaging a large idle peer session — a cold wake replays its whole transcript at full price | `cross-session-send-guard@claude-plugins` |
 | [compact-manager](plugins/compact-manager/README.md) | Warns the main session as its own context fills; wake packet + reorientation across compaction; opt-in managed mode types `/compact` into your tmux pane at verified-idle moments | `compact-manager@claude-plugins` |
+| [task-forensics](plugins/task-forensics/README.md) | Wraps background Bash tasks in a signal-forensics wrapper — when something kills a task, the killer's pid/uid/cmdline get logged before the task dies | `task-forensics@claude-plugins` |
 
 ```
 /plugin marketplace add msshives-gif/claude-plugins

@@ -19,6 +19,11 @@
       "name": "compact-manager",
       "source": "./plugins/compact-manager",
       "description": "Warns the main session as its own context fills, captures a wake packet before compaction, and reorients the session after it."
+    },
+    {
+      "name": "task-forensics",
+      "source": "./plugins/task-forensics",
+      "description": "Wraps background Bash tasks in a signal-forensics wrapper: when something kills a task, the killer's pid, uid, and cmdline are logged before the task dies."
     }
   ]
 }

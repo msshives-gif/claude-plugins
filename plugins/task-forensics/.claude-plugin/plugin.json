@@ -1,0 +1,11 @@
+{
+  "name": "task-forensics",
+  "version": "0.1.0",
+  "description": "Wraps background Bash tasks in a signal-forensics wrapper: when something kills a task, the killer's pid, uid, and cmdline are logged before the task dies.",
+  "author": {
+    "name": "msshives-gif"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/msshives-gif/claude-plugins/tree/main/plugins/task-forensics",
+  "repository": "https://github.com/msshives-gif/claude-plugins"
+}
