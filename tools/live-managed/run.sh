@@ -315,17 +315,31 @@ send_turn $SES "Use the Bash tool with run_in_background set to true to run this
 tmux capture-pane -t $SES -p -J -S -100 | grep -qi "background" \
   && row s14_bg_launched pass \
   || row s14_bg_launched info "no background-launch text visible (model phrasing varies; marker checks below are the topology gate)"
-ACT_PAIRED="$(python3 - "$STATE" "$SID" <<'EOF'
+# The Stop hook writes the ended marker a beat after send_turn's
+# completion heuristic fires, so a single-shot read raced it (flaked
+# 4/4 runs on 2026-08-21 with markers that paired on disk moments
+# later). Poll for the pair; on failure report both prompt_ids so the
+# mismatch is diagnosable.
+ACT_PAIRED=unread
+for _ in $(seq 1 30); do
+  ACT_PAIRED="$(python3 - "$STATE" "$SID" <<'EOF'
 import json, os, sys
 state, sid = sys.argv[1], sys.argv[2]
 try:
     r = json.load(open(os.path.join(state, "managed", "activity", f"running-{sid}.json")))
     e = json.load(open(os.path.join(state, "managed", "activity", f"ended-{sid}.json")))
-    print("y" if r.get("prompt_id") == e.get("prompt_id") else "n")
+    rp, ep = r.get("prompt_id"), e.get("prompt_id")
+    if rp and rp == ep:  # two missing ids must not pass as a pair
+        print("y")
+    else:
+        print("n running=%s ended=%s" % (str(rp)[:8], str(ep)[:8]))
 except Exception as exc:
     print("err:%r" % (exc,))
 EOF
 )"
+  [ "$ACT_PAIRED" = y ] && break
+  sleep 1
+done
 [ "$ACT_PAIRED" = y ] && row s14_marker_paired pass \
   || row s14_marker_paired fail "running/ended pair: $ACT_PAIRED"
 LINES0=$(wc -l < "$JN")

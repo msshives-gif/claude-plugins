@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Unwatched-session visibility (the gap that let a live session sit
+  two days over its trigger unmanaged): the overview flags a managed,
+  provably live session at/over trigger with no attached watcher
+  (`unwatched: true` in `overview --json`, a `(!)` warning line in
+  the text readout), and the advisor injects a mid-flight attach
+  warning into the session itself the first tool call after it
+  crosses trigger unwatched — once per crossing, re-armed when a
+  compaction drops it back below (`unwatched_warned` state key).
+  The SessionStart lease check moved to `managed.lease_attached` so
+  both hooks share one positive-proof predicate.
+
 - Watcher: removed the time-based retirement deadline
   (`managed_deadline_hours` is gone from the config). A watcher now
   lives exactly as long as its session: exit, `/clear`/in-app

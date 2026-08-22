@@ -2408,6 +2408,21 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("sNewDone", by_sid)
 
 
+class LeaseAttachedTests(unittest.TestCase):
+    def test_malformed_proc_start_is_not_attached(self):
+        # A malformed lease must not read as attached even under a
+        # fresh heartbeat — it would suppress the unwatched warning
+        # (Sol audit). Well-formed = exact positive int starttime.
+        base = {"run_token": "t" * 16, "pid": 1,
+                "heartbeat_at": time.time()}
+        for bad in (None, -5, 0, 1.5, "2020", True):
+            self.assertFalse(
+                managed.lease_attached(dict(base, proc_start=bad)),
+                repr(bad))
+        self.assertTrue(
+            managed.lease_attached(dict(base, proc_start=2020)))
+
+
 class SessionLivenessTests(unittest.TestCase):
     """live_session_ids and the overview's session_live/alive surface."""
 
@@ -2442,6 +2457,98 @@ class SessionLivenessTests(unittest.TestCase):
         ids, complete = managed.live_session_ids(self.sessions, self.proc)
         self.assertTrue(complete)
         self.assertEqual(ids, {"sess-live-1234"})
+
+    def test_overview_flags_unwatched_above_trigger(self):
+        # Managed mode, provably live session at/over trigger, no
+        # attached watcher: the row carries unwatched=True and the
+        # text readout warns — the gap that let a live session sit
+        # two days over trigger unnoticed.
+        state_root = os.path.join(self.temp.name, "cmstate")
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=state_root,
+                   context_window=200_000)
+        sdir = os.path.join(state_root, "state")
+        os.makedirs(sdir)
+        write_proc(self.proc, 20, 20, 2020)
+        self._entry(20, "sess-live-1234", 2020)
+        with open(os.path.join(sdir, "sess-live-1234.json"), "w") as fh:
+            json.dump({"model": "m", "current": 170_000,
+                       "peak": 170_000}, fh)
+        data = managed.overview_data(cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        self.assertIs(data["sessions"][0].get("unwatched"), True)
+        text = managed.overview_text(cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        self.assertIn("NO live watcher", text)
+        # Report-only surface relayed to models by the status command:
+        # it must name the USER's remedy, never an imperative the
+        # reader could execute (Sol audit blocker).
+        warn = [l for l in text.splitlines() if "(!)" in l][0]
+        self.assertIn("The user can attach", warn)
+        self.assertNotIn("adopt", warn)
+        # An attached watcher (fresh heartbeat) clears the flag.
+        lease_dir = os.path.join(state_root, "managed", "leases")
+        os.makedirs(lease_dir)
+        lease_path = os.path.join(lease_dir,
+                                  "session-sess-live-1234.json")
+        with open(lease_path, "w") as fh:
+            json.dump({"run_token": "t" * 16, "pid": os.getpid(),
+                       "proc_start": 1, "heartbeat_at": time.time()},
+                      fh)
+        data = managed.overview_data(cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        self.assertNotIn("unwatched", data["sessions"][0])
+        # Below trigger: no flag even with no lease.
+        os.unlink(lease_path)
+        with open(os.path.join(sdir, "sess-live-1234.json"), "w") as fh:
+            json.dump({"model": "m", "current": 50_000,
+                       "peak": 170_000}, fh)
+        data = managed.overview_data(cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        self.assertNotIn("unwatched", data["sessions"][0])
+        # Advisory mode: watchers are not expected; never flag.
+        with open(os.path.join(sdir, "sess-live-1234.json"), "w") as fh:
+            json.dump({"model": "m", "current": 170_000,
+                       "peak": 170_000}, fh)
+        data = managed.overview_data(
+            dict(cfg, mode="advisory"), sessions_dir=self.sessions,
+            proc_root=self.proc)
+        self.assertNotIn("unwatched", data["sessions"][0])
+
+    def test_overview_unwatched_edge_conditions(self):
+        state_root = os.path.join(self.temp.name, "cmstate")
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=state_root,
+                   context_window=200_000)
+        sdir = os.path.join(state_root, "state")
+        os.makedirs(sdir)
+        write_proc(self.proc, 20, 20, 2020)
+        self._entry(20, "sess-live-1234", 2020)
+        # Exactly AT trigger (hard default 0.8): flags — >= not >.
+        with open(os.path.join(sdir, "sess-live-1234.json"), "w") as fh:
+            json.dump({"model": "m", "current": 160_000,
+                       "peak": 160_000}, fh)
+        data = managed.overview_data(cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        self.assertIs(data["sessions"][0].get("unwatched"), True)
+        # Ambiguous lease read (symlink): proves nothing — no flag.
+        lease_dir = os.path.join(state_root, "managed", "leases")
+        os.makedirs(lease_dir)
+        os.symlink("/nonexistent", os.path.join(
+            lease_dir, "session-sess-live-1234.json"))
+        data = managed.overview_data(cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        self.assertNotIn("unwatched", data["sessions"][0])
+        # Dead session (registry entry, no /proc): liveness False —
+        # never flag a corpse, however high its lingering state reads.
+        self._entry(30, "sess-dead-1234", 3030)
+        with open(os.path.join(sdir, "sess-dead-1234.json"), "w") as fh:
+            json.dump({"model": "m", "current": 190_000,
+                       "peak": 190_000}, fh)
+        data = managed.overview_data(cfg, sessions_dir=self.sessions,
+                                     proc_root=self.proc)
+        dead = [s for s in data["sessions"]
+                if s["session_id"] == "sess-dead-1234"][0]
+        self.assertIs(dead["session_live"], False)
+        self.assertNotIn("unwatched", dead)
 
     def test_liveness_unjudgeable_returns_incomplete(self):
         ids, complete = managed.live_session_ids(

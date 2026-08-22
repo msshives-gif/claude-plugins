@@ -861,6 +861,131 @@ class HookShellTests(unittest.TestCase):
         # Same state again: hysteresis, no repeat.
         self.assertEqual(self.run_hook("advisor.py", payload), {})
 
+    def test_advisor_warns_unwatched_above_trigger_once(self):
+        # Managed session over trigger with no attached watcher: the
+        # advisor injects the mid-flight attach warning (the
+        # SessionStart notice never re-fires, so this is the only
+        # in-session signal) — once per crossing, re-armed when a
+        # compaction drops usage below trigger.
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 170_000, 0, 500)])
+        payload = {"hook_event_name": "PostToolUse", "session_id": "sU",
+                   "transcript_path": t, "tool_name": "Bash"}
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("NO live watcher", ctx)
+        self.assertIn("adopt", ctx)
+        # Same crossing: silent (advisory hysteresis + warned flag).
+        self.assertEqual(self.run_hook("advisor.py", payload,
+                                       mode="managed"), {})
+        # Compaction drops below trigger: flag re-arms (the packet
+        # delivery may inject, but not the unwatched warning).
+        append_jsonl(t, [boundary_row("auto", 170_510, 20_000),
+                         usage_row(10, 20_000, 0, 500)])
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        ctx = (out.get("hookSpecificOutput") or {}).get(
+            "additionalContext", "")
+        self.assertNotIn("NO live watcher", ctx)
+        # Climb back over trigger: warns again.
+        append_jsonl(t, [usage_row(10, 171_000, 0, 500)])
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("NO live watcher", ctx)
+
+    def test_advisor_unwatched_honors_override_trigger(self):
+        # Nondefault trigger + window via the override file: 100k of a
+        # 150k window is 66.7% — over the 60% override trigger, under
+        # the 80% hard default. Only the correct trigger/window source
+        # warns here (Sol audit: the defaults would mask a wrong
+        # source), and no threshold advisory accompanies it.
+        d = os.path.join(self.dir.name, "overrides")
+        os.makedirs(d)
+        with open(os.path.join(d, "sT.json"), "w") as fh:
+            json.dump({"managed_trigger_pct": 0.6,
+                       "context_window": 150_000}, fh)
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 100_000, 0, 500)])
+        payload = {"hook_event_name": "PostToolUse", "session_id": "sT",
+                   "transcript_path": t, "tool_name": "Bash"}
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("NO live watcher", ctx)
+        self.assertIn("67%", ctx)
+        self.assertIn("60%", ctx)
+        # The injected warning must steer to the user, never instruct
+        # the model to attach/adopt itself (Sol audit blocker).
+        self.assertIn("Do not attach or adopt one yourself", ctx)
+        # Exactly AT the trigger warns too (>=, not >): 90,000 of
+        # 150,000 is precisely 60%.
+        t2 = os.path.join(self.dir.name, "sess2.jsonl")
+        append_jsonl(t2, [usage_row(0, 90_000, 0, 0)])
+        with open(os.path.join(d, "sQ.json"), "w") as fh:
+            json.dump({"managed_trigger_pct": 0.6,
+                       "context_window": 150_000}, fh)
+        out = self.run_hook("advisor.py",
+                            dict(payload, session_id="sQ",
+                                 transcript_path=t2), mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("NO live watcher", ctx)
+
+    def test_advisor_unwatched_survives_off_round_trip(self):
+        # managed (warn) → off (hook inert) → managed again: the same
+        # crossing stays suppressed (already delivered), and a NEW
+        # crossing — which requires a compaction boundary — warns
+        # again via the boundary reset, even though off mode never
+        # touched the flag (Sol audit round-3).
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 170_000, 0, 500)])
+        payload = {"hook_event_name": "PostToolUse", "session_id": "sR",
+                   "transcript_path": t, "tool_name": "Bash"}
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        self.assertIn("NO live watcher",
+                      out["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.run_hook("advisor.py", payload,
+                                       mode="off"), {})
+        # Back in managed, same crossing: still suppressed.
+        self.assertEqual(self.run_hook("advisor.py", payload,
+                                       mode="managed"), {})
+        # Compaction + re-climb (spanning one scan): warns again.
+        append_jsonl(t, [boundary_row("auto", 170_510, 20_000),
+                         usage_row(10, 171_000, 0, 500)])
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        self.assertIn("NO live watcher",
+                      out["hookSpecificOutput"]["additionalContext"])
+
+    def test_advisor_unwatched_silent_when_attached_or_advisory(self):
+        lease_dir = os.path.join(self.dir.name, "managed", "leases")
+        os.makedirs(lease_dir, exist_ok=True)
+        with open(os.path.join(lease_dir, "session-sV.json"), "w") as fh:
+            json.dump({"run_token": "t" * 16, "pid": os.getpid(),
+                       "proc_start": 1, "heartbeat_at": time.time()}, fh)
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 170_000, 0, 500)])
+        payload = {"hook_event_name": "PostToolUse", "session_id": "sV",
+                   "transcript_path": t, "tool_name": "Bash"}
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        ctx = (out.get("hookSpecificOutput") or {}).get(
+            "additionalContext", "")
+        self.assertNotIn("NO live watcher", ctx)  # attached watcher
+        # Advisory mode: watchers are not expected; never warn.
+        out = self.run_hook("advisor.py",
+                            dict(payload, session_id="sW"))
+        ctx = (out.get("hookSpecificOutput") or {}).get(
+            "additionalContext", "")
+        self.assertNotIn("NO live watcher", ctx)
+        # Ambiguous lease read (symlink → read_json_inode None): proves
+        # nothing — no warning, and the warned flag must not stick.
+        os.symlink("/nonexistent",
+                   os.path.join(lease_dir, "session-sX.json"))
+        out = self.run_hook("advisor.py",
+                            dict(payload, session_id="sX"),
+                            mode="managed")
+        ctx = (out.get("hookSpecificOutput") or {}).get(
+            "additionalContext", "")
+        self.assertNotIn("NO live watcher", ctx)
+        with open(os.path.join(self.dir.name, "state", "sX.json")) as fh:
+            self.assertFalse(json.load(fh).get("unwatched_warned"))
+
     def test_advisor_honors_session_override_file(self):
         # 80,510 tokens: silent against the 200k/70% defaults, but the
         # override file (150k window, 50% soft) makes it a soft

@@ -523,6 +523,38 @@ def leases_owned(paths, run_token):
     return True
 
 
+def lease_attached(lease, now=None, proc_root="/proc"):
+    """POSITIVE proof of a watcher, unlike lease_is_live, whose
+    ambiguous cases deliberately count as live so lease RECLAIM fails
+    safe — the wrong default for a status display ({} would show as
+    attached). Attached = well-formed lease AND (fresh heartbeat OR
+    pid+starttime verified alive)."""
+    if not isinstance(lease, dict):
+        return False
+    pid = lease.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    token = lease.get("run_token")
+    if not isinstance(token, str) or not token:
+        return False
+    # Well-formed means an exact positive integer starttime — the shape
+    # _lease_record writes. A malformed lease must not read as attached
+    # (it would suppress the unwatched warning) even under a fresh
+    # heartbeat.
+    start = lease.get("proc_start")
+    if not isinstance(start, int) or isinstance(start, bool) or start <= 0:
+        return False
+    heartbeat = _finite_number(lease.get("heartbeat_at"))
+    now = time.time() if now is None else now
+    # Heartbeats are same-machine writes: a future timestamp (beyond
+    # sub-second slop) is malformed, not clock skew — it must not count
+    # as fresh evidence. The pid can still prove the watcher alive.
+    if heartbeat is not None and heartbeat <= now + 1 and \
+            now - heartbeat < LEASE_FRESH_S:
+        return True
+    return proc_matches(pid, start, proc_root)
+
+
 def heartbeat_leases(paths, run_token, now=None, fail_after=None):
     """Conditionally replace both lease files in one short transaction."""
     now = time.time() if now is None else now
@@ -3087,6 +3119,26 @@ def overview_data(cfg, now=None, sessions_dir=None, proc_root="/proc"):
                 row["age_s"] = max(0, int(now - mtime))
             else:
                 row["future_mtime"] = True
+            # The blind spot that left a live session two days past
+            # its trigger unmanaged: managed mode, provably live
+            # session, at/over trigger, no attached watcher. Positive
+            # conditions only — unknown liveness or an ambiguous lease
+            # read (None: e.g. a heartbeat's atomic replace mid-
+            # flight) stays unflagged rather than crying wolf; and its
+            # own guard, so a surprise here degrades to no flag, never
+            # to an unreadable row.
+            try:
+                if (cfg.get("mode") == "managed"
+                        and row["session_live"] is True
+                        and current / window >= trig):
+                    lease, _inode = read_json_inode(os.path.join(
+                        cfg["state_dir"], "managed", "leases",
+                        "session-%s.json" % cm.path_component(sid)))
+                    if lease is not None and not lease_attached(
+                            lease, now=now, proc_root=proc_root):
+                        row["unwatched"] = True
+            except Exception:
+                pass
         except Exception:
             row["unreadable"] = True
         data["sessions"].append(row)
@@ -3211,6 +3263,17 @@ def overview_text(cfg, now=None, sessions_dir=None, proc_root="/proc"):
         if "?" in alives:
             lines.append("(alive=? — session liveness could not be "
                          "judged on this machine)")
+        for s in data["sessions"]:
+            if s.get("unwatched"):
+                # Report-only surface (the status command relays this
+                # verbatim to a model): describe, name the user's
+                # remedy, and never phrase it as an instruction the
+                # reader should execute.
+                lines.append("(!) %s is at/over its trigger with NO "
+                             "live watcher — nothing will compact it. "
+                             "The user can attach one from inside "
+                             "that session with /compact-manager:"
+                             "attach." % str(s["session_id"])[:8])
     else:
         lines.append(label)
     return "\n".join(lines)

@@ -49,33 +49,6 @@ def _reorient(cfg, session_id):
     _emit(cfg, cm.reorientation_text(packet, cm.delivery_cap(cfg)))
 
 
-def _lease_attached(managed, lease):
-    """POSITIVE proof of a watcher, unlike managed.lease_is_live, whose
-    ambiguous cases deliberately count as live so lease RECLAIM fails
-    safe — the wrong default for a status display ({} would show as
-    attached). Attached = well-formed lease AND (fresh heartbeat OR
-    pid+starttime verified alive)."""
-    if not isinstance(lease, dict):
-        return False
-    pid = lease.get("pid")
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return False
-    token = lease.get("run_token")
-    if not isinstance(token, str) or not token:
-        return False
-    if managed._finite_number(lease.get("proc_start")) is None:
-        return False
-    heartbeat = managed._finite_number(lease.get("heartbeat_at"))
-    now = time.time()
-    # Heartbeats are same-machine writes: a future timestamp (beyond
-    # sub-second slop) is malformed, not clock skew — it must not count
-    # as fresh evidence. The pid can still prove the watcher alive.
-    if heartbeat is not None and heartbeat <= now + 1 and \
-            now - heartbeat < managed.LEASE_FRESH_S:
-        return True
-    return managed.proc_matches(pid, lease.get("proc_start"))
-
-
 def _watcher_status(cfg, session_id):
     if cfg["mode"] != "managed":
         return
@@ -90,7 +63,7 @@ def _watcher_status(cfg, session_id):
     cli = os.path.normpath(
         os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "..", "bin", "compact-manager"))
-    if _lease_attached(managed, lease):
+    if managed.lease_attached(lease):
         text = ("compact-manager: managed mode, watcher attached to this "
                 "session (pid %s)." % lease.get("pid"))
     else:

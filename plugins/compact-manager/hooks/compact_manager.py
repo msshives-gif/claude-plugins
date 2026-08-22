@@ -368,6 +368,9 @@ _STATE_DEFAULTS = {"schema": SCHEMA_VERSION, "inode": None, "size": 0,
                    "advisory_level": "none", "armed_at_ts": 0,
                    "packet_seq": 0, "last_drained_packet_seq": -1,
                    "discard_to_newline": False,
+                   # One warning per crossing of trigger while
+                   # unwatched (managed mode); re-armed below trigger.
+                   "unwatched_warned": False,
                    # Effective thresholds stamped by the advisor (its
                    # env-honoring, per-model-merged view); 0 = unstamped.
                    "eff_window": 0, "eff_soft_pct": 0.0,
@@ -395,7 +398,7 @@ def load_state(paths):
             st[k] = v if v in ("none", "soft", "hard") else "none"
         elif k == "model":
             st[k] = v if isinstance(v, str) else ""
-        elif k == "discard_to_newline":
+        elif k in ("discard_to_newline", "unwatched_warned"):
             st[k] = v if isinstance(v, bool) else False
         elif k in ("eff_soft_pct", "eff_hard_pct", "eff_trigger_pct"):
             # Stamped threshold fractions: (0, 1] or back to unstamped.
