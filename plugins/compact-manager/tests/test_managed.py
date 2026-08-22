@@ -1000,7 +1000,6 @@ class RequestConfigInstructionTests(unittest.TestCase):
                "COMPACT_MANAGER_MANAGED_POLL_S": "1",
                "COMPACT_MANAGER_MANAGED_ACK_TIMEOUT_S": "4",
                "COMPACT_MANAGER_MANAGED_COMPLETION_TIMEOUT_S": "5",
-               "COMPACT_MANAGER_MANAGED_DEADLINE_HOURS": "1000",
                "COMPACT_MANAGER_MANAGED_PANE_COMMANDS": '["claude","cc"]'}
         cfg = managed.load_config(base=base, environ=env)
         self.assertEqual(cfg["managed_trigger_pct"], 0.8)
@@ -1008,7 +1007,6 @@ class RequestConfigInstructionTests(unittest.TestCase):
         self.assertEqual(cfg["managed_poll_s"], 5)
         self.assertEqual(cfg["managed_ack_timeout_s"], 30)
         self.assertEqual(cfg["managed_completion_timeout_s"], 30)
-        self.assertEqual(cfg["managed_deadline_hours"], 72)
         self.assertEqual(cfg["managed_pane_commands"], ["claude", "cc"])
 
     def test_instruction_is_fixed_and_metacharacter_free(self):
@@ -1407,11 +1405,11 @@ class TickWiringTests(unittest.TestCase):
                         "tmux_session_id": "$1", "run_token": self.token,
                         "attended": True}
 
-    def make_watcher(self, rows, tmux):
+    def make_watcher(self, rows, tmux, **kw):
         append_rows(self.transcript, rows)
+        kw.setdefault("wait", lambda seconds: None)
         return managed.Watcher(self.binding, self.cfg, self.paths,
-                               run_tmux=tmux, proc_root=self.proc,
-                               wait=lambda seconds: None)
+                               run_tmux=tmux, proc_root=self.proc, **kw)
 
     def test_operator_stop_journals_stop_requested(self):
         # A stop must record its actual cause, not the incidental
@@ -1439,7 +1437,9 @@ class TickWiringTests(unittest.TestCase):
 
     def test_missing_transcript_is_pending_not_retire(self):
         # A virgin session's watcher waits for the first turn to create
-        # the transcript; it must not retire (deadline bounds the wait).
+        # the transcript; it must not retire (the wait is bounded by
+        # the session's own life — validate_binding retires on death
+        # and rotation).
         watcher = self.make_watcher([], LadderTmux([IDLE]))
         if os.path.exists(self.transcript):
             os.unlink(self.transcript)
@@ -1451,6 +1451,78 @@ class TickWiringTests(unittest.TestCase):
         tmux.facts = "%1\t/dev/pts/7\t10\tclaude\t1\t120\t40\t$1\n"
         watcher = self.make_watcher([usage_row(50)], tmux)
         self.assertEqual(watcher.tick(), (True, "pane_in_mode"))
+
+    def test_zombie_leader_retires_claude_dead(self):
+        # Watchers have no time-based deadline, so an exited-but-
+        # unreaped claude (proc state Z, pid entry lingering) must be
+        # positively recognized as death — otherwise the watcher
+        # babysits the corpse forever.
+        for state in ("Z", "X", "x"):
+            write_proc(self.proc, 20, 20, 2020, state=state)
+            watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+            watcher.cursor["caught_up"] = True
+            keep, reason = watcher.tick()
+            self.assertEqual((keep, reason), (False, "claude_dead"), state)
+
+    def test_stopped_leader_keeps_watcher_alive(self):
+        # T (SIGSTOP) is a paused session, not an ended one: the
+        # watcher stays for as long as the session lives.
+        write_proc(self.proc, 20, 20, 2020, state="T")
+        watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+        watcher.cursor["caught_up"] = True
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+
+    def test_retire_skips_stale_record_after_ownership_loss(self):
+        # A successor already owns the leases and has journaled READY:
+        # the loser's trailing WATCHER_RETIRED would supersede the
+        # successor's lifecycle in status and flag a live watcher
+        # DEAD-LEASE (Sol round-3 MEDIUM) — the fenced append must
+        # skip it.
+        watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+        successor = {"run_token": "b" * 16, "pid": 20, "proc_start": 2020,
+                     "heartbeat_at": time.time()}
+        managed._atomic_json(self.paths["session_lease"], successor)
+        managed._atomic_json(self.paths["pane_lease"], successor)
+        managed.journal_record(self.paths["journal"], "WATCHER_READY",
+                               {"run_token": "b" * 16})
+        watcher._retire("lease_lost")
+        records = list(managed.read_journal(self.paths["journal"]))
+        self.assertEqual(records[-1]["state"], "WATCHER_READY")
+        self.assertNotIn("WATCHER_RETIRED",
+                         [r.get("state") for r in records])
+
+    def test_retire_writes_when_ownership_unknowable(self):
+        # Lock timeout: ownership can't be judged — prefer the durable
+        # record (old behavior) over a clean exit reading READY +
+        # DEAD-LEASE forever.
+        watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+        with managed.txn_lock(self.paths["txn"]):
+            watcher._retire("stop_requested")
+        records = list(managed.read_journal(self.paths["journal"]))
+        self.assertEqual(records[-1]["state"], "WATCHER_RETIRED")
+        self.assertEqual(records[-1].get("reason"), "stop_requested")
+
+    def test_stop_with_typed_attempt_journals_hazard_first(self):
+        # An operator stop while an attempt sits SUBMITTED (typed
+        # bytes of unproven disposition, typed_critical only spans the
+        # ladder call) must journal CLEANUP_REQUIRED before the
+        # retirement record — a bare WATCHER_RETIRED tail would read
+        # as a clean exit in status and mask the hazard (Sol round-2
+        # HIGH).
+        watcher = self.make_watcher([usage_row(50)], LadderTmux([IDLE]))
+        watcher.attempt = {"state": "SUBMITTED", "run_token": self.token,
+                           "attempt_id": "att1", "nonce": "n1",
+                           "nonces": ["n1"], "generation": None,
+                           "attempt_packet_seq_floor": 0, "timers": {}}
+        watcher.stop_requested = True
+        watcher.run()
+        records = list(managed.read_journal(self.paths["journal"]))
+        self.assertEqual(records[-1]["state"], "WATCHER_RETIRED")
+        self.assertEqual(records[-1].get("reason"), "stop_requested")
+        hazards = [r for r in records if r.get("state") == "CLEANUP_REQUIRED"
+                   and r.get("attempt_id") == "att1"]
+        self.assertTrue(hazards)  # journaled before the retirement
 
     def test_pane_hiccup_with_live_claude_waits(self):
         tmux = LadderTmux([IDLE])
@@ -1689,35 +1761,6 @@ class TickWiringTests(unittest.TestCase):
         self.assertEqual(
             triggered[-1]["request_fingerprint"]["request_id"],
             "please-compact-now")
-
-
-class WatcherDeadlineTests(unittest.TestCase):
-    def test_deadline_expiry_retires_before_any_tmux_call(self):
-        # The absolute deadline cannot be exercised live (1h floor); pin it
-        # here: an expired watcher retires before touching tmux or leases.
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        cfg = managed.load_config(
-            base=dict(cm._DEFAULTS, state_dir=temp.name), environ={})
-        paths = managed.managed_paths(cfg, "session-1234", "sock", "%1")
-        clock = iter([0.0, 0.0, cfg["managed_deadline_hours"] * 3600 + 1.0])
-        calls = []
-
-        def runner(argv, timeout=5):
-            calls.append(argv)
-            return Result("")
-        binding = {"socket": "sock", "pane_id": "%1", "pane_tty": "t",
-                   "pane_root_pid": 1, "pane_root_start": 1,
-                   "claude_pid": 2, "claude_start": 2,
-                   "session_id": "session-1234", "transcript_path": "/none",
-                   "tmux_session_id": "$1", "run_token": "a" * 16,
-                   "attended": True}
-        watcher = managed.Watcher(binding, cfg, paths, run_tmux=runner,
-                                  proc_root=temp.name,
-                                  monotonic=lambda: next(clock))
-        keep, reason = watcher.tick()
-        self.assertEqual((keep, reason), (False, "deadline"))
-        self.assertEqual(calls, [])
 
 
 class StopSessionTests(unittest.TestCase):

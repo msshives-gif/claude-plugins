@@ -30,7 +30,8 @@
 #   s15 half-typed text under background chrome with the boundary lane
 #       armed: zero keystrokes; submits after the composer clears
 #   s16 queued /compact evidence pin (informational; watcher stopped)
-# Deadline expiry is unit-tested (1h floor makes it impractical live).
+# Watchers have no time-based deadline; lifecycle ends are covered by
+# s06 (stop), s11 (claude death), and s13 (session rotation).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 D="$(cd "$(dirname "$0")" && pwd)"

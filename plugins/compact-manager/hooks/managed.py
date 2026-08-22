@@ -64,7 +64,6 @@ MANAGED_DEFAULTS = {
     "managed_poll_s": 15,
     "managed_ack_timeout_s": 120,
     "managed_completion_timeout_s": 300,
-    "managed_deadline_hours": 24,
     "managed_pane_commands": ["claude"],
 }
 
@@ -147,7 +146,6 @@ def load_config(base=None, environ=None):
     cfg["managed_ack_timeout_s"] = integer("managed_ack_timeout_s", 30)
     cfg["managed_completion_timeout_s"] = max(
         cfg["managed_ack_timeout_s"], integer("managed_completion_timeout_s", 30))
-    cfg["managed_deadline_hours"] = integer("managed_deadline_hours", 1, 72)
     commands = raw["managed_pane_commands"]
     if isinstance(commands, str):
         try:
@@ -673,8 +671,9 @@ def live_session_ids(sessions_dir=None, proc_root="/proc", limit=256):
 def derive_transcript(cwd, session_id, projects_dir=None):
     """Derive the transcript PATH (containment-checked). The file may not
     exist yet — a virgin session writes it on its first turn, and start
-    binds before any turn; the watcher waits (transcript_pending, bounded
-    by its deadline) and can never inject until a real scan catches up."""
+    binds before any turn; the watcher waits (transcript_pending, for as
+    long as the session lives) and can never inject until a real scan
+    catches up."""
     projects = os.path.realpath(projects_dir or
                                 os.path.expanduser("~/.claude/projects"))
     # Claude Code's project slug maps every non-alphanumeric character to
@@ -741,13 +740,26 @@ def validate_binding(binding, cfg, paths=None, run_tmux=default_run_tmux,
     if (facts["pane_pid"] != binding["pane_root_pid"] or root is None or
             root["starttime"] != binding["pane_root_start"]):
         return False, "pane_root_changed"
-    if not proc_matches(binding["claude_pid"], binding["claude_start"], proc_root):
+    leader = proc_stat(binding["claude_pid"], proc_root)
+    try:
+        leader_ok = (leader is not None and
+                     leader["starttime"] == int(binding["claude_start"]))
+    except (TypeError, ValueError, OverflowError):
+        leader_ok = False
+    # A zombie (Z) or dead (X/x) leader is an exited claude whose
+    # parent has not reaped it: the session is over. Watchers have no
+    # time-based deadline — this positive death proof is what keeps
+    # "watcher lives exactly as long as its session" honest for a
+    # corpse whose pid entry lingers.
+    if leader_ok and leader["state"] in ("Z", "X", "x"):
+        leader_ok = False
+    if not leader_ok:
         return False, "claude_dead"
     # /clear and in-app /resume rotate the session id inside the SAME
     # claude process; without this check the watcher babysits the dead
-    # id's frozen transcript until its deadline while the live session
-    # goes unwatched. Positive proof only: a readable registry entry
-    # for the bound pid, same starttime (same process), carrying a
+    # id's frozen transcript forever while the live session goes
+    # unwatched. Positive proof only: a readable registry entry for
+    # the bound pid, same starttime (same process), carrying a
     # DIFFERENT valid session id. A missing or malformed entry proves
     # nothing and must never retire a healthy watcher.
     try:
@@ -2005,7 +2017,6 @@ class Watcher:
         self.typed_critical = False
         self.next_heartbeat = monotonic() + HEARTBEAT_S
         self.started = monotonic()
-        self.deadline = self.started + cfg["managed_deadline_hours"] * 3600
         self.cursor = load_cursor(paths["scan"])
         self.attempt = recover_attempt(paths["journal"], boot_id(proc_root))
         self.backoff = BACKOFF_INITIAL_S
@@ -2066,7 +2077,7 @@ class Watcher:
         if reason != "pane_missing":
             return False
         # A zombie claude is dead for this purpose — hot-waiting on an
-        # exited-but-unreaped process would spin until the deadline.
+        # exited-but-unreaped process would spin forever.
         live = proc_stat(self.binding["claude_pid"], self.proc_root)
         try:
             return (live is not None and live.get("state") != "Z" and
@@ -2096,6 +2107,37 @@ class Watcher:
                            self.attempt, reason=reason)
             self.alert_if_needed()
 
+    def _retire(self, reason, hazard_reason=None):
+        """Durable exit: typed-state hazard first (a no-op unless an
+        attempt holds unproven typed bytes — without it a trailing
+        clean retirement would mask the hazard in status), then the
+        retirement record (without which status reads WATCHER_READY
+        plus a DEAD-LEASE false alarm for a watcher that left
+        cleanly). The retirement append is fenced on lease ownership
+        under the txn lock: after an ownership loss a successor may
+        already be journaling, and a stale trailing WATCHER_RETIRED
+        would supersede its lifecycle in status (Sol round-3). The
+        hazard record stays unconditional — unproven typed bytes are
+        a property of the pane, not of who owns the lease now."""
+        self._journal_typed_hazard(hazard_reason or reason)
+        payload = self.attempt or {
+            "run_token": self.binding["run_token"],
+            "generation": generation(self.cursor)}
+        try:
+            with txn_lock(self.paths["txn"]):
+                if leases_owned(self.paths, self.binding["run_token"]):
+                    journal_record(self.paths["journal"],
+                                   "WATCHER_RETIRED", payload,
+                                   reason=reason)
+        except Exception:
+            # Ownership unknowable (lock timeout, unreadable lease):
+            # prefer the durable record, matching the old behavior —
+            # a missing record makes a clean exit read READY +
+            # DEAD-LEASE forever, while a stale one is a transient
+            # mislabel until the successor's next journal write.
+            journal_record(self.paths["journal"], "WATCHER_RETIRED",
+                           payload, reason=reason)
+
     def _heartbeat_due(self, now):
         """Beat both leases if due; False means ownership was lost."""
         if now >= self.next_heartbeat:
@@ -2121,9 +2163,6 @@ class Watcher:
                     "attempt_packet_seq_floor",
                     latest.get("packet_seq_at_prepare", 0))
                 self.attempt = latest
-        if now >= self.deadline:
-            self._journal_typed_hazard("watcher_deadline")
-            return False, "deadline"
         ok, reason = validate_binding(self.binding, self.cfg, self.paths,
                                       self.run_tmux, self.proc_root,
                                       sessions_dir=self.sessions_dir)
@@ -2416,38 +2455,18 @@ class Watcher:
         # necessary, keeping the fixed heartbeat alive between chunks.
         while not self.cursor.get("caught_up"):
             if self.stop_requested:
-                # An operator stop is a clean exit and must say so —
-                # a silent return leaves READY + DEAD-LEASE in status.
-                journal_record(
-                    self.paths["journal"], "WATCHER_RETIRED",
-                    self.attempt or {
-                        "run_token": self.binding["run_token"],
-                        "generation": generation(self.cursor)},
-                    reason="stop_requested")
+                self._retire("stop_requested")
                 return
             now = self.monotonic()
-            if now >= self.deadline:
-                self._journal_typed_hazard("watcher_deadline")
-                return
             valid, why = validate_binding(
                 self.binding, self.cfg, self.paths, self.run_tmux,
                 self.proc_root, sessions_dir=self.sessions_dir)
             if not valid:
                 if not self._transient(why):
-                    # Same contract as tick(): retiring with a recovered
-                    # typed-state attempt must leave a durable hazard —
-                    # and the retirement itself must be journaled, or
-                    # status keeps reading WATCHER_READY + DEAD-LEASE
-                    # for a watcher that left cleanly (audit finding).
-                    self._journal_typed_hazard(why)
-                    journal_record(
-                        self.paths["journal"], "WATCHER_RETIRED",
-                        self.attempt or {
-                            "run_token": self.binding["run_token"],
-                            "generation": generation(self.cursor)},
-                        reason=why)
+                    self._retire(why)
                     return
                 if not self._heartbeat_due(now):
+                    self._retire("lease_lost")
                     return
                 self._defer_triggered(why, now)
                 self.wait(min(self.cfg["managed_poll_s"], HEARTBEAT_S))
@@ -2457,16 +2476,18 @@ class Watcher:
                 self.cursor, self.binding["transcript_path"], SCAN_MAX_BYTES)
             if self.cursor.get("_scan_missing"):
                 # Virgin session: wait for the first turn to create the
-                # transcript (deadline-bounded; claude death retires).
+                # transcript (claude death or rotation retires).
                 if not self._heartbeat_due(self.monotonic()):
+                    self._retire("lease_lost")
                     return
                 self.wait(min(self.cfg["managed_poll_s"], HEARTBEAT_S))
                 continue
             if self.cursor.get("_scan_error"):
-                self._journal_typed_hazard("transcript_unavailable")
+                self._retire("transcript_unavailable")
                 return
             save_cursor(self.paths["scan"], self.cursor)
             if not self._heartbeat_due(self.monotonic()):
+                self._retire("lease_lost")
                 return
             after = (self.cursor.get("file_epoch"), self.cursor.get("offset"))
             if after == before:
@@ -2479,10 +2500,13 @@ class Watcher:
                     # not the incidental last-tick status (which would
                     # read e.g. "below_threshold").
                     reason = "stop_requested"
-                journal_record(self.paths["journal"], "WATCHER_RETIRED",
-                               self.attempt or {"run_token": self.binding["run_token"],
-                                                "generation": generation(self.cursor)},
-                               reason=reason)
+                # _retire's hazard pass matters here: a stop or lease
+                # loss can land while an attempt sits SUBMITTED/ACKED
+                # between ticks (typed_critical only spans the ladder
+                # call), and tick's own hazard paths have already
+                # moved the attempt out of typed states, making the
+                # extra pass a no-op there.
+                self._retire(reason)
                 break
             now = self.monotonic()
             # Floor keeps an overdue heartbeat from degenerating into a

@@ -245,7 +245,6 @@ Managed-mode knobs (all clamped to safe ranges):
 | `managed_poll_s` | `15` | How often the watcher checks the session. |
 | `managed_ack_timeout_s` | `120` | No confirmation the command was received → one retry, then stop and alert. |
 | `managed_completion_timeout_s` | `300` | Command received but compaction never finished → stop and alert. |
-| `managed_deadline_hours` | `24` | Watcher retires unconditionally after this. |
 | `managed_pane_commands` | `["claude"]` | Only type into a pane running one of these. |
 
 ## How it works / limitations

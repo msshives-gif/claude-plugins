@@ -48,8 +48,8 @@ two decisions, not a tutorial.
    for live watchers and stop each one
    (`"${CLAUDE_PLUGIN_ROOT}/bin/compact-manager" stop <session-id>`,
    with the user confirming the list) — or tell the user explicitly
-   that existing watchers stay active until stopped or their 24h
-   deadline.
+   that existing watchers stay active until stopped or their session
+   ends.
 6. Write `~/.claude/compact-manager.json` with the chosen mode (and
    any overrides). If the file exists, MERGE — show the user the
    exact final JSON before writing, and never drop keys they already

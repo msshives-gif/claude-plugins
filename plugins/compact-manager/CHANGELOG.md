@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Watcher: removed the time-based retirement deadline
+  (`managed_deadline_hours` is gone from the config). A watcher now
+  lives exactly as long as its session: exit, `/clear`/in-app
+  `/resume` rotation, pane repurposing, and operator stop retire it;
+  nothing else does. Previously it silently retired 24h after
+  adoption, leaving long-lived sessions unmanaged with no notice
+  (observed live: a session two days past its watcher's deadline
+  sitting 8 points above its trigger). To keep "as long as its
+  session" honest without a clock, a zombie/dead leader proc state
+  (Z/X/x — exited claude, unreaped pid) is now positively recognized
+  as claude_dead; a stopped one (T) is a paused session and keeps
+  its watcher.
+- Watcher: catch-up loop exits (stop, non-transient binding loss,
+  heartbeat-ownership loss, scan error) now journal WATCHER_RETIRED
+  like the tick loop's exits (Sol audit). All retirement exits route
+  through one helper that journals a CLEANUP_REQUIRED typed-state
+  hazard before the retirement record, closing a pre-existing gap
+  where an operator stop or lease loss while an attempt sat
+  SUBMITTED/ACKED between ticks would mask the unproven typed bytes
+  behind a clean retirement in status (Sol audit HIGH) — and the
+  retirement append is fenced on lease ownership under the txn lock
+  so a stale loser can't supersede a successor's lifecycle in status
+  (Sol audit MEDIUM).
 - Overview: cleanly retired watchers now age out of the watchers list
   24h after their last journal write (same window the sessions list
   uses) instead of lingering until the 7-day TTL reap. Rows carrying
