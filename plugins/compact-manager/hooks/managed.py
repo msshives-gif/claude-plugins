@@ -2936,6 +2936,26 @@ def overview_data(cfg, now=None, sessions_dir=None, proc_root="/proc"):
             flags.append("MALFORMED-LEASE")
         if r.get("starved_for_s") is not None:
             flags.append("ATTENTION")
+        if r["state"] == "WATCHER_RETIRED" and not flags:
+            # A cleanly retired watcher ages off the overview 24h after
+            # its last journal write (same window the sessions list
+            # uses); the journal itself survives to state_ttl_days so
+            # the cm counter keeps its proof. Flagged rows (DEAD-LEASE
+            # etc.) are hazards and stay visible regardless of age.
+            paths = managed_paths(cfg, r["session_id"])
+            if os.path.lexists(paths["session_lease"]):
+                # A clean retirement releases its lease. A lease file
+                # still present here is one status_rows could not read
+                # (a readable one flags DEAD-LEASE above) — it still
+                # blocks adoption, so it must stay visible and flagged,
+                # never age out as "clean" (Sol audit).
+                flags.append("DEAD-LEASE")
+            else:
+                try:
+                    if now - os.path.getmtime(paths["journal"]) > 86_400:
+                        continue
+                except OSError:
+                    pass  # nothing to date the retirement by — keep it
         data["watchers"].append({
             "session_id": r["session_id"], "pid": r["pid"],
             "state": r["state"], "live": r["live"],

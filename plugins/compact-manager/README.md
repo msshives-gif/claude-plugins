@@ -137,7 +137,10 @@ locate the CLI defensively rather than trusting the placeholder.
 The data-gathering lives in the CLI, not in command prose:
 `bin/compact-manager overview` prints the runtime readout (effective
 thresholds global and per-model-override, watchers with attention
-flags, per-session usage, and a recency-based current-session marker
+flags — a cleanly retired watcher ages out of the list 24h after
+retirement, while flagged rows (DEAD-LEASE and friends) stay visible
+until resolved or TTL-reaped — per-session usage, and a
+recency-based current-session marker
 with an age column to verify it) that `status`
 relays — also usable directly, with no model turn at all. Each
 session row also carries an `alive` verdict (`live` / `GONE` / `?`):

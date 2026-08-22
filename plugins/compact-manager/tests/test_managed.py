@@ -2298,6 +2298,72 @@ class OverviewTests(unittest.TestCase):
             self.assertIn("FUTURE-MTIME", row)
         self.assertNotRegex(out, r"-\d+s ago")  # no negative age anywhere
 
+    def test_overview_retired_watcher_ages_out_after_24h(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = dict(cm._DEFAULTS, mode="managed", state_dir=tmp.name,
+                   context_window=200_000)
+        lease_dir = os.path.join(tmp.name, "managed", "leases")
+        wdir = os.path.join(tmp.name, "managed", "watchers")
+        os.makedirs(lease_dir)
+        os.makedirs(wdir)
+        now = time.time()
+        old = now - 25 * 3600
+        # cleanly retired >24h ago: drops from the overview (the
+        # journal file itself lives on to state_ttl_days)
+        old_done = os.path.join(wdir, "sOldDone.journal.jsonl")
+        managed.journal_record(old_done, "WATCHER_RETIRED", {},
+                               reason="deadline")
+        os.utime(old_done, (old, old))
+        # cleanly retired just now: stays
+        managed.journal_record(
+            os.path.join(wdir, "sNewDone.journal.jsonl"),
+            "WATCHER_RETIRED", {}, reason="claude_dead")
+        # retired >24h ago but the lease was never released: a hazard
+        # row (DEAD-LEASE) never ages out of the display
+        with open(os.path.join(lease_dir, "session-sOldOrphan.json"),
+                  "w") as fh:
+            json.dump({"run_token": "t", "pid": 999999999,
+                       "proc_start": 1, "heartbeat_at": 1.0}, fh)
+        old_orphan = os.path.join(wdir, "sOldOrphan.journal.jsonl")
+        managed.journal_record(old_orphan, "WATCHER_RETIRED", {},
+                               reason="claude_dead")
+        os.utime(old_orphan, (old, old))
+        # retired >24h ago with an UNREADABLE leftover lease: status_rows
+        # reads has_lease=False (unparseable leases are dropped), but the
+        # file still blocks adoption — must stay visible and flagged,
+        # never age out as "clean" (Sol audit MEDIUM)
+        with open(os.path.join(lease_dir, "session-sOldTorn.json"),
+                  "w") as fh:
+            fh.write("{not json")
+        old_torn = os.path.join(wdir, "sOldTorn.journal.jsonl")
+        managed.journal_record(old_torn, "WATCHER_RETIRED", {},
+                               reason="claude_dead")
+        os.utime(old_torn, (old, old))
+        data = managed.overview_data(cfg, now=now)
+        by_sid = {w["session_id"]: w for w in data["watchers"]}
+        self.assertNotIn("sOldDone", by_sid)
+        self.assertIn("sNewDone", by_sid)
+        self.assertIn("sOldOrphan", by_sid)
+        self.assertIn("DEAD-LEASE", by_sid["sOldOrphan"]["flags"])
+        self.assertIn("sOldTorn", by_sid)
+        self.assertIn("DEAD-LEASE", by_sid["sOldTorn"]["flags"])
+        # journal stat failing (pruned/replaced between listing and
+        # stat): the row stays visible and the readout survives
+        real_getmtime = os.path.getmtime
+
+        def flaky_getmtime(path):
+            if path.endswith("sOldDone.journal.jsonl"):
+                raise OSError("gone")
+            return real_getmtime(path)
+
+        with mock.patch.object(managed.os.path, "getmtime",
+                               side_effect=flaky_getmtime):
+            data = managed.overview_data(cfg, now=now)
+        by_sid = {w["session_id"]: w for w in data["watchers"]}
+        self.assertIn("sOldDone", by_sid)  # fail-open to visible
+        self.assertIn("sNewDone", by_sid)
+
 
 class SessionLivenessTests(unittest.TestCase):
     """live_session_ids and the overview's session_live/alive surface."""

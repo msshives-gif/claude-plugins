@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Overview: cleanly retired watchers now age out of the watchers list
+  24h after their last journal write (same window the sessions list
+  uses) instead of lingering until the 7-day TTL reap. Rows carrying
+  hazard flags (DEAD-LEASE, ATTENTION, MALFORMED-LEASE) never age
+  out of the display. Fixes stale multi-day RETIRED rows in the CLI
+  overview and the ccam dashboard panel that relays it. A retired row
+  whose leftover lease file is unreadable (status_rows drops
+  unparseable leases, so it carries no flag) is surfaced as DEAD-LEASE
+  and kept — the file still blocks adoption (Sol audit).
 - Overview: per-session count of compactions the manager itself fired
   (`cm` column in the text table, `cm_compacts` in `overview --json`).
   Derived read-only from the watcher journal — attempts with own-nonce
