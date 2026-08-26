@@ -63,6 +63,50 @@ ALERT_STATES = {"LATCHED", "SUBMISSION_UNCERTAIN", "CLEANUP_REQUIRED"}
 LIFECYCLE_STATES = {"WATCHER_READY", "ALERT_DELIVERY", "WATCHER_RETIRED",
                     "STARVATION_ALERT"}
 STARVATION_ALERT_S = 120.0
+# Active composer clearing. When an attempt is due (or a typed-bytes
+# wedge is being recovered) and the composer visibly holds input —
+# the watcher's own wedged instruction or a human draft — the watcher
+# may clear it with bounded C-u keystrokes and proceed, instead of
+# deferring or staying wedged until an operator arrives. C-u only:
+# C-c arms the TUI's quit prompt and Escape interrupts a running
+# turn, so neither is ever an acceptable clearing key. C-u on an
+# already-empty composer is a no-op, and the watcher never sends it
+# without visible material to clear. Every clear is journaled with an
+# excerpt of what was destroyed. Disable with managed_clear_composer.
+# Each round is C-e, C-u, BSpace: C-u kills to line START, so a
+# cursor a human left mid-line would otherwise strand the text to its
+# right (containment audit); C-e is a pure cursor move, harmless
+# anywhere; the trailing BSpace consumes the newline joining a
+# hard-multiline draft's continuation line to the one above (C-u
+# kills text, never the newline — observed live: the first line
+# survived a multiline clear), and is a no-op on an empty composer.
+CLEAR_CURSOR_KEY = "C-e"
+CLEAR_KEY = "C-u"
+CLEAR_JOIN_KEY = "BSpace"
+CLEAR_KEY_ROUNDS = 6
+CLEAR_VERIFY_WAIT_S = 0.3
+CLEAR_EXCERPT_CHARS = 200
+# The destructive path's quiet window must never be SHORTER than the
+# non-destructive boundary lane's 500ms floor (containment audit).
+CLEAR_STABLE_FLOOR_MS = 500
+# Reasons whose hazard is "typed bytes, Enter never sent": the only
+# cleanup class active recovery may clear. own_packet_proof and every
+# other cleanup reason keep terminal operator-resolve semantics.
+ACTIVE_RECOVERY_REASONS = {"R4_send_failed", "R5_composer_mismatch",
+                           "R6_prime_composer_mismatch"}
+# Consecutive active recoveries without an intervening confirmed
+# boundary before the watcher concludes the wedge cause is systematic
+# (UI drift, a stuck repaint) and stops sending keys at it.
+ACTIVE_RECOVERY_LIMIT = 3
+# Keyed clear INVOCATIONS per attempt before clear_composer stops
+# trying — successes included, charged durably before the first key:
+# a composer that keeps getting refilled (or that fails to react to
+# C-u) must not be cleared once per poll forever, and an exception
+# after dispatch must not escape the accounting (Sol round-2
+# blocker: failure-only counting left successful clears free while
+# recovery proofs kept failing). Gate refusals (no keystroke sent)
+# cost nothing.
+CLEAR_CHARGE_LIMIT = 3
 INSTRUCTION_TEMPLATE = ("/compact [cm-{nonce}] Preserve the task list and "
                         "open decisions to the handoff file")
 INSTRUCTION_TEMPLATE_SHORT = "/compact [cm-{nonce}]"
@@ -74,7 +118,10 @@ ADOPT_ACKNOWLEDGEMENT = (
     "In adopt mode, the automation may in a worst-case race deliver the "
     "fixed `/compact …` bytes and one Enter to the underlying shell. "
     "The resulting shell behavior is not semantically bounded; "
-    "concurrent user input can alter the executed line.")
+    "concurrent user input can alter the executed line. With composer "
+    "clearing on (the default), the automation may also erase text "
+    "sitting unsubmitted in the composer — including text a human "
+    "typed — after journaling an excerpt of it.")
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 _SESSION_ID = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 
@@ -85,6 +132,7 @@ MANAGED_DEFAULTS = {
     "managed_ack_timeout_s": 120,
     "managed_completion_timeout_s": 300,
     "managed_pane_commands": ["claude"],
+    "managed_clear_composer": True,
 }
 
 
@@ -176,6 +224,16 @@ def load_config(base=None, environ=None):
             all(isinstance(x, str) and x.strip() for x in commands)):
         commands = list(MANAGED_DEFAULTS["managed_pane_commands"])
     cfg["managed_pane_commands"] = commands
+    clear = raw["managed_clear_composer"]
+    if clear is None:
+        # An explicit JSON null falls back to the default rather than
+        # silently reading as false (audit nit).
+        clear = MANAGED_DEFAULTS["managed_clear_composer"]
+    if isinstance(clear, str):
+        # Env values arrive as strings; the usual falsey spellings
+        # disable, anything else (including "1"/"true") enables.
+        clear = clear.strip().lower() not in ("", "0", "false", "no", "off")
+    cfg["managed_clear_composer"] = bool(clear)
     return cfg
 
 
@@ -1776,16 +1834,241 @@ def _boundary_still_safe(binding, run_tmux, activity_reader, activity_rev):
     return _activity_unchanged(activity_reader, activity_rev)
 
 
+def _clear_revalidate(abort_check, activity_reader, rev, binding, cfg,
+                      paths, run_tmux, proc_root, sessions_dir):
+    """The per-key safety battery: caller authority (abort_check),
+    same ended turn, schedulable leader, valid binding. None = safe to
+    send; else the refusal reason."""
+    if abort_check is not None and not abort_check():
+        return "aborted"
+    if not _activity_unchanged(activity_reader, rev):
+        return "activity_changed"
+    leader = proc_stat(binding["claude_pid"], proc_root)
+    if leader is None or leader.get("state") not in ("R", "S"):
+        return "leader_not_schedulable"
+    ok, _why = validate_binding(binding, cfg, paths, run_tmux,
+                                proc_root, sessions_dir=sessions_dir)
+    if not ok:
+        return "binding_lost"
+    return None
+
+
+def clear_composer(binding, cfg, paths, run_tmux, proc_root, wait,
+                   activity_reader, journal_path, attempt,
+                   sessions_dir=None, now_wall=time.time,
+                   context="preflight", abort_check=None):
+    """Actively empty a visibly non-empty composer with bounded C-u
+    keystrokes, so an attempt (or a typed-bytes recovery) proceeds past
+    a stray draft instead of deferring or wedging until an operator
+    arrives. Returns (True, "cleared") or (False, reason). A refusal
+    sends nothing; a failed clear degrades to the caller's defer path,
+    never to a wedge.
+
+    Gates, all mandatory: managed_clear_composer on; POSITIVE
+    ended-activity evidence with the pair settled (a marker-less
+    session is never cleared — no proof a turn is not consuming the
+    keystrokes) and no stop_hook_active on the ended half (a blocking
+    Stop hook writes "ended" and then forces generation to continue);
+    leader schedulable R/S (a stopped claude queues keystrokes
+    invisibly); binding valid; no modal; composer parseable and
+    "nonempty" (empty composers never receive a key); and the draft
+    byte-stable across two captures one stability window apart, so a
+    human mid-keystroke is never cleared out from under.
+
+    The destroyed draft is journaled (COMPOSER_CLEAR, excerpt-capped)
+    BEFORE the first key, mirroring PREPARED-before-typing: the
+    durable record precedes the destructive act. Every keyed
+    invocation — success or failure — spends the attempt's
+    CLEAR_CHARGE_LIMIT budget, charged in place on the caller's
+    attempt dict and journaled with the intent record before the
+    first key (restored from the journal on watcher restart); gate
+    refusals cost nothing."""
+    if not cfg.get("managed_clear_composer"):
+        return False, "disabled"
+    if attempt.get("clear_charges", 0) >= CLEAR_CHARGE_LIMIT:
+        return False, "clear_charges_exhausted"
+    if activity_reader is None:
+        return False, "no_activity_evidence"
+    phase, rev = activity_reader()
+    if phase != "ended":
+        return False, "activity_%s" % phase
+    try:
+        if now_wall() - rev[3] < 1.0:
+            return False, "activity_unsettled"
+    except (TypeError, IndexError):
+        return False, "activity_unreadable"
+    try:
+        ended = _read_activity_file(
+            activity_paths(cfg, binding["session_id"])["ended"],
+            binding["session_id"], now_wall())
+        if ended is None or ended.get("stop_hook_active"):
+            return False, "stop_hook_active"
+    except Exception:
+        return False, "activity_unreadable"
+    leader = proc_stat(binding["claude_pid"], proc_root)
+    if leader is None or leader.get("state") not in ("R", "S"):
+        return False, "leader_not_schedulable"
+    ok, why = validate_binding(binding, cfg, paths, run_tmux, proc_root,
+                               sessions_dir=sessions_dir)
+    if not ok:
+        return False, str(why)
+    def composer_region(s):
+        # Everything from the composer marker row down: hard-multiline
+        # drafts render continuation lines BELOW the marker with no
+        # marker of their own, so the single bottom-anchored text line
+        # under-represents what a clear will destroy (round-2 audit).
+        # Raw capture text, not a parse — used for stability
+        # comparison and forensics only, never for authorization.
+        row = s.get("row")
+        if row is None:
+            return s.get("text") or ""
+        return "\n".join(s["plain"].splitlines()[row:])
+
+    capture = capture_pane(binding, run_tmux, ansi=True)
+    if capture is None:
+        return False, "precheck_capture_failed"
+    snap = parse_pane(capture)
+    if snap["modal"]:
+        return False, "modal"
+    if snap["composer"] != "nonempty":
+        return False, "composer_%s" % snap["composer"]
+    draft = snap["text"]
+    region = composer_region(snap)
+    wait(max(cfg["managed_stable_ms"], CLEAR_STABLE_FLOOR_MS) / 1000.0)
+    second = capture_pane(binding, run_tmux, ansi=True)
+    if second is None:
+        return False, "precheck_capture_failed"
+    snap = parse_pane(second)
+    if snap["modal"] or snap["composer"] != "nonempty" or \
+            snap["text"] != draft or composer_region(snap) != region:
+        # The whole region must sit still, not only the marker line: a
+        # human typing on a continuation line never changes line 1
+        # (round-2 audit).
+        return False, "draft_unstable"
+    if not _activity_unchanged(activity_reader, rev):
+        return False, "activity_changed"
+    def keyed_failure(reason):
+        journal_record(journal_path, "COMPOSER_CLEAR_FAILED", attempt,
+                       reason=reason,
+                       clear_charges=attempt.get("clear_charges", 0))
+        return False, reason
+
+    # The last free refusal point: the full revalidation battery runs
+    # BEFORE the charge, so an abort or gate change caught here has
+    # sent no key and costs no budget (Sol round-3: transient
+    # tail-read failures must not exhaust the destructive budget
+    # keylessly).
+    why = _clear_revalidate(abort_check, activity_reader, rev, binding,
+                            cfg, paths, run_tmux, proc_root,
+                            sessions_dir)
+    if why is not None:
+        return False, why
+    excerpt = draft[2:] if draft.startswith("❯\u00a0") else draft
+    # The charge and the intent record land together BEFORE the first
+    # key: every keyed invocation spends budget (success included), so
+    # a crash or exception after dispatch is already accounted.
+    attempt["clear_charges"] = attempt.get("clear_charges", 0) + 1
+    extra = {}
+    if "\n" in region:
+        # Continuation lines exist below the marker: record the whole
+        # region so multi-line drafts are not destroyed with only
+        # their first line on file (round-2 audit).
+        extra["region_excerpt"] = cm.sanitize(region,
+                                              CLEAR_EXCERPT_CHARS * 3)
+    journal_record(journal_path, "COMPOSER_CLEAR", attempt,
+                   reason=context,
+                   clear_charges=attempt["clear_charges"],
+                   cleared_excerpt=cm.sanitize(excerpt, CLEAR_EXCERPT_CHARS),
+                   **extra)
+    previous_region = region
+    for round_n in range(CLEAR_KEY_ROUNDS):
+        # EVERY key is revalidated immediately before it is sent, not
+        # just the first: a prompt can start, the leader can stop, or
+        # the binding can rot between rounds (Sol blocker on the first
+        # cut of this function). Round 0's battery ran pre-charge
+        # above, so a first-key refusal costs nothing.
+        if round_n > 0:
+            why = _clear_revalidate(abort_check, activity_reader, rev,
+                                    binding, cfg, paths, run_tmux,
+                                    proc_root, sessions_dir)
+            if why is not None:
+                return keyed_failure(why)
+        rc, _, _ = _result(run_tmux(_tmux(
+            binding["socket"],
+            ["send-keys", "-t", binding["pane_id"],
+             CLEAR_CURSOR_KEY, CLEAR_KEY, CLEAR_JOIN_KEY])))
+        if rc != 0:
+            return keyed_failure("send_failed")
+        wait(CLEAR_VERIFY_WAIT_S)
+        capture = capture_pane(binding, run_tmux, ansi=True)
+        if capture is None:
+            return keyed_failure("capture_failed")
+        snap = parse_pane(capture)
+        if snap["modal"] or snap["composer"] in ("unknown", "absent"):
+            return keyed_failure("pane_unparseable")
+        if snap["composer"] == "empty":
+            return True, "cleared"
+        # Progress is judged on the whole REGION: a multiline clear
+        # eats continuation lines first, leaving the marker line
+        # untouched for a round — text-only comparison misread that
+        # as inert and aborted with the first line stranded (observed
+        # live, s17). Known tradeoff (round-4 audit): the region also
+        # spans footer chrome below the composer, so footer noise can
+        # read as progress (extra bounded rounds against the same
+        # draft) or as growth (a conservative abort, retried next
+        # poll) — both bounded by CLEAR_KEY_ROUNDS and the charge
+        # budget; separating draft rows from footer rows would need
+        # exactly the kind of UI-layout parsing this module refuses.
+        now_region = composer_region(snap)
+        if now_region == previous_region:
+            # A key round that changed nothing is inert here (foreign
+            # TUI, remapped binding): stop hammering.
+            return keyed_failure("clear_ineffective")
+        if len(now_region) > len(previous_region):
+            # The composer GREW after our kill-line: someone is typing
+            # into it right now. Stop immediately — progress means
+            # shrinking, never mutation.
+            return keyed_failure("composer_grew")
+        previous_region = now_region
+    return keyed_failure("rounds_exhausted")
+
+
+# Preflight failures a clear can act on: a strict-lane non-idle pane
+# (which clear_composer narrows to "real typed input" itself) and the
+# boundary lane's explicit non-empty composer.
+CLEARABLE_PREFLIGHT_REASONS = ("R2_not_idle", "R2_composer_nonempty")
+
+
 def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
                packet_loader, run_tmux=default_run_tmux, proc_root="/proc",
                wait=lambda seconds: time.sleep(seconds), now_mono=time.monotonic,
                sessions_dir=None, boundary_ok=False, activity_reader=None,
                now_wall=time.time):
-    """Execute R1-R6'.  Never sends a clearing key."""
+    """Execute R1-R6'.  The only clearing key it can send is
+    clear_composer's bounded C-u, behind that function's gates; Enter
+    stays gated on the full R5/R6' proof chain regardless."""
     ok, reason, defer_class, lane, activity_rev = ladder_preflight(
         binding, cfg, paths, run_tmux, proc_root, wait,
         sessions_dir=sessions_dir, boundary_ok=boundary_ok,
         activity_reader=activity_reader, now_wall=now_wall)
+    if (not ok and reason in CLEARABLE_PREFLIGHT_REASONS and
+            cfg.get("managed_clear_composer") and
+            activity_reader is not None):
+        # A surprise inside the clear (journal I/O, tmux transport)
+        # must degrade to this attempt's defer, never escape and kill
+        # the watcher (Sol should-fix).
+        try:
+            cleared, _ = clear_composer(
+                binding, cfg, paths, run_tmux, proc_root, wait,
+                activity_reader, journal_path, attempt,
+                sessions_dir=sessions_dir, now_wall=now_wall)
+        except Exception:
+            cleared = False
+        if cleared:
+            ok, reason, defer_class, lane, activity_rev = ladder_preflight(
+                binding, cfg, paths, run_tmux, proc_root, wait,
+                sessions_dir=sessions_dir, boundary_ok=boundary_ok,
+                activity_reader=activity_reader, now_wall=now_wall)
     if not ok:
         return dict(attempt, state="DEFERRED", reason=reason,
                     defer_class=defer_class)
@@ -2189,14 +2472,57 @@ class Watcher:
         self._recovery_baseline_epoch = None
         self._recovery_activity_fp = None
         self._recovery_fp_due = 0.0
+        # Consecutive active (clear_composer) recoveries without an
+        # intervening confirmed boundary, and the once-only exhausted
+        # journal flag. Restored from the journal tail window below —
+        # an in-memory-only budget would refresh on every restart and
+        # let a crash loop churn keystrokes unboundedly (Sol blocker).
+        self._active_recoveries = 0
+        self._active_exhausted_journaled = False
         self.next_heartbeat = monotonic() + HEARTBEAT_S
         self.started = monotonic()
         self.cursor = load_cursor(paths["scan"])
-        self.attempt = recover_attempt(paths["journal"], boot_id(proc_root))
+        # ONE full-journal read shared by attempt recovery, budget
+        # restoration, and request history below: the three views must
+        # agree — restoring a wedge from one read while restoring its
+        # budgets from another lets an unreadable-read fail open to a
+        # fresh destructive budget on a still-live wedge (Sol round-3).
+        journal_records = read_journal(paths["journal"])
+        self.attempt = recover_attempt_records(journal_records,
+                                               boot_id(proc_root))
+        # Restore the clearing budgets from the same FULL horizon
+        # recover_attempt reads — a tail-window read could be evicted
+        # by lifecycle spam (a restart loop appending WATCHER_READY
+        # rows) while the full read still resurrects the wedge,
+        # silently refreshing destructive budgets (Sol round-2
+        # blocker).
+        try:
+            aid = (self.attempt or {}).get("attempt_id")
+            for record in journal_records:
+                state = record.get("state")
+                if state == "BOUNDARY_CONFIRMED":
+                    self._active_recoveries = 0
+                elif (state == "RECOVERED" and
+                      record.get("reason") == "composer_cleared"):
+                    self._active_recoveries += 1
+                elif state == "COMPOSER_CLEAR_FAILED" and \
+                        record.get("attempt_id") == aid and aid and \
+                        record.get("reason") == "active_recovery_exhausted":
+                    self._active_exhausted_journaled = True
+                elif state == "COMPOSER_CLEAR" and \
+                        record.get("attempt_id") == aid and aid:
+                    charges = record.get("clear_charges")
+                    if isinstance(charges, int) and \
+                            not isinstance(charges, bool) and \
+                            self.attempt and \
+                            charges > self.attempt.get("clear_charges", 0):
+                        self.attempt["clear_charges"] = charges
+        except Exception:
+            pass
         self.backoff = BACKOFF_INITIAL_S
         self.consumed_request_generations = set()
         self.request_history = {}
-        for record in read_journal(paths["journal"]):
+        for record in journal_records:
             fingerprint = record.get("request_fingerprint")
             observation = record.get("request_observation")
             if isinstance(observation, dict):
@@ -2358,13 +2684,18 @@ class Watcher:
         return (record.get("prompt_id"), record.get("written_at"))
 
     def _maybe_recover(self, now, packet):
-        """Self-recovery from CLEANUP_REQUIRED/R5_composer_mismatch —
-        the one cleanup reason whose hazard is fully observable. Two
-        clean probes RECOVERY_POLL_S apart re-arm the watcher; the
-        RECOVERED record is durable, so a restart starts fresh instead
-        of resurrecting the wedge. Every other cleanup reason keeps
-        the terminal semantics (operator resolve only). Probes never
-        send a key.
+        """Self-recovery from typed-bytes CLEANUP_REQUIRED wedges, two
+        lanes. ACTIVE (managed_clear_composer, default on): for
+        ACTIVE_RECOVERY_REASONS the watcher clears the visibly wedged
+        composer itself (clear_composer's gates + bounded C-u), proves
+        the hazard gone by direct observation, and re-arms — bounded by
+        ACTIVE_RECOVERY_LIMIT consecutive uses. PASSIVE (always on,
+        R5_composer_mismatch only — the one reason whose hazard is
+        fully observable without touching the pane): two clean keyless
+        probes RECOVERY_POLL_S apart re-arm the watcher. The RECOVERED
+        record is durable, so a restart starts fresh instead of
+        resurrecting the wedge. Cleanup reasons outside both lanes
+        keep the terminal semantics (operator resolve only).
 
         Two guards beyond the probe itself (both Sol blockers):
         - The transcript must have GROWN since the wedge was first
@@ -2377,8 +2708,28 @@ class Watcher:
           journal tail: an operator resolve that landed mid-probe
           stands, never masked by a later RECOVERED append."""
         if not self.attempt or \
-                self.attempt.get("state") != "CLEANUP_REQUIRED" or \
-                self.attempt.get("reason") != "R5_composer_mismatch":
+                self.attempt.get("state") != "CLEANUP_REQUIRED":
+            return
+        reason = self.attempt.get("reason")
+        # The ACTIVE lane (clear_composer) may recover any typed-bytes
+        # cleanup whose Enter was never sent — unless the late own
+        # packet proved the first submission fired, or this watcher
+        # has already actively recovered ACTIVE_RECOVERY_LIMIT times
+        # without an intervening confirmed boundary (a systematic
+        # wedge cause must not become a type/clear churn loop).
+        active_ok = (self.cfg.get("managed_clear_composer") and
+                     reason in ACTIVE_RECOVERY_REASONS and
+                     not self.attempt.get("own_packet_proof") and
+                     self._active_recoveries < ACTIVE_RECOVERY_LIMIT)
+        if (self.cfg.get("managed_clear_composer") and
+                reason in ACTIVE_RECOVERY_REASONS and
+                not self.attempt.get("own_packet_proof") and
+                self._active_recoveries >= ACTIVE_RECOVERY_LIMIT and
+                not self._active_exhausted_journaled):
+            self._active_exhausted_journaled = True
+            journal_record(self.paths["journal"], "COMPOSER_CLEAR_FAILED",
+                           self.attempt, reason="active_recovery_exhausted")
+        if reason != "R5_composer_mismatch" and not active_ok:
             return
         aid = self.attempt.get("attempt_id")
         if not isinstance(aid, str) or not aid:
@@ -2423,7 +2774,37 @@ class Watcher:
         if now < self._recovery_next:
             return
         self._recovery_next = now + RECOVERY_POLL_S
+        if active_ok:
+            try:
+                verdict = self._try_active_clear(packet)
+            except Exception:
+                verdict = False
+            if verdict is True:
+                if self._commit_recovery("composer_cleared"):
+                    self._active_recoveries += 1
+                return
+            if verdict is None:
+                # A live packet stood us down: the passive probe would
+                # judge the same moment on the tick's STALE packet, so
+                # it must not run this poll (Sol round-3 blocker).
+                return
+        if reason != "R5_composer_mismatch" or \
+                self.attempt.get("own_packet_proof"):
+            # Non-R5 typed-bytes wedges have no passive lane: their
+            # hazard evidence was never audited for the growth/identity
+            # proofs, so without a successful active clear they keep
+            # operator-resolve semantics. An own-proved wedge (the
+            # compact FIRED) is terminal for BOTH lanes — a later
+            # unreadable packet reads as NONE, and the passive probes
+            # must not re-arm a fired attempt (round-4 audit; own-proof
+            # on an R5 reason only became reachable with the active
+            # lane's OWN stamping, so this loosens nothing).
+            return
         try:
+            # The tick's packet snapshot is stale by however long the
+            # active lane ran: the passive probe judges a fresh read.
+            packet = load_layer1_packet(self.cfg,
+                                        self.binding["session_id"])
             grown = self.cursor.get("offset", 0) > self._recovery_baseline
             ok = grown and self._recovery_probe_ok(packet)
         except Exception:
@@ -2435,6 +2816,12 @@ class Watcher:
         if self._recovery_streak < RECOVERY_PROBES:
             return
         self._recovery_streak = 0
+        self._commit_recovery("composer_clean")
+
+    def _commit_recovery(self, recovered_reason):
+        """Serialize the RECOVERED append under the txn lock and re-arm
+        the watcher. True only when the record landed."""
+        aid = self.attempt.get("attempt_id")
         try:
             with txn_lock(self.paths["txn"]):
                 tail = attempt_tail(self.paths["journal"])
@@ -2448,16 +2835,16 @@ class Watcher:
                 # unattended recovery matters most).
                 if not (tail and tail.get("attempt_id") == aid and
                         tail.get("state") == "CLEANUP_REQUIRED" and
-                        tail.get("reason") == "R5_composer_mismatch" and
+                        tail.get("reason") == self.attempt.get("reason") and
                         tail.get("run_token") ==
                         self.attempt.get("run_token")):
                     # The journal moved under us (operator resolve,
                     # another writer): their word stands.
-                    return
+                    return False
                 journal_record(self.paths["journal"], "RECOVERED",
-                               self.attempt, reason="composer_clean")
+                               self.attempt, reason=recovered_reason)
         except Exception:
-            return
+            return False
         # The durable RECOVERED record is the authority: the in-memory
         # attempt clears the moment it lands, so a failure in the
         # status-marker or ledger writes below can never leave a live
@@ -2479,9 +2866,127 @@ class Watcher:
                 "event": "managed_recovered",
                 "session_id": self.binding["session_id"],
                 "run_token": self.binding["run_token"],
-                "reason": "composer_clean"})
+                "reason": recovered_reason})
         except Exception:
             pass
+        return True
+
+    def _try_active_clear(self, packet):
+        """One active-recovery round. Verdicts: True — cleared and the
+        wedge hazard proven gone by DIRECT observation (empty composer,
+        no attempt nonce anywhere in the pane, a caught-up nonce-free
+        transcript, no in-flight packet re-read AFTER the clear — the
+        tick's snapshot is stale by the whole clearing duration);
+        None — a live packet stood the attempt down (OWN or FOREIGN):
+        the caller must skip the PASSIVE probe this poll too, since
+        that probe would judge the same stale tick packet (Sol round-3
+        blocker); False — no clear happened or the proof failed, and
+        the passive lane may proceed on its own evidence. The passive
+        lane's running-identity and transcript-growth proofs existed to
+        reason about bytes nobody watched being consumed; here the
+        clearing keystroke's effect is verified by capture, so those
+        legs are replaced by the verification itself."""
+        # A packet visible RIGHT NOW must be honored before any
+        # destructive key: OWN proves this attempt's first submission
+        # actually fired — stamp the proof durably and stand down
+        # (active recovery is then permanently ineligible); FOREIGN
+        # means a compaction is in flight — wait (Sol round-2
+        # blocker: only the stored flag was consulted).
+        try:
+            fresh = scan_cursor(dict(self.cursor),
+                                self.binding["transcript_path"])
+            live = load_layer1_packet(self.cfg,
+                                      self.binding["session_id"])
+            classification = packet_classification(self.attempt, live,
+                                                   cursor=fresh)
+        except Exception:
+            return False
+        if classification == "OWN":
+            self.attempt["own_packet_proof"] = True
+            # The durable proof append must not logically overwrite an
+            # operator resolution that landed since the tick loaded the
+            # wedge: serialize and re-check the tail under the txn
+            # lock, exactly like _commit_recovery (Sol round-3
+            # blocker). A skipped append keeps the in-memory flag —
+            # active clearing stays blocked either way.
+            try:
+                with txn_lock(self.paths["txn"]):
+                    tail = attempt_tail(self.paths["journal"])
+                    if (tail and
+                            tail.get("attempt_id") ==
+                            self.attempt.get("attempt_id") and
+                            tail.get("state") == "CLEANUP_REQUIRED" and
+                            tail.get("reason") ==
+                            self.attempt.get("reason") and
+                            tail.get("run_token") ==
+                            self.attempt.get("run_token")):
+                        journal_record(self.paths["journal"],
+                                       "CLEANUP_REQUIRED", self.attempt,
+                                       reason=self.attempt.get("reason"))
+            except Exception:
+                pass
+            return None
+        if classification != "NONE":
+            return None
+
+        # An operator resolve (or any other writer) that already moved
+        # the journal must win BEFORE the destructive keystroke, not
+        # only at commit time (Sol should-fix: the commit yielded but
+        # the human's composer text was already gone). The same check
+        # re-runs as clear_composer's abort_check immediately before
+        # every key, closing the stability-wait window.
+        def tail_still_ours():
+            try:
+                tail = attempt_tail(self.paths["journal"])
+            except Exception:
+                return False
+            return bool(
+                tail and
+                tail.get("attempt_id") == self.attempt.get("attempt_id") and
+                tail.get("state") == "CLEANUP_REQUIRED" and
+                tail.get("reason") == self.attempt.get("reason") and
+                tail.get("run_token") == self.attempt.get("run_token"))
+
+        if not tail_still_ours():
+            return False
+        cleared, _ = clear_composer(
+            self.binding, self.cfg, self.paths, self.run_tmux,
+            self.proc_root, self.wait, self._activity_reader,
+            self.paths["journal"], self.attempt,
+            sessions_dir=self.sessions_dir, now_wall=self.wall,
+            context="recovery", abort_check=tail_still_ours)
+        if not cleared:
+            return False
+        packet = load_layer1_packet(self.cfg, self.binding["session_id"])
+        needles = ["cm-%s" % n for n in self.attempt.get("nonces", [])
+                   if isinstance(n, str) and n]
+        if not needles:
+            return False
+        capture = capture_pane(self.binding, self.run_tmux, ansi=True)
+        if capture is None:
+            return False
+        snap = parse_pane(capture)
+        if snap["modal"] or snap["composer"] != "empty":
+            return False
+        if any(n in (snap.get("plain") or "") for n in needles):
+            return False
+        fresh = scan_cursor(dict(self.cursor),
+                            self.binding["transcript_path"])
+        if fresh.get("_scan_error") or not fresh.get("caught_up"):
+            return False
+        if packet_classification(self.attempt, packet,
+                                 cursor=fresh) != "NONE":
+            return False
+        gen = self.attempt.get("generation") or {}
+        cur = generation(fresh)
+        start = (gen.get("last_boundary_offset")
+                 if isinstance(gen, dict) and
+                 gen.get("file_epoch") == cur.get("file_epoch") else 0)
+        if not isinstance(start, int) or isinstance(start, bool) or \
+                start < 0:
+            start = 0
+        return transcript_contains(
+            self.binding["transcript_path"], start, needles) is False
 
     def _transient(self, reason):
         """Validation failures that mean WAIT, not retire: job-control
@@ -2638,6 +3143,10 @@ class Watcher:
                 return True, "recovered"
             if self.attempt.get("state") == "BOUNDARY_CONFIRMED":
                 self.backoff = BACKOFF_INITIAL_S
+                # A confirmed boundary proves the pane is healthy end
+                # to end: refill the active-recovery budget.
+                self._active_recoveries = 0
+                self._active_exhausted_journaled = False
                 eff, trigger = self._thresholds()
                 pct = self.cursor.get("current", 0) / eff["context_window"]
                 if pct >= trigger - self.cfg["rearm_band_pct"]:

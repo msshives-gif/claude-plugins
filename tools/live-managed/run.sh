@@ -12,7 +12,8 @@
 #   s05 Ctrl-Z foreground loss = defer/wait, fg = recovery (no cleanup)
 #   s06 CLI stop releases leases and kills the watcher
 #   s07 threshold trigger -> ladder -> nonce ack -> boundary confirmed
-#   s08 half-typed user text defers; watcher never clears or types over it
+#   s08 half-typed user text is actively cleared (journaled with an
+#       excerpt) and the compact submits without operator help
 #   s09 foreign packet -> stand-down -> safety latch + alert; operator
 #       resolve accepted for the live token; manual /compact clears it
 #   s10 TYPED_VERIFIED crash tail -> adopt reports SUBMISSION_UNCERTAIN;
@@ -28,7 +29,9 @@
 #       mid-turn keystrokes, STARVATION_ALERT, prompt boundary-lane
 #       submit at turn end
 #   s15 half-typed text under background chrome with the boundary lane
-#       armed: zero keystrokes; submits after the composer clears
+#       armed: the watcher clears it itself and submits
+#   s17 hard-multiline draft: whole region journaled, fully cleared,
+#       compact submits
 #   s16 queued /compact evidence pin (informational; watcher stopped)
 # Watchers have no time-based deadline; lifecycle ends are covered by
 # s06 (stop), s11 (claude death), and s13 (session rotation).
@@ -254,21 +257,34 @@ else
   row s07_happy fail "no BOUNDARY_CONFIRMED in 360s; states=$(jstates "$SID"); pane=$(tmux capture-pane -t $SES -p | tail -3 | tr '\n' ' ')"
 fi
 
-# --- s08: half-typed text defers; never cleared, never typed over
+# --- s08: half-typed text is actively cleared and the compact submits
+JN8="$STATE/managed/watchers/$SID.journal.jsonl"
 kill -STOP "$WPID"
 send_turn $SES "Read the file filler_b.txt in full, then reply with exactly one word: done" 240 || row s08_fill fail "turn timeout"
 tmux send-keys -t $SES -l "harness half-typed do not submit"
+L8=$(wc -l < "$JN8")
 kill -CONT "$WPID"
-sleep 25
-CAP="$(tmux capture-pane -t $SES -p -J | grep '^❯' | tail -1)"
-if echo "$CAP" | grep -qF "harness half-typed do not submit" && ! echo "$CAP" | grep -q "/compact"; then
-  row s08_half_typed pass "composer intact, deferred"
+# The intent record alone is not proof (it precedes the keystroke):
+# the pin is intent journaled AND the draft actually gone from the
+# composer AND no keyed failure — all scoped to records after L8.
+s08_cleared() {
+  tail -n +$((L8+1)) "$JN8" 2>/dev/null | grep -q '"state":"COMPOSER_CLEAR"' && \
+    ! tmux capture-pane -t $SES -p -J | grep '^❯' | tail -1 | grep -qF "harness half-typed"
+}
+if wait_for 120 s08_cleared; then
+  S08="$(tail -n +$((L8+1)) "$JN8")"
+  if echo "$S08" | grep -q '"state":"COMPOSER_CLEAR_FAILED"'; then
+    row s08_clear fail "keyed clear failure journaled: $(echo "$S08" | grep COMPOSER_CLEAR_FAILED | tail -1 | head -c 200)"
+  elif echo "$S08" | grep '"state":"COMPOSER_CLEAR"' | tail -1 | grep -qF "harness half-typed"; then
+    row s08_clear pass "draft cleared, excerpt journaled"
+  else
+    row s08_clear fail "COMPOSER_CLEAR journaled without the draft excerpt"
+  fi
 else
-  row s08_half_typed fail "composer: $CAP"
+  row s08_clear fail "draft not cleared in 120s; composer: $(tmux capture-pane -t $SES -p -J | grep '^❯' | tail -1)"
 fi
-tmux send-keys -t $SES C-u; sleep 1   # harness clears; the watcher may not
-boundary2_done() { [ "$(jstates "$SID" | tr ',' '\n' | grep -c BOUNDARY_CONFIRMED)" -ge 2 ]; }
-wait_for 360 boundary2_done && row s08_resume pass "injected after clear" \
+boundary2_done() { tail -n +$((L8+1)) "$JN8" 2>/dev/null | grep -q '"state":"BOUNDARY_CONFIRMED"'; }
+wait_for 360 boundary2_done && row s08_resume pass "cleared and submitted without operator help" \
   || row s08_resume fail "states=$(jstates "$SID")"
 
 # --- s09: foreign packet -> stand-down -> safety latch -> resolve
@@ -411,10 +427,14 @@ wait_for 240 s14_confirmed && row s14_boundary pass \
   || row s14_boundary fail "no boundary: $(tail -3 "$JN" | tr '\n' ' ')"
 wait_idle $SES 120 || true
 
-# --- s15: half-typed text under background chrome still gets zero
-#     keystrokes even with the boundary lane armed (request pending).
+# --- s15: half-typed text under background chrome with the boundary
+#     lane armed (request pending): the watcher clears it and submits.
 LINES0=$(wc -l < "$JN")
 tmux send-keys -t $SES -l "harness half-typed boundary lane do not submit"
+# Park the cursor mid-line: C-u alone kills only to line start, so this
+# pins the C-e+C-u whole-line clear against the real TUI binding
+# (containment audit's unverified premise).
+tmux send-keys -t $SES Left Left Left Left Left
 sleep 2
 python3 - "$STATE" "$SID" <<'EOF'
 import json, os, sys
@@ -424,20 +444,106 @@ tmp = path + ".tmp"
 json.dump({"request_id": "live-s15-request"}, open(tmp, "w"))
 os.replace(tmp, path)
 EOF
-sleep 30
-CAP="$(tmux capture-pane -t $SES -p -J | grep '^❯' | tail -1)"
-if echo "$CAP" | grep -qF "harness half-typed boundary lane do not submit" && ! echo "$CAP" | grep -q "/compact"; then
-  row s15_half_typed_boundary pass "composer intact"
+s15_cleared() {
+  tail -n +$((LINES0+1)) "$JN" | grep -q '"state":"COMPOSER_CLEAR"' && \
+    ! tmux capture-pane -t $SES -p -J | grep '^❯' | tail -1 | grep -qF "harness half-typed boundary"
+}
+if wait_for 120 s15_cleared; then
+  tail -n +$((LINES0+1)) "$JN" | grep -q '"state":"COMPOSER_CLEAR_FAILED"' \
+    && row s15_half_typed_boundary fail "keyed clear failure journaled" \
+    || row s15_half_typed_boundary pass "watcher cleared the draft"
 else
-  row s15_half_typed_boundary fail "composer: $CAP"
+  row s15_half_typed_boundary fail "draft not cleared; composer: $(tmux capture-pane -t $SES -p -J | grep '^❯' | tail -1)"
 fi
-tmux send-keys -t $SES C-u; sleep 1
 s15_submitted() { tail -n +$((LINES0+1)) "$JN" | grep -q '"state":"SUBMITTED"'; }
-wait_for 180 s15_submitted && row s15_resume pass "submitted after clear" \
-  || row s15_resume fail "states: $(tail -3 "$JN" | tr '\n' ' ')"
+if wait_for 180 s15_submitted; then
+  LANE15="$(tail -n +$((LINES0+1)) "$JN" | grep '"state":"PREPARED"' | tail -1 | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("lane"))' 2>/dev/null)"
+  row s15_resume pass "submitted after self-clear (lane=$LANE15)"
+  # The scenario intends the boundary lane; strict is possible if the
+  # s14 background job already exited — flag, don't fail (as s14 does).
+  [ "$LANE15" = boundary ] || row s15_lane info "submitted via lane=$LANE15 (boundary topology not exercised this run)"
+else
+  row s15_resume fail "states: $(tail -3 "$JN" | tr '\n' ' ')"
+fi
 s15_confirmed() { tail -n +$((LINES0+1)) "$JN" | grep -q '"state":"BOUNDARY_CONFIRMED"'; }
 wait_for 240 s15_confirmed || row s15_boundary info "boundary still pending at scenario end"
 wait_idle $SES 120 || true
+
+# --- s17: hard-multiline draft (backslash-continuation) is fully
+#     cleared and the whole region is journaled (round-2 audit pin:
+#     C-u-per-line vs whole-buffer is a claude-internal we can only
+#     settle live; continuation lines must not be destroyed with only
+#     line 1 on file).
+# Barrier: s15's compact must be watcher-CONFIRMED before s17 can own
+# an attempt — a request landing mid-completion-wait queues behind the
+# live attempt (observed: a slow haiku compaction held ACKED for 6+
+# minutes and swallowed s17's whole window).
+s15_watcher_done() { tail -n +$((LINES0+1)) "$JN" | grep -q '"state":"BOUNDARY_CONFIRMED"'; }
+if ! wait_for 360 s15_watcher_done; then
+  row s17_multiline_clear info "skipped: s15 compact not confirmed in 360s; watcher still mid-attempt"
+  SKIP_S17=1
+else
+  SKIP_S17=0
+fi
+LINES17=$(wc -l < "$JN")
+if [ "$SKIP_S17" = 0 ]; then
+tmux send-keys -t $SES -l 'harness multiline first line \'
+tmux send-keys -t $SES Enter
+tmux send-keys -t $SES -l "harness multiline second line do not submit"
+sleep 2
+ML_OK="$(tmux capture-pane -t $SES -p -J | python3 -c "
+import sys
+sys.path.insert(0, '$ROOT/plugins/compact-manager/hooks')
+cap = sys.stdin.read()
+lines = cap.splitlines()
+row = max((i for i, l in enumerate(lines) if l.startswith('❯')), default=None)
+region = '\n'.join(lines[row:]) if row is not None else ''
+print('y' if 'multiline first' in region and 'multiline second' in region
+      else 'n')")"
+if [ "$ML_OK" = y ]; then
+  python3 - "$STATE" "$SID" <<'EOF'
+import json, os, sys
+state, sid = sys.argv[1], sys.argv[2]
+path = os.path.join(state, "managed", "requests", f"{sid}.json")
+tmp = path + ".tmp"
+json.dump({"request_id": "live-s17-request"}, open(tmp, "w"))
+os.replace(tmp, path)
+EOF
+  s17_cleared() {
+    # The whole post-marker region must be free of the draft, not just
+    # the marker line — continuation rows carry no marker and a
+    # stranded one would be invisible to a ❯-line grep (round-3 audit).
+    tail -n +$((LINES17+1)) "$JN" | grep -q '"state":"COMPOSER_CLEAR"' && \
+      [ "$(tmux capture-pane -t $SES -p -J | python3 -c "
+import sys
+lines = sys.stdin.read().splitlines()
+row = max((i for i, l in enumerate(lines) if l.startswith('❯')), default=None)
+if row is None:
+    print('n')     # no marker = unprovable, never a pass (round-4 audit)
+else:
+    region = '\n'.join(lines[row:])
+    print('n' if 'harness multiline' in region else 'y')")" = y ]
+  }
+  if wait_for 120 s17_cleared; then
+    S17="$(tail -n +$((LINES17+1)) "$JN")"
+    if echo "$S17" | grep '"state":"COMPOSER_CLEAR"' | tail -1 | grep -qF "multiline second"; then
+      row s17_multiline_clear pass "whole region journaled and cleared"
+    else
+      row s17_multiline_clear fail "region_excerpt missing continuation line: $(echo "$S17" | grep COMPOSER_CLEAR | tail -1 | head -c 300)"
+    fi
+    s17_submitted() { tail -n +$((LINES17+1)) "$JN" | grep -q '"state":"SUBMITTED"'; }
+    wait_for 180 s17_submitted && row s17_resume pass "submitted after multiline clear" \
+      || row s17_resume fail "no submit: $(tail -3 "$JN" | tr '\n' ' ')"
+  else
+    row s17_multiline_clear fail "multiline draft not cleared in 120s; journal tail: $(tail -2 "$JN" | tr '\n' ' ' | head -c 300); composer: $(tmux capture-pane -t $SES -p -J | grep '^❯' | tail -1)"
+    tmux send-keys -t $SES C-e C-u C-e C-u C-e C-u; sleep 1  # unblock later scenarios
+  fi
+else
+  row s17_multiline_clear info "backslash-continuation did not produce a multiline draft; case not exercised"
+  tmux send-keys -t $SES C-e C-u; sleep 1
+fi
+wait_idle $SES 240 || true
+fi   # SKIP_S17
 
 # --- s16: queued /compact evidence pin (Sol: prerequisite for any
 #     future unattended queue fallback — NOT shipped behavior). Watcher

@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- Watcher: active composer clearing (`managed_clear_composer`, default
+  on). When a compaction is due and unsubmitted text sits in the
+  composer — a human draft or the watcher's own wedged `/compact` line
+  — the watcher now clears it with bounded `C-e`,`C-u`,`Backspace`
+  key rounds (`C-e` first so a mid-line cursor cannot strand text;
+  the `Backspace` eats the newline of a hard-multiline draft, a no-op
+  otherwise; progress is judged on the whole composer region) and
+  proceeds, instead of deferring (drafts) or wedging until an operator
+  arrives (`R5_composer_mismatch` sat 15h live on 2026-08-25/26).
+  Gates: positive ended-turn marker evidence (never marker-less,
+  running, or `stop_hook_active` turns), schedulable leader, no modal,
+  parseable composer, and the whole composer region — continuation
+  lines of a hard-multiline draft included — byte-stable across a
+  stability window (500ms floor, matching the boundary lane), all
+  re-proven before every keystroke, so someone caught mid-typing
+  defers the clear; text typed during the brief clearing loop itself
+  can still be lost, with the journaled record as the recovery path.
+  Every clear journals `COMPOSER_CLEAR` before the first key with an
+  excerpt of the destroyed line (plus the full region for multiline
+  drafts); failures journal `COMPOSER_CLEAR_FAILED` and degrade to a
+  defer. Bounds: 3 keyed clear invocations per attempt (successes
+  included, charged durably before the first key) and 3 active
+  self-recoveries per confirmed boundary — both restored from the
+  full journal on watcher restart, so restart loops cannot refresh
+  them. Active recovery extends to `R4_send_failed` and
+  `R6_prime_composer_mismatch`, stands down permanently when a live
+  packet classifies OWN (stamping the fired-compact proof durably),
+  waits on FOREIGN packets, yields to an operator resolve before
+  every keystroke, and proves the hazard gone by direct observation
+  (packet re-read after the clear) before re-arming. Enter stays
+  gated on the full R5/R6' byte-exact chain. `false` restores the
+  strictly-hands-off contract, including the keyless probe-based R5
+  recovery. Live-suite scenarios s08/s15 re-pinned from "never
+  clears" to "clears and submits", s17 added (hard-multiline draft);
+  adopt acknowledgement text extended.
+
 - Watcher: R5 typed-text verification now re-captures the pane up to
   three times (read-only) before declaring `composer_mismatch` — a
   transient repaint racing the single capture terminalized a healthy

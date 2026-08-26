@@ -3178,8 +3178,28 @@ class BoundaryLaneTests(RunLadderTests):
         self.assertEqual(out["state"], "DEFERRED")
         self.assertEqual(out["reason"], "R2_activity_unsettled")
 
-    def test_half_typed_defers_in_boundary_lane(self):
+    def test_half_typed_gets_one_clear_attempt_then_defers(self):
+        # Active clearing (default on): a stable draft with an ended
+        # pair earns exactly one C-u; when the composer provably does
+        # not react (LadderTmux repeats the same capture), the clear is
+        # journaled as ineffective and the attempt defers — never a
+        # wedge, never an Enter.
         self.write_pair()
+        tmux = LadderTmux([BUSY_IDLE + "half typed"])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_composer_nonempty")
+        self.assertEqual(len(tmux.sent), 1)
+        self.assertIn(managed.CLEAR_KEY, tmux.sent[0])
+        states = [r["state"] for r in
+                  managed.read_journal(self.paths["journal"])]
+        self.assertIn("COMPOSER_CLEAR", states)
+        self.assertIn("COMPOSER_CLEAR_FAILED", states)
+
+    def test_half_typed_untouched_when_clearing_disabled(self):
+        # The old contract, pinned behind the off switch: zero keys.
+        self.write_pair()
+        self.cfg["managed_clear_composer"] = False
         tmux = LadderTmux([BUSY_IDLE + "half typed"])
         out = self.run_boundary(tmux)
         self.assertEqual(out["state"], "DEFERRED")
@@ -4242,3 +4262,1050 @@ class TranscriptContainsTests(unittest.TestCase):
         self.write(needle.encode() + b"z" * 64)
         self.assertIs(managed.transcript_contains(
             self.path, len(needle), [needle]), False)
+
+
+class ClearingTmux:
+    """Fake tmux whose composer reacts like the real one: it holds a
+    pre-existing draft, C-u empties the input line, send-keys -l types,
+    Enter submits and clears. Chrome (busy footer) is constant."""
+
+    def __init__(self, draft, chrome="", clear_works=True):
+        self.sent = []
+        self.draft = draft
+        self.typed = ""
+        self.chrome = chrome
+        self.clear_works = clear_works
+        self.display_rc = 0
+        self.facts = "%1\t/dev/pts/7\t10\tclaude\t0\t120\t40\t$1\n"
+
+    def __call__(self, argv, timeout=5):
+        argv = list(argv)
+        cmd = argv[2] if argv[:1] == ["-S"] else argv[0]
+        if cmd == "display-message":
+            return Result(self.facts, self.display_rc)
+        if cmd == "capture-pane":
+            return Result(self.chrome + IDLE + self.draft + self.typed)
+        if cmd == "send-keys":
+            self.sent.append(argv)
+            if argv[-1] == "Enter":
+                self.typed = ""
+            elif managed.CLEAR_KEY in argv:
+                if self.clear_works:
+                    self.draft = ""
+                    self.typed = ""
+            elif "-l" in argv:
+                self.typed += argv[-1]
+            return Result("")
+        return Result("")
+
+    def enters(self):
+        return [a for a in self.sent if a[-1] == "Enter"]
+
+    def clears(self):
+        return [a for a in self.sent if managed.CLEAR_KEY in a]
+
+
+class PreflightClearTests(BoundaryLaneTests):
+    """Active composer clearing at the ladder preflight: a stable,
+    parseable draft behind positive ended-turn evidence is cleared with
+    bounded C-u and the attempt proceeds; every gate failure refuses
+    without a single keystroke; Enter keeps the full R5/R6' proof
+    chain regardless of how the composer got empty."""
+
+    def test_draft_cleared_then_submits_boundary_lane(self):
+        self.write_pair()
+        tmux = ClearingTmux("stray human draft",
+                            chrome="esc to interrupt\n")
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(len(tmux.clears()), 1)
+        self.assertEqual(len(tmux.enters()), 1)
+        records = managed.read_journal(self.paths["journal"])
+        clear = [r for r in records if r["state"] == "COMPOSER_CLEAR"]
+        self.assertEqual(len(clear), 1)
+        self.assertEqual(clear[0].get("reason"), "preflight")
+        self.assertIn("stray human draft", clear[0].get("cleared_excerpt"))
+        self.assertNotIn("COMPOSER_CLEAR_FAILED",
+                         [r["state"] for r in records])
+
+    def test_draft_cleared_then_submits_strict_lane(self):
+        # Below hard with no request (boundary_ok=False) the strict
+        # lane also earns the clear, provided the markers prove the
+        # turn ended.
+        self.write_pair()
+        tmux = ClearingTmux("stray strict-lane draft")
+        reader = lambda: managed.read_activity(
+            self.cfg, self.sid, self.transcript)
+        out = managed.run_ladder(
+            self.binding, self.cfg, self.paths, self.attempt, self.cursor,
+            self.paths["journal"], lambda: None, tmux, self.proc,
+            wait=lambda seconds: None, now_mono=lambda: 0.0,
+            boundary_ok=False, activity_reader=reader,
+            now_wall=lambda: time.time() + 5)
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(out.get("lane"), "strict")
+        self.assertEqual(len(tmux.clears()), 1)
+
+    def test_no_clear_without_activity_reader(self):
+        # The hook-independent strict contract is unchanged: a session
+        # with no marker evidence never gets its composer touched.
+        tmux = ClearingTmux("draft")
+        out = self.run_ladder(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.sent, [])
+
+    def test_no_clear_while_activity_running(self):
+        managed.write_activity(self.cfg, self.marker_payload, "running")
+        tmux = ClearingTmux("draft", chrome="esc to interrupt\n")
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.sent, [])
+
+    def test_no_clear_on_modal(self):
+        self.write_pair()
+        tmux = LadderTmux([" ❯ 1. Yes\n❯ "])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_modal")
+        self.assertEqual(tmux.sent, [])
+
+    def test_unstable_draft_not_cleared(self):
+        # The draft changing between the two stability captures means a
+        # human is typing right now: refuse without a keystroke.
+        self.write_pair()
+        tmux = LadderTmux([BUSY_IDLE + "dra", BUSY_IDLE + "dra",
+                           BUSY_IDLE + "draf", BUSY_IDLE + "draf"])
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.sent, [])
+
+    def test_stop_hook_active_blocks_clear(self):
+        managed.write_activity(self.cfg, self.marker_payload, "running")
+        managed.write_activity(
+            self.cfg, dict(self.marker_payload, stop_hook_active=True),
+            "ended")
+        tmux = ClearingTmux("draft", chrome="esc to interrupt\n")
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.sent, [])
+
+    def test_stopped_leader_blocks_clear(self):
+        self.write_pair()
+        write_proc(self.proc, 20, 20, 2020, state="T")
+        tmux = ClearingTmux("draft", chrome="esc to interrupt\n")
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.sent, [])
+
+    def test_clear_ineffective_journals_and_defers(self):
+        # A composer that provably does not react to C-u (foreign TUI,
+        # remapped key) gets exactly one keystroke, a durable
+        # COMPOSER_CLEAR_FAILED, and a defer — never a wedge.
+        self.write_pair()
+        tmux = ClearingTmux("stuck draft", chrome="esc to interrupt\n",
+                            clear_works=False)
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(len(tmux.clears()), 1)
+        self.assertEqual(tmux.enters(), [])
+        records = managed.read_journal(self.paths["journal"])
+        failed = [r for r in records
+                  if r["state"] == "COMPOSER_CLEAR_FAILED"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].get("reason"), "clear_ineffective")
+
+    def test_enter_still_gated_after_clear(self):
+        # A foreign packet at R6' aborts the submission even though the
+        # composer was actively cleared and the instruction typed: the
+        # clear must never weaken the Enter proof chain.
+        self.write_pair()
+        tmux = ClearingTmux("stray draft", chrome="esc to interrupt\n")
+        packet = {"seq": 7, "trigger": "auto", "base_compaction_count": 99}
+        out = self.run_boundary(tmux, packet=packet)
+        self.assertEqual(out["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(tmux.enters(), [])
+
+    def test_clearing_disabled_leaves_draft_untouched(self):
+        self.cfg["managed_clear_composer"] = False
+        self.write_pair()
+        tmux = ClearingTmux("stray human draft",
+                            chrome="esc to interrupt\n")
+        out = self.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_composer_nonempty")
+        self.assertEqual(tmux.sent, [])
+
+
+class ActiveClearRecoveryTests(WedgeRecoveryTests):
+    """Active recovery from typed-bytes wedges: the watcher clears the
+    visibly wedged composer itself (no operator, no post-wedge prompt,
+    no transcript growth required) and re-arms after proving the
+    hazard gone by direct observation. Inherited passive tests re-run
+    unchanged, pinning that the keyless lane survives intact."""
+
+    def wedged_tmux(self, attempt, clear_works=True):
+        text = managed.instruction_text(attempt["nonce"])
+        return ClearingTmux(text, clear_works=clear_works)
+
+    def make_settled_watcher(self, attempt, tmux):
+        """Watcher past baseline + snapshot rounds, wall clock ahead of
+        the marker writes so the settle gate passes."""
+        watcher = self.make_watcher(tmux, wall=lambda: time.time() + 5)
+        self.tick(watcher)                      # baseline round
+        self.tick(watcher)                      # snapshot round
+        return watcher
+
+    def test_wedged_bytes_actively_cleared_and_recovered(self):
+        append_rows(self.transcript, [usage_row(50)])
+        attempt = self.wedge()
+        tmux = self.wedged_tmux(attempt)
+        watcher = self.make_settled_watcher(attempt, tmux)
+        keep, reason = self.tick(watcher)       # active round
+        self.assertEqual((keep, reason), (True, "recovered"))
+        self.assertIsNone(watcher.attempt)
+        self.assertEqual(len(tmux.clears()), 1)
+        self.assertEqual(watcher._active_recoveries, 1)
+        records = managed.read_journal(self.paths["journal"])
+        states = [r["state"] for r in records]
+        self.assertIn("COMPOSER_CLEAR", states)
+        recovered = [r for r in records if r["state"] == "RECOVERED"]
+        self.assertEqual(recovered[-1].get("reason"), "composer_cleared")
+        self.assertEqual(states[-1], "WATCHER_READY")
+        clear = [r for r in records if r["state"] == "COMPOSER_CLEAR"]
+        self.assertEqual(clear[0].get("reason"), "recovery")
+        self.assertIn("/compact [cm-", clear[0].get("cleared_excerpt"))
+        # Durable: a restart starts fresh, and the watcher serves again.
+        self.assertIsNone(managed.recover_attempt(
+            self.paths["journal"], "boot"))
+        keep, reason = self.tick(watcher)
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+
+    def test_r4_and_r6_composer_reasons_recover_actively(self):
+        for reason in ("R4_send_failed", "R6_prime_composer_mismatch"):
+            with self.subTest(reason=reason):
+                self.setUp()
+                append_rows(self.transcript, [usage_row(50)])
+                attempt = self.wedge(reason=reason)
+                tmux = self.wedged_tmux(attempt)
+                watcher = self.make_settled_watcher(attempt, tmux)
+                keep, verdict = self.tick(watcher)
+                self.assertEqual((keep, verdict), (True, "recovered"))
+                self.assertIsNone(watcher.attempt)
+
+    def test_own_packet_proof_blocks_active_recovery(self):
+        append_rows(self.transcript, [usage_row(50)])
+        self.arm_activity()
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      self.transcript)
+        attempt = managed.new_attempt(
+            self.token, managed.generation(cursor), 0, 0.0, "boot")
+        attempt.update(state="CLEANUP_REQUIRED",
+                       reason="R6_prime_composer_mismatch",
+                       own_packet_proof=True)
+        managed.journal_record(self.paths["journal"], "CLEANUP_REQUIRED",
+                               attempt, reason=attempt["reason"])
+        tmux = self.wedged_tmux(attempt)
+        watcher = self.make_settled_watcher(attempt, tmux)
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertIsNotNone(watcher.attempt)
+        self.assertEqual(tmux.clears(), [])
+        self.assertNotIn("RECOVERED", self.journal_states())
+
+    def test_churn_cap_stops_active_clearing(self):
+        append_rows(self.transcript, [usage_row(50)])
+        attempt = self.wedge()
+        tmux = self.wedged_tmux(attempt)
+        watcher = self.make_watcher(tmux, wall=lambda: time.time() + 5)
+        watcher._active_recoveries = managed.ACTIVE_RECOVERY_LIMIT
+        for _ in range(4):
+            self.tick(watcher)
+        self.assertEqual(tmux.clears(), [])
+        self.assertIsNotNone(watcher.attempt)
+        records = managed.read_journal(self.paths["journal"])
+        exhausted = [r for r in records
+                     if r["state"] == "COMPOSER_CLEAR_FAILED" and
+                     r.get("reason") == "active_recovery_exhausted"]
+        self.assertEqual(len(exhausted), 1)     # journaled exactly once
+
+    def test_packet_blocks_active_recovery(self):
+        # An in-flight packet at probe time means a compaction is
+        # happening: clearing may proceed but re-arming must not.
+        append_rows(self.transcript, [usage_row(50)])
+        attempt = self.wedge()
+        managed._atomic_json(
+            managed.packet_path(self.cfg, self.sid),
+            {"seq": 41, "trigger": "auto", "base_compaction_count": 99})
+        tmux = self.wedged_tmux(attempt)
+        watcher = self.make_settled_watcher(attempt, tmux)
+        self.tick(watcher)
+        self.assertIsNotNone(watcher.attempt)
+        self.assertNotIn("RECOVERED", self.journal_states())
+
+    def test_running_activity_blocks_active_recovery(self):
+        append_rows(self.transcript, [usage_row(50)])
+        attempt = self.wedge()
+        managed.write_activity(
+            self.cfg, {"session_id": self.sid, "prompt_id": "prompt-new9",
+                       "transcript_path": self.transcript}, "running")
+        tmux = self.wedged_tmux(attempt)
+        watcher = self.make_settled_watcher(attempt, tmux)
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(tmux.clears(), [])
+        self.assertIsNotNone(watcher.attempt)
+
+    def test_clearing_disabled_keeps_operator_semantics(self):
+        self.cfg["managed_clear_composer"] = False
+        append_rows(self.transcript, [usage_row(50)])
+        attempt = self.wedge()
+        tmux = self.wedged_tmux(attempt)
+        watcher = self.make_settled_watcher(attempt, tmux)
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(tmux.clears(), [])
+        self.assertIsNotNone(watcher.attempt)
+        self.assertNotIn("RECOVERED", self.journal_states())
+
+
+class ClearChargeBudgetTests(unittest.TestCase):
+    """CLEAR_CHARGE_LIMIT bounds keyed clear invocations per attempt
+    (successes included), in both the preflight and recovery lanes."""
+
+    def test_preflight_budget_stops_keystrokes(self):
+        base = PreflightClearTests("test_no_clear_on_modal")
+        base.setUp()
+        base.write_pair()
+        for _ in range(managed.CLEAR_CHARGE_LIMIT):
+            tmux = ClearingTmux("stuck draft", chrome="esc to interrupt\n",
+                                clear_works=False)
+            out = base.run_boundary(tmux)
+            self.assertEqual(out["state"], "DEFERRED")
+            self.assertEqual(len(tmux.clears()), 1)
+            base.attempt = out
+        tmux = ClearingTmux("stuck draft", chrome="esc to interrupt\n",
+                            clear_works=False)
+        out = base.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.sent, [])
+        base.temp.cleanup()
+
+    def test_recovery_budget_stops_keystrokes(self):
+        base = ActiveClearRecoveryTests(
+            "test_wedged_bytes_actively_cleared_and_recovered")
+        base.setUp()
+        append_rows(base.transcript, [usage_row(50)])
+        attempt = base.wedge()
+        tmux = base.wedged_tmux(attempt, clear_works=False)
+        watcher = base.make_settled_watcher(attempt, tmux)
+        for _ in range(managed.CLEAR_CHARGE_LIMIT + 3):
+            base.tick(watcher)
+        self.assertEqual(len(tmux.clears()), managed.CLEAR_CHARGE_LIMIT)
+        self.assertIsNotNone(watcher.attempt)
+        self.assertNotIn("RECOVERED", base.journal_states())
+        base.temp.cleanup()
+
+
+class StagedClearTmux(ClearingTmux):
+    """ClearingTmux whose draft shrinks through `stages` one C-u at a
+    time, with an optional side effect per C-u."""
+
+    def __init__(self, stages, chrome="", on_clear=None):
+        super().__init__(stages[0], chrome=chrome)
+        self.stages = list(stages)
+        self.on_clear = on_clear
+        self.cleared_count = 0
+
+    def __call__(self, argv, timeout=5):
+        argv = list(argv)
+        cmd = argv[2] if argv[:1] == ["-S"] else argv[0]
+        if cmd == "send-keys" and managed.CLEAR_KEY in argv:
+            self.sent.append(argv)
+            self.cleared_count += 1
+            if self.stages:
+                self.stages.pop(0)
+            self.draft = self.stages[0] if self.stages else ""
+            if self.on_clear:
+                self.on_clear()
+            return Result("")
+        return super().__call__(argv, timeout)
+
+
+class SolRoundFixTests(unittest.TestCase):
+    """Pins for the Sol audit findings on active clearing (2026-08-26):
+    per-key revalidation, composer-growth abort, post-clear packet
+    re-read, restart-persistent budgets, exception containment."""
+
+    def _preflight_base(self):
+        base = PreflightClearTests("test_no_clear_on_modal")
+        base.setUp()
+        base.write_pair()
+        self.addCleanup(base.temp.cleanup)
+        return base
+
+    def _recovery_base(self):
+        base = ActiveClearRecoveryTests(
+            "test_wedged_bytes_actively_cleared_and_recovered")
+        base.setUp()
+        self.addCleanup(base.temp.cleanup)
+        return base
+
+    def test_activity_flip_between_rounds_withholds_next_key(self):
+        # A prompt starting after the first C-u must stop the second
+        # before it is sent (Sol blocker 1).
+        base = self._preflight_base()
+        tmux = StagedClearTmux(["stage two left", "stage one left"],
+                               chrome="esc to interrupt\n")
+        real_reader = lambda: managed.read_activity(
+            base.cfg, base.sid, base.transcript)
+        reader = lambda: (("running", None) if tmux.cleared_count
+                          else real_reader())
+        out = base.run_boundary(tmux, reader=reader)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.cleared_count, 1)
+        records = managed.read_journal(base.paths["journal"])
+        failed = [r for r in records
+                  if r["state"] == "COMPOSER_CLEAR_FAILED"]
+        self.assertEqual(failed[-1].get("reason"), "activity_changed")
+
+    def test_composer_growth_after_key_aborts(self):
+        # Text growing after our kill-line means someone is typing:
+        # exactly one key, then a keyed abort (Sol blocker 1).
+        base = self._preflight_base()
+        tmux = StagedClearTmux(["short", "short plus human typing"],
+                               chrome="esc to interrupt\n")
+        out = base.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.cleared_count, 1)
+        records = managed.read_journal(base.paths["journal"])
+        failed = [r for r in records
+                  if r["state"] == "COMPOSER_CLEAR_FAILED"]
+        self.assertEqual(failed[-1].get("reason"), "composer_grew")
+
+    def test_packet_landing_during_clear_blocks_rearm(self):
+        # The no-packet proof must be read AFTER the clear (Sol
+        # blocker 2): a packet materializing mid-clear blocks RECOVERED.
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        attempt = base.wedge()
+        text = managed.instruction_text(attempt["nonce"])
+        plant = lambda: managed._atomic_json(
+            managed.packet_path(base.cfg, base.sid),
+            {"seq": 77, "trigger": "auto", "base_compaction_count": 99})
+        tmux = StagedClearTmux([text], on_clear=plant)
+        watcher = base.make_settled_watcher(attempt, tmux)
+        base.tick(watcher)
+        self.assertIsNotNone(watcher.attempt)
+        self.assertNotIn("RECOVERED", base.journal_states())
+
+    def test_active_recovery_budget_survives_restart(self):
+        # Journal-derived restoration (Sol blocker 3): three RECOVERED/
+        # composer_cleared records with no confirmed boundary after
+        # them exhaust the budget for a freshly constructed watcher.
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      base.transcript)
+        for i in range(managed.ACTIVE_RECOVERY_LIMIT):
+            prior = managed.new_attempt(
+                base.token, managed.generation(cursor), 0, 0.0, "boot")
+            managed.journal_record(base.paths["journal"], "RECOVERED",
+                                   prior, reason="composer_cleared")
+        attempt = base.wedge()
+        tmux = base.wedged_tmux(attempt)
+        watcher = base.make_settled_watcher(attempt, tmux)
+        self.assertEqual(watcher._active_recoveries,
+                         managed.ACTIVE_RECOVERY_LIMIT)
+        for _ in range(3):
+            base.tick(watcher)
+        self.assertEqual(tmux.clears(), [])
+        self.assertIsNotNone(watcher.attempt)
+
+    def test_boundary_between_recoveries_resets_restored_budget(self):
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      base.transcript)
+        gen_attempt = lambda: managed.new_attempt(
+            base.token, managed.generation(cursor), 0, 0.0, "boot")
+        for _ in range(2):
+            managed.journal_record(base.paths["journal"], "RECOVERED",
+                                   gen_attempt(), reason="composer_cleared")
+        managed.journal_record(base.paths["journal"], "BOUNDARY_CONFIRMED",
+                               gen_attempt())
+        managed.journal_record(base.paths["journal"], "RECOVERED",
+                               gen_attempt(), reason="composer_cleared")
+        attempt = base.wedge()
+        watcher = base.make_watcher(base.wedged_tmux(attempt))
+        self.assertEqual(watcher._active_recoveries, 1)
+
+    def test_clear_charges_survive_restart(self):
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        attempt = base.wedge()
+        stamped = dict(attempt,
+                       clear_charges=managed.CLEAR_CHARGE_LIMIT)
+        managed.journal_record(
+            base.paths["journal"], "COMPOSER_CLEAR", stamped,
+            reason="recovery",
+            clear_charges=managed.CLEAR_CHARGE_LIMIT)
+        # The wedge tail must stay CLEANUP_REQUIRED after the clear
+        # record (as it would live: intent precedes any failure).
+        managed.journal_record(base.paths["journal"], "CLEANUP_REQUIRED",
+                               attempt, reason=attempt["reason"])
+        tmux = base.wedged_tmux(attempt)
+        watcher = base.make_settled_watcher(attempt, tmux)
+        self.assertEqual(watcher.attempt.get("clear_charges"),
+                         managed.CLEAR_CHARGE_LIMIT)
+        for _ in range(3):
+            base.tick(watcher)
+        self.assertEqual(tmux.clears(), [])
+
+    def test_clear_exception_degrades_to_defer(self):
+        # A transport surprise inside the clear must not escape and
+        # kill the watcher (Sol should-fix 5).
+        base = self._preflight_base()
+
+        class RaisingTmux(ClearingTmux):
+            def __call__(self, argv, timeout=5):
+                if managed.CLEAR_KEY in list(argv):
+                    raise RuntimeError("tmux transport died")
+                return super().__call__(argv, timeout)
+
+        tmux = RaisingTmux("stray draft", chrome="esc to interrupt\n")
+        out = base.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(out["reason"], "R2_composer_nonempty")
+
+    def test_operator_resolve_before_clear_wins(self):
+        # A journal that moved (operator resolve) after the wedge was
+        # loaded must suppress the destructive clear entirely (Sol
+        # should-fix 4).
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        attempt = base.wedge()
+        resolved = dict(attempt, state="LATCHED")
+        managed.journal_record(base.paths["journal"], "LATCHED", resolved,
+                               reason="operator_resolved")
+        tmux = base.wedged_tmux(attempt)
+        watcher = managed.Watcher(base.binding, base.cfg, base.paths,
+                                  run_tmux=tmux, proc_root=base.proc,
+                                  monotonic=lambda: base.now,
+                                  wait=lambda seconds: None,
+                                  wall=lambda: time.time() + 5)
+        watcher.attempt = dict(attempt)
+        for _ in range(4):
+            base.tick(watcher)
+        self.assertEqual(tmux.clears(), [])
+
+
+class ClearComposerConfigTests(unittest.TestCase):
+    """load_config plumbing for managed_clear_composer (audit gap: the
+    behavior tests set the cfg key directly, leaving the env/file
+    parsing unpinned)."""
+
+    def _cfg(self, environ=None, file_value="MISSING"):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        environ = dict(environ or {})
+        if file_value != "MISSING":
+            path = os.path.join(temp.name, "config.json")
+            with open(path, "w") as fh:
+                json.dump({"managed_clear_composer": file_value}, fh)
+            environ.setdefault("COMPACT_MANAGER_CONFIG", path)
+        return managed.load_config(
+            base=dict(cm._DEFAULTS, state_dir=temp.name), environ=environ)
+
+    def test_default_is_on(self):
+        self.assertIs(self._cfg()["managed_clear_composer"], True)
+
+    def test_env_falsey_spellings_disable(self):
+        for spelling in ("0", "false", "False", "no", "off", ""):
+            cfg = self._cfg({"COMPACT_MANAGER_MANAGED_CLEAR_COMPOSER":
+                             spelling})
+            self.assertIs(cfg["managed_clear_composer"], False,
+                          spelling or "<empty>")
+
+    def test_env_truthy_spellings_enable(self):
+        for spelling in ("1", "true", "yes", "on"):
+            cfg = self._cfg({"COMPACT_MANAGER_MANAGED_CLEAR_COMPOSER":
+                             spelling})
+            self.assertIs(cfg["managed_clear_composer"], True, spelling)
+
+    def test_file_false_disables_and_env_overrides_file(self):
+        self.assertIs(self._cfg(file_value=False)["managed_clear_composer"],
+                      False)
+        cfg = self._cfg({"COMPACT_MANAGER_MANAGED_CLEAR_COMPOSER": "1"},
+                        file_value=False)
+        self.assertIs(cfg["managed_clear_composer"], True)
+
+    def test_file_null_falls_back_to_default(self):
+        self.assertIs(self._cfg(file_value=None)["managed_clear_composer"],
+                      True)
+
+
+class ContainmentRoundFixTests(unittest.TestCase):
+    """Pins for the containment-audit findings (2026-08-26): the
+    destructive stability floor, the NBSP excerpt strip, and the
+    cursor-proof C-e+C-u key pair."""
+
+    def _base(self):
+        base = PreflightClearTests("test_no_clear_on_modal")
+        base.setUp()
+        base.write_pair()
+        self.addCleanup(base.temp.cleanup)
+        return base
+
+    def test_stability_floor_at_least_boundary_lanes(self):
+        # The destructive path must never use a shorter quiet window
+        # than the non-destructive boundary lane's 500ms floor.
+        self.assertGreaterEqual(managed.CLEAR_STABLE_FLOOR_MS, 500)
+        base = self._base()
+        waits = []
+        tmux = ClearingTmux("stray draft", chrome="esc to interrupt\n")
+        reader = lambda: managed.read_activity(
+            base.cfg, base.sid, base.transcript)
+        managed.run_ladder(
+            base.binding, base.cfg, base.paths, base.attempt, base.cursor,
+            base.paths["journal"], lambda: None, tmux, base.proc,
+            wait=lambda seconds: waits.append(seconds),
+            now_mono=lambda: 0.0, boundary_ok=True,
+            activity_reader=reader, now_wall=lambda: time.time() + 5)
+        self.assertTrue(any(w >= 0.5 for w in waits),
+                        "no >=500ms stability wait observed: %r" % waits)
+
+    def test_excerpt_strips_nbsp_prompt_marker(self):
+        base = self._base()
+        tmux = ClearingTmux("stray human draft",
+                            chrome="esc to interrupt\n")
+        base.run_boundary(tmux)
+        records = managed.read_journal(base.paths["journal"])
+        clear = [r for r in records if r["state"] == "COMPOSER_CLEAR"]
+        self.assertEqual(clear[0].get("cleared_excerpt"),
+                         "stray human draft")
+
+    def test_clear_sends_cursor_to_end_before_kill(self):
+        # C-u kills to line START; without a preceding C-e a cursor a
+        # human parked mid-line strands the text to its right.
+        base = self._base()
+        tmux = ClearingTmux("stray draft", chrome="esc to interrupt\n")
+        base.run_boundary(tmux)
+        clears = tmux.clears()
+        self.assertEqual(len(clears), 1)
+        self.assertEqual(clears[0][-3:],
+                         [managed.CLEAR_CURSOR_KEY, managed.CLEAR_KEY,
+                          managed.CLEAR_JOIN_KEY])
+
+
+class SolRound2FixTests(unittest.TestCase):
+    """Pins for the round-2 Sol findings: success-charged budgets,
+    OWN-packet pre-clear stand-down, eviction-proof restoration,
+    mid-clear operator-resolve abort, and per-round leader/binding
+    revalidation."""
+
+    def _preflight_base(self):
+        base = PreflightClearTests("test_no_clear_on_modal")
+        base.setUp()
+        base.write_pair()
+        self.addCleanup(base.temp.cleanup)
+        return base
+
+    def _recovery_base(self):
+        base = ActiveClearRecoveryTests(
+            "test_wedged_bytes_actively_cleared_and_recovered")
+        base.setUp()
+        self.addCleanup(base.temp.cleanup)
+        return base
+
+    def _clear(self, base, tmux, attempt):
+        reader = lambda: managed.read_activity(
+            base.cfg, base.sid, base.transcript)
+        return managed.clear_composer(
+            base.binding, base.cfg, base.paths, tmux, base.proc,
+            lambda seconds: None, reader, base.paths["journal"], attempt,
+            now_wall=lambda: time.time() + 5)
+
+    def test_successful_clears_also_spend_the_budget(self):
+        # Failure-only accounting let a refilled composer be erased
+        # once per poll forever while recovery proofs kept failing.
+        base = self._preflight_base()
+        attempt = base.attempt
+        for i in range(managed.CLEAR_CHARGE_LIMIT):
+            ok, why = self._clear(
+                base, ClearingTmux("draft %d" % i,
+                                   chrome="esc to interrupt\n"), attempt)
+            self.assertTrue(ok, why)
+        ok, why = self._clear(
+            base, ClearingTmux("draft again",
+                               chrome="esc to interrupt\n"), attempt)
+        self.assertFalse(ok)
+        self.assertEqual(why, "clear_charges_exhausted")
+        clears = [r for r in managed.read_journal(base.paths["journal"])
+                  if r["state"] == "COMPOSER_CLEAR"]
+        self.assertEqual(len(clears), managed.CLEAR_CHARGE_LIMIT)
+        self.assertEqual(clears[-1].get("clear_charges"),
+                         managed.CLEAR_CHARGE_LIMIT)
+
+    def test_visible_own_packet_stands_down_and_stamps_proof(self):
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        attempt = base.wedge()
+        managed._atomic_json(
+            managed.packet_path(base.cfg, base.sid),
+            {"seq": 5, "trigger": "manual", "base_compaction_count": 99,
+             "custom_instructions": "[cm-%s] x" % attempt["nonce"]})
+        tmux = base.wedged_tmux(attempt)
+        watcher = base.make_settled_watcher(attempt, tmux)
+        for _ in range(3):
+            base.tick(watcher)
+        self.assertEqual(tmux.clears(), [])
+        self.assertIs(watcher.attempt.get("own_packet_proof"), True)
+        records = managed.read_journal(base.paths["journal"])
+        stamped = [r for r in records
+                   if r["state"] == "CLEANUP_REQUIRED" and
+                   r.get("own_packet_proof") is True]
+        self.assertTrue(stamped)
+        # And the stamped compact is now counted as fired.
+        self.assertEqual(
+            managed.cm_compact_count(base.cfg, base.sid), 1)
+
+    def test_budget_restoration_survives_lifecycle_spam(self):
+        # Restoration must read the same horizon recover_attempt does:
+        # >64KB of lifecycle rows between the budget records and the
+        # tail must not refresh the budgets (Sol round-2 blocker 3).
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        attempt = base.wedge()
+        stamped = dict(attempt, clear_charges=managed.CLEAR_CHARGE_LIMIT)
+        managed.journal_record(
+            base.paths["journal"], "COMPOSER_CLEAR", stamped,
+            reason="recovery",
+            clear_charges=managed.CLEAR_CHARGE_LIMIT)
+        managed.journal_record(base.paths["journal"], "CLEANUP_REQUIRED",
+                               attempt, reason=attempt["reason"])
+        filler = {"run_token": base.token,
+                  "generation": attempt["generation"],
+                  "padding": "x" * 400}
+        for _ in range(300):        # ~120KB of lifecycle spam
+            managed.journal_record(base.paths["journal"],
+                                   "WATCHER_READY", filler,
+                                   reason="restart_spam")
+        tmux = base.wedged_tmux(attempt)
+        watcher = base.make_settled_watcher(attempt, tmux)
+        self.assertEqual(watcher.attempt.get("clear_charges"),
+                         managed.CLEAR_CHARGE_LIMIT)
+        for _ in range(3):
+            base.tick(watcher)
+        self.assertEqual(tmux.clears(), [])
+
+    def test_resolve_landing_mid_clear_withholds_the_key(self):
+        # A LATCHED/operator_resolved append during the stability
+        # window must stop the first key via abort_check (Sol round-2
+        # should-fix 4: the old test consumed the resolve at tick
+        # start and never exercised the pre-key check).
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        attempt = base.wedge()
+
+        class ResolveMidClearTmux(ClearingTmux):
+            captures = 0
+            def __call__(self, argv, timeout=5):
+                argv = list(argv)
+                cmd = argv[2] if argv[:1] == ["-S"] else argv[0]
+                if cmd == "capture-pane":
+                    type(self).captures += 1
+                    if type(self).captures == 2:
+                        resolved = dict(attempt)
+                        managed.journal_record(
+                            base.paths["journal"], "LATCHED", resolved,
+                            latch_kind="SAFETY",
+                            reason="operator_resolved")
+                return super().__call__(argv, timeout)
+
+        text = managed.instruction_text(attempt["nonce"])
+        tmux = ResolveMidClearTmux(text)
+        watcher = base.make_settled_watcher(attempt, tmux)
+        for _ in range(3):
+            base.tick(watcher)
+        self.assertEqual(tmux.clears(), [])
+        # The abort happens PRE-charge: no key, no records, no budget
+        # burned (round-3: transient aborts must not exhaust the
+        # destructive budget keylessly).
+        records = managed.read_journal(base.paths["journal"])
+        self.assertEqual([r for r in records
+                          if r["state"].startswith("COMPOSER_CLEAR")], [])
+        self.assertFalse(watcher.attempt and
+                         watcher.attempt.get("clear_charges"))
+
+    def test_leader_stopping_between_rounds_withholds_next_key(self):
+        base = self._preflight_base()
+        stop_leader = lambda: write_proc(base.proc, 20, 20, 2020,
+                                         state="T")
+        tmux = StagedClearTmux(["stage two left", "stage one left"],
+                               chrome="esc to interrupt\n",
+                               on_clear=stop_leader)
+        out = base.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.cleared_count, 1)
+        records = managed.read_journal(base.paths["journal"])
+        failed = [r for r in records
+                  if r["state"] == "COMPOSER_CLEAR_FAILED"]
+        self.assertEqual(failed[-1].get("reason"),
+                         "leader_not_schedulable")
+
+    def test_binding_rotting_between_rounds_withholds_next_key(self):
+        base = self._preflight_base()
+        tmux = StagedClearTmux(["stage two left", "stage one left"],
+                               chrome="esc to interrupt\n")
+        tmux.on_clear = lambda: setattr(
+            tmux, "facts", "%1\t/dev/pts/9\t10\tclaude\t0\t120\t40\t$1\n")
+        out = base.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.cleared_count, 1)
+        records = managed.read_journal(base.paths["journal"])
+        failed = [r for r in records
+                  if r["state"] == "COMPOSER_CLEAR_FAILED"]
+        self.assertEqual(failed[-1].get("reason"), "binding_lost")
+
+
+class MultilineDraftTests(unittest.TestCase):
+    """Round-2 Opus finding: hard-multiline drafts render continuation
+    lines below the marker with no marker of their own — the stability
+    gate and the forensic record must cover the whole region."""
+
+    def _base(self):
+        base = PreflightClearTests("test_no_clear_on_modal")
+        base.setUp()
+        base.write_pair()
+        self.addCleanup(base.temp.cleanup)
+        return base
+
+    def test_continuation_line_typing_defers(self):
+        base = self._base()
+        before = "esc to interrupt\n" + IDLE + "line one\nline two"
+        after = "esc to interrupt\n" + IDLE + "line one\nline two more"
+        tmux = LadderTmux([before, before, after, after])
+        out = base.run_boundary(tmux)
+        self.assertEqual(out["state"], "DEFERRED")
+        self.assertEqual(tmux.sent, [])
+
+    def test_multiline_clear_journals_region_excerpt(self):
+        base = self._base()
+        tmux = ClearingTmux("line one\nline two secret",
+                            chrome="esc to interrupt\n")
+        base.run_boundary(tmux)
+        records = managed.read_journal(base.paths["journal"])
+        clear = [r for r in records if r["state"] == "COMPOSER_CLEAR"]
+        self.assertEqual(len(clear), 1)
+        self.assertIn("line two secret", clear[0].get("region_excerpt"))
+
+    def test_single_line_clear_has_no_region_excerpt(self):
+        base = self._base()
+        tmux = ClearingTmux("just one line", chrome="esc to interrupt\n")
+        base.run_boundary(tmux)
+        records = managed.read_journal(base.paths["journal"])
+        clear = [r for r in records if r["state"] == "COMPOSER_CLEAR"]
+        self.assertNotIn("region_excerpt", clear[0])
+
+
+class SolRound3FixTests(unittest.TestCase):
+    """Pins for the round-3 Sol findings: packet stand-down blocks the
+    passive lane too, the OWN append serializes against an operator
+    resolve, pre-charge aborts are free, and abort_check re-runs after
+    every key."""
+
+    def _recovery_base(self):
+        base = ActiveClearRecoveryTests(
+            "test_wedged_bytes_actively_cleared_and_recovered")
+        base.setUp()
+        self.addCleanup(base.temp.cleanup)
+        return base
+
+    def _preflight_base(self):
+        base = PreflightClearTests("test_no_clear_on_modal")
+        base.setUp()
+        base.write_pair()
+        self.addCleanup(base.temp.cleanup)
+        return base
+
+    def test_foreign_packet_stands_down_before_any_key(self):
+        # A FOREIGN packet visible at recovery time must suppress the
+        # clear entirely AND the passive probe for that poll — not just
+        # fail the post-clear proof (round-3 blocker 1).
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        attempt = base.wedge()
+        managed._atomic_json(
+            managed.packet_path(base.cfg, base.sid),
+            {"seq": 41, "trigger": "auto", "base_compaction_count": 99})
+        tmux = base.wedged_tmux(attempt)
+        watcher = base.make_settled_watcher(attempt, tmux)
+        for _ in range(3):
+            base.tick(watcher)
+        self.assertEqual(tmux.clears(), [])
+        self.assertIsNotNone(watcher.attempt)
+        self.assertNotIn("RECOVERED", base.journal_states())
+
+    def test_own_append_yields_to_operator_resolve(self):
+        # The durable OWN-proof append re-checks the tail under the
+        # txn lock; a resolve that landed after the tick loaded the
+        # wedge (so the tick-start adoption missed it) must not be
+        # buried under a newer CLEANUP_REQUIRED row (round-3 blocker
+        # 2). Exercised at the _try_active_clear level, where the race
+        # actually lives — a resolve written before tick() is consumed
+        # at tick start and never reaches this code.
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        attempt = base.wedge()
+        managed._atomic_json(
+            managed.packet_path(base.cfg, base.sid),
+            {"seq": 5, "trigger": "manual", "base_compaction_count": 99,
+             "custom_instructions": "[cm-%s] x" % attempt["nonce"]})
+        tmux = base.wedged_tmux(attempt)
+        watcher = base.make_watcher(tmux, wall=lambda: time.time() + 5)
+        watcher.attempt = dict(attempt)
+        watcher.cursor = managed.initial_scan(managed.default_cursor(),
+                                              base.transcript)
+        # The resolve lands NOW — after the tick would have loaded the
+        # wedge, before the active lane classifies the packet.
+        resolved = dict(attempt, state="LATCHED")
+        managed.journal_record(base.paths["journal"], "LATCHED", resolved,
+                               latch_kind="SAFETY",
+                               reason="operator_resolved")
+        verdict = watcher._try_active_clear(None)
+        self.assertIsNone(verdict)          # stand-down, not a clear
+        self.assertEqual(tmux.clears(), [])
+        tail = managed.attempt_tail(base.paths["journal"])
+        self.assertEqual(tail.get("state"), "LATCHED")
+        self.assertEqual(tail.get("reason"), "operator_resolved")
+        # In-memory proof still recorded: active clearing stays blocked.
+        self.assertIs(watcher.attempt.get("own_packet_proof"), True)
+
+    def test_transient_aborts_cost_no_budget(self):
+        # Pre-charge refusals are free: an abort_check that fails
+        # forever must leave the budget intact (round-3 should-fix 1).
+        base = self._preflight_base()
+        attempt = dict(base.attempt)
+        reader = lambda: managed.read_activity(
+            base.cfg, base.sid, base.transcript)
+        for _ in range(10):
+            ok, why = managed.clear_composer(
+                base.binding, base.cfg, base.paths,
+                ClearingTmux("draft", chrome="esc to interrupt\n"),
+                base.proc, lambda s: None, reader,
+                base.paths["journal"], attempt,
+                now_wall=lambda: time.time() + 5,
+                abort_check=lambda: False)
+            self.assertEqual((ok, why), (False, "aborted"))
+        self.assertEqual(attempt.get("clear_charges", 0), 0)
+        self.assertEqual(managed.read_journal(base.paths["journal"]), [])
+
+    def test_abort_check_reruns_after_each_key(self):
+        # The authority must be re-proven before EVERY key, not only
+        # the first (round-3 should-fix 3).
+        base = self._preflight_base()
+        attempt = dict(base.attempt)
+        reader = lambda: managed.read_activity(
+            base.cfg, base.sid, base.transcript)
+        tmux = StagedClearTmux(["stage two left", "stage one left"],
+                               chrome="esc to interrupt\n")
+        state = {"allowed": True}
+        tmux.on_clear = lambda: state.update(allowed=False)
+        ok, why = managed.clear_composer(
+            base.binding, base.cfg, base.paths, tmux, base.proc,
+            lambda s: None, reader, base.paths["journal"], attempt,
+            now_wall=lambda: time.time() + 5,
+            abort_check=lambda: state["allowed"])
+        self.assertEqual((ok, why), (False, "aborted"))
+        self.assertEqual(tmux.cleared_count, 1)
+        records = managed.read_journal(base.paths["journal"])
+        failed = [r for r in records
+                  if r["state"] == "COMPOSER_CLEAR_FAILED"]
+        self.assertEqual(failed[-1].get("reason"), "aborted")
+        self.assertEqual(attempt.get("clear_charges"), 1)
+
+
+class LineByLineClearTests(unittest.TestCase):
+    """Pin for the live s17 failure: a TUI whose kill-line eats one
+    line per round leaves the marker line untouched at first — region
+    progress must carry the loop to convergence instead of aborting
+    clear_ineffective with the first line stranded."""
+
+    def test_line_by_line_clear_converges_and_submits(self):
+        base = PreflightClearTests("test_no_clear_on_modal")
+        base.setUp()
+        self.addCleanup(base.temp.cleanup)
+        base.write_pair()
+        tmux = StagedClearTmux(["line one\nline two", "line one"],
+                               chrome="esc to interrupt\n")
+        out = base.run_boundary(tmux)
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(tmux.cleared_count, 2)
+        records = managed.read_journal(base.paths["journal"])
+        self.assertNotIn("COMPOSER_CLEAR_FAILED",
+                         [r["state"] for r in records])
+
+
+class SolRound4FixTests(unittest.TestCase):
+    """Round-4 pins: the None verdict itself suppresses the passive
+    lane (independent of what the passive probe would conclude), and
+    an own-proved attempt never recovers through either lane."""
+
+    def _recovery_base(self):
+        base = ActiveClearRecoveryTests(
+            "test_wedged_bytes_actively_cleared_and_recovered")
+        base.setUp()
+        self.addCleanup(base.temp.cleanup)
+        return base
+
+    def _passive_favorable_watcher(self, base, attempt):
+        """A watcher whose PASSIVE probes would succeed: settled
+        baseline+snapshot, post-wedge transcript growth, a new prompt
+        identity, empty composer."""
+        watcher = base.make_watcher(LadderTmux([IDLE]),
+                                    wall=lambda: time.time() + 5)
+        base.tick(watcher)                     # baseline
+        base.tick(watcher)                     # snapshot
+        append_rows(base.transcript, [usage_row(51)])
+        base.arm_activity(prompt_id="prompt-post-9")
+        return watcher
+
+    def test_none_verdict_suppresses_passive_lane_that_poll(self):
+        # Mutation pin for the FOREIGN stand-down: force the active
+        # lane's verdict directly, with the passive lane otherwise
+        # fully able to recover — None must block it, False must not.
+        for verdict, expect_recovered in ((None, False), (False, True)):
+            with self.subTest(verdict=verdict):
+                base = self._recovery_base()
+                append_rows(base.transcript, [usage_row(50)])
+                attempt = base.wedge()
+                watcher = self._passive_favorable_watcher(base, attempt)
+                watcher._try_active_clear = lambda packet: verdict
+                recovered = False
+                for _ in range(4):
+                    keep, state = base.tick(watcher)
+                    if state == "recovered":
+                        recovered = True
+                self.assertEqual(recovered, expect_recovered)
+
+    def test_own_proved_attempt_never_passively_recovers(self):
+        # own_packet_proof = the compact FIRED: terminal for both
+        # lanes even when every passive proof would pass and the
+        # packet file has since become unreadable (round-4 audit).
+        base = self._recovery_base()
+        append_rows(base.transcript, [usage_row(50)])
+        base.arm_activity()
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      base.transcript)
+        attempt = managed.new_attempt(
+            base.token, managed.generation(cursor), 0, 0.0, "boot")
+        attempt.update(state="CLEANUP_REQUIRED",
+                       reason="R5_composer_mismatch",
+                       own_packet_proof=True)
+        managed.journal_record(base.paths["journal"], "CLEANUP_REQUIRED",
+                               attempt, reason=attempt["reason"])
+        watcher = self._passive_favorable_watcher(base, attempt)
+        for _ in range(5):
+            base.tick(watcher)
+        self.assertIsNotNone(watcher.attempt)
+        self.assertNotIn("RECOVERED", base.journal_states())

@@ -95,10 +95,20 @@ instruction into the pane and presses Enter — but only after checking,
 immediately before every keystroke, that it's the right pane, the
 right claude process, the input line is empty and has stayed still,
 and no other compaction is already underway. Any doubt at any step
-means it backs off and tries later. It never deletes anything you
-typed, and if anything is ambiguous *after* it has typed, it stops,
-raises a persistent alert in `status`, and waits for you to look —
-it never guesses.
+means it backs off and tries later. One deliberate exception: text
+sitting unsubmitted in the input line when a compaction is due. By
+default the watcher clears it (bounded `C-e`,`C-u`,`Backspace` key rounds, only
+after the turn provably ended and the text sat still through a
+stability window, re-proven before every keystroke — someone caught
+mid-typing defers the clear, though text typed during the brief
+clearing loop itself can still be lost) and journals an excerpt of
+what it erased before the first key, so a stray draft cannot stall
+compaction indefinitely and nothing is destroyed without a durable
+record. Set `managed_clear_composer` to `false` to
+restore the old strictly-hands-off behavior. If anything is ambiguous
+*after* it has typed, it stops, raises a persistent alert in
+`status`, and waits — pressing Enter is never authorized by anything
+less than the full byte-exact verification chain.
 
 Honest risk note, because you must pass `--attended` to acknowledge
 it: on a pane you're actively typing in, there is an unavoidable
@@ -194,10 +204,15 @@ its journal: cleanup required, uncertain submission, a safety latch)
 is reported as such with the `resolve` command instead of the plain
 attached line, and the advisor repeats that warning in-session once
 per distinct wedge — plus an all-clear when the journal positively
-clears. A wedge from a composer-verification race also self-heals:
-the watcher re-arms itself after repeated read-only probes prove the
-typed bytes are gone from the composer, pane, and transcript while
-the session demonstrably kept running. A watcher whose pane rotates its session id under it
+clears. A wedge whose typed bytes are still visible in the composer
+also self-heals: with clearing on (the default) the watcher erases
+its own wedged `/compact` line under the same gates it uses for
+drafts, proves the bytes gone from composer, pane, and transcript,
+and re-arms — bounded to three consecutive self-recoveries so a
+systematic failure escalates to you instead of churning. With
+clearing off, the keyless path remains: repeated read-only probes
+must prove the bytes vanished while the session demonstrably kept
+running. A watcher whose pane rotates its session id under it
 (`/clear`, in-app `/resume` — same claude process, new id) retires
 with `reason=session_rotated` rather than watching the dead id's
 frozen transcript; re-attach to cover the new session. Without it, "mode is managed but nobody adopted this
@@ -254,6 +269,7 @@ Managed-mode knobs (all clamped to safe ranges):
 | `managed_ack_timeout_s` | `120` | No confirmation the command was received → one retry, then stop and alert. |
 | `managed_completion_timeout_s` | `300` | Command received but compaction never finished → stop and alert. |
 | `managed_pane_commands` | `["claude"]` | Only type into a pane running one of these. |
+| `managed_clear_composer` | `true` | Clear unsubmitted composer text (bounded `C-e`,`C-u`,`Backspace` rounds, journaled with an excerpt) when a compaction is due or a typed-bytes wedge is recoverable. `false` restores the strictly-hands-off contract. |
 
 ## How it works / limitations
 
@@ -264,8 +280,9 @@ a paired turn marker (running/ended, keyed by the turn's `prompt_id`):
 the watcher trusts "the foreground turn ended" only when the two
 halves pair, which lets a requested compaction type into a session
 whose background tasks never leave the pane idle — the composer must
-still be exactly empty (dim ghost-suggestion text counts as empty; a
-half-typed prompt or a modal never does), and input-opportunity
+still be exactly empty at typing time (dim ghost-suggestion text
+counts as empty; a modal never does; a half-typed prompt is cleared
+first when `managed_clear_composer` is on), and input-opportunity
 retries stay at the poll cadence instead of decaying into exponential
 backoff. If a requested or hard-threshold compaction stays blocked
 for two minutes, the watcher journals a starvation alert and flags
