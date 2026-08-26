@@ -16,6 +16,41 @@ except Exception as e:
     sys.exit(0)
 
 
+def resume_nudge_promise(cfg, session_id):
+    """The advisory's "let it restart you" tail — emitted ONLY when a
+    LIVE attached watcher lease positively reports the nudge enabled.
+    The promise must come from the RUNNING watcher, not from re-deriving
+    config here: a watcher adopted with different env (or predating the
+    feature) would never nudge, and a session told to end its turn and
+    wait would strand exactly the way the feature exists to prevent
+    (Sol round-1 #6). Ambiguous, missing, dead, or unflagged leases all
+    read as no promise."""
+    try:
+        import managed as mg
+        lease, _inode = mg.read_json_inode(os.path.join(
+            cfg["state_dir"], "managed", "leases",
+            "session-%s.json" % cm.path_component(session_id)))
+        if (lease and mg.lease_attached(lease) and
+                # lease_attached accepts a fresh heartbeat alone; a
+                # watcher can die milliseconds after one, leaving a
+                # window where this promise would strand the session.
+                # The promise is the one consumer that needs POSITIVE
+                # process liveness, not just heartbeat freshness (Sol
+                # round-3 N2).
+                mg.proc_matches(lease.get("pid"),
+                                lease.get("proc_start")) and
+                lease.get("resume_nudge") is True):
+            return (
+                " Resume nudge is ON: after a compaction "
+                "you REQUESTED completes, the watcher "
+                "types a continuation prompt for you — "
+                "end your turn after writing the request "
+                "and let it restart you.")
+    except Exception:
+        pass
+    return ""
+
+
 def run(payload, cfg):
     session_id = payload.get("session_id") or ""
     transcript = payload.get("transcript_path") or ""
@@ -51,10 +86,16 @@ def run(payload, cfg):
         st["eff_window"] = eff["context_window"]
         st["eff_soft_pct"] = eff["soft_pct"]
         st["eff_hard_pct"] = eff["hard_pct"]
+        # ONE managed-config load for the whole run (trigger stamp and
+        # the resume-nudge advisory below): a second load could re-emit
+        # the loader's fail-open diagnostics twice per hook invocation.
         try:
             import managed as mg
-            st["eff_trigger_pct"] = mg.trigger_for(mg.load_config(),
-                                                   st.get("model"))
+            mg_cfg = mg.load_config()
+        except Exception:
+            mg, mg_cfg = None, None
+        try:
+            st["eff_trigger_pct"] = mg.trigger_for(mg_cfg, st.get("model"))
         except Exception:
             st["eff_trigger_pct"] = eff["hard_pct"]
         # The advisories themselves DO honor the overrides. One
@@ -71,13 +112,14 @@ def run(payload, cfg):
                 req = os.path.join(
                     cfg["state_dir"], "managed", "requests",
                     f"{cm.path_component(session_id)}.json")
+                tail = resume_nudge_promise(cfg, session_id)
                 advisory += (
                     f" (managed mode: when you are AT the natural "
                     f"boundary, you may instead request compaction "
                     f"yourself by writing "
                     f'{{"request_id": "<8-64 letters/digits/dashes>"}} '
                     f"to {req} — the watcher compacts at the next "
-                    f"safe idle moment.)")
+                    f"safe idle moment.{tail})")
             parts.append(advisory)
         st["advisory_level"] = level
         # Managed mode's blind spot: a session whose watcher retired or

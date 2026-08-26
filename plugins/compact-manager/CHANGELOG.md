@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Watcher: resume nudge (`managed_resume_nudge`, default off). After a
+  **session-requested** compaction's boundary is confirmed, the
+  watcher types one continuation prompt and presses Enter — `/compact`
+  never re-invokes the model, so an autonomous session that requested
+  its compaction at a turn boundary otherwise strands itself until a
+  human prompts it (observed live 2026-08-26: 7h45m idle after a clean
+  requested compact). Arming is deliberately narrow (Sol round-1):
+  request-triggered attempts only, with manager-origin proof of the
+  boundary (prior `ACKED` or an own-packet proof — a human or native
+  `/compact` winning the race never arms), on a fresh transition only
+  (a restart's resurrected boundary tail cannot re-arm), and only with
+  positive ended-turn marker evidence — the armed revision causally
+  binds every later keystroke to the exact turn that requested the
+  compaction, re-proven immediately before Enter. The pending nudge
+  cancels itself if a second boundary lands, another compaction goes
+  in flight, or the session resumes some other way; it stands down
+  permanently on any visible composer input (it never clears a draft);
+  and its 180s window bounds keystrokes, not just entry — the deadline
+  is rechecked before the first typed byte and before Enter. Every
+  terminal disposition is journaled as a `RESUME_NUDGE` row — a state
+  invisible to recovery, wedge verdicts, and status by design. The
+  watcher publishes its effective setting into its leases, and the
+  soft-threshold advisory tells the model to end its turn and let the
+  watcher restart it only when a live attached watcher positively
+  reports the nudge enabled.
 - Watcher: active composer clearing (`managed_clear_composer`, default
   on). When a compaction is due and unsubmitted text sits in the
   composer — a human draft or the watcher's own wedged `/compact` line

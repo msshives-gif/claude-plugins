@@ -114,6 +114,25 @@ INSTRUCTION_TEMPLATE_SHORT = "/compact [cm-{nonce}]"
 # instruction can render unwrapped (the composer pads before wrapping).
 WRAP_MARGIN_COLS = 4
 INSTRUCTION_DENYLIST = ";&|><()\"'$`\n\r"
+# Resume nudge (managed_resume_nudge, default off): after a
+# session-REQUESTED compaction confirms its boundary, the watcher types
+# one continuation prompt — /compact never re-invokes the model, so an
+# autonomous session that requests a compact at a turn boundary strands
+# itself until a human prompts it (observed live 2026-08-26: 7h45m
+# idle). Request-triggered attempts only: a threshold compact on an
+# interactive session must not restart the model behind the human's
+# back. The texts obey INSTRUCTION_DENYLIST (adopt-mode worst case
+# delivers the bytes to a shell) and the short form exists for panes
+# too narrow to render the full line unwrapped (a soft-wrapped composer
+# can never pass the typed-text verification).
+RESUME_NUDGE_TEMPLATE = ("continue [compact-manager resume nudge after "
+                         "the compaction this session requested]")
+RESUME_NUDGE_TEMPLATE_SHORT = "continue [cm-resume]"
+# One bounded window per confirmed boundary: transient pane conditions
+# retry inside it; expiry stands down for good (never a latch — a
+# missed nudge leaves the session exactly as idle as before the
+# feature existed).
+RESUME_NUDGE_WINDOW_S = 180.0
 ADOPT_ACKNOWLEDGEMENT = (
     "In adopt mode, the automation may in a worst-case race deliver the "
     "fixed `/compact …` bytes and one Enter to the underlying shell. "
@@ -133,6 +152,7 @@ MANAGED_DEFAULTS = {
     "managed_completion_timeout_s": 300,
     "managed_pane_commands": ["claude"],
     "managed_clear_composer": True,
+    "managed_resume_nudge": False,
 }
 
 
@@ -234,6 +254,22 @@ def load_config(base=None, environ=None):
         # disable, anything else (including "1"/"true") enables.
         clear = clear.strip().lower() not in ("", "0", "false", "no", "off")
     cfg["managed_clear_composer"] = bool(clear)
+    # Strict parsing, unlike the clear knob: this one is default-OFF
+    # and arms automated Enter, so a malformed value ("flase", a list,
+    # a number) must read as the default, never as enabled (Sol
+    # round-1 #8).
+    nudge = raw["managed_resume_nudge"]
+    if isinstance(nudge, str):
+        lowered = nudge.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            nudge = True
+        elif lowered in ("", "0", "false", "no", "off"):
+            nudge = False
+        else:
+            nudge = MANAGED_DEFAULTS["managed_resume_nudge"]
+    if not isinstance(nudge, bool):
+        nudge = MANAGED_DEFAULTS["managed_resume_nudge"]
+    cfg["managed_resume_nudge"] = nudge
     return cfg
 
 
@@ -537,8 +573,14 @@ def _prune_managed_locked(cfg, exclude_session_lease=None, now=None,
 
 
 def acquire_leases(paths, run_token, pid, proc_start, now=None,
-                   proc_root="/proc", before_second=None, ttl_days=7):
-    """Acquire session then pane atomically; roll session back on loss."""
+                   proc_root="/proc", before_second=None, ttl_days=7,
+                   extra=None):
+    """Acquire session then pane atomically; roll session back on loss.
+    extra: additional fields merged into both lease records (e.g. the
+    watcher's effective resume_nudge setting, so hook-side advisories
+    reflect the RUNNING watcher's behavior rather than re-deriving it
+    from a config the watcher may not share — Sol round-1 #6).
+    heartbeat_leases preserves unknown fields, so they survive."""
     now = time.time() if now is None else now
     with txn_lock(paths["txn"]):
         # Housekeeping shares this one transaction and never touches the
@@ -556,7 +598,10 @@ def acquire_leases(paths, run_token, pid, proc_start, now=None,
                     conditional_remove(made_path, run_token, made_inode, locked=True)
                 return False, {"reason": "lease_held", "path": path,
                                "holder": old}
-            _atomic_json(path, _lease_record(run_token, pid, proc_start, now))
+            record = _lease_record(run_token, pid, proc_start, now)
+            if extra:
+                record.update(extra)
+            _atomic_json(path, record)
             made_inode = os.lstat(path).st_ino
             acquired.append((path, made_inode))
             if index == 0 and before_second:
@@ -1531,6 +1576,15 @@ def instruction_text(nonce, width=None):
     return text
 
 
+def resume_nudge_text(width=None):
+    text = RESUME_NUDGE_TEMPLATE
+    if width is not None and len("❯ " + text) > width - WRAP_MARGIN_COLS:
+        text = RESUME_NUDGE_TEMPLATE_SHORT
+    if any(ch in text for ch in INSTRUCTION_DENYLIST):
+        raise ValueError("nudge contains shell metacharacter")
+    return text
+
+
 def _composer_line(capture):
     # capture-pane -J (required to re-join wrapped lines) PRESERVES
     # trailing spaces, so the live composer captures as "❯"+NBSP+padding
@@ -2072,7 +2126,14 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
     if not ok:
         return dict(attempt, state="DEFERRED", reason=reason,
                     defer_class=defer_class)
-    attempt = dict(attempt, lane=lane)
+    # The authorizing activity revision, kept on the attempt: the
+    # resume nudge must bind to the turn that was current when the
+    # instruction was TYPED — a revision first sampled at boundary
+    # time could belong to a turn that slipped in during the
+    # compaction (Sol round-2 #2).
+    attempt = dict(attempt, lane=lane,
+                   activity_rev_at_submit=(list(activity_rev)
+                                           if activity_rev else None))
     ok, r4_facts = validate_binding(binding, cfg, paths, run_tmux, proc_root,
                                     sessions_dir=sessions_dir)
     if not ok:
@@ -2194,6 +2255,134 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
         journal_record(journal_path, "SUBMISSION_UNCERTAIN", attempt,
                        reason=attempt["reason"])
     return attempt
+
+
+def type_resume_nudge(binding, cfg, paths, run_tmux=default_run_tmux,
+                      proc_root="/proc",
+                      wait=lambda seconds: time.sleep(seconds),
+                      activity_reader=None, sessions_dir=None,
+                      now_wall=time.time, expected_rev=None,
+                      deadline_mono=None, now_mono=time.monotonic,
+                      cursor=None, expected_generation_k=None,
+                      packet_loader=None):
+    """Type the post-compaction continuation prompt, under the same
+    preflight/verify discipline as the compact ladder but with benign
+    failure semantics: the text is a harmless prompt, so no outcome
+    here is a CLEANUP_REQUIRED-class hazard, and a human draft in the
+    composer stands the nudge down permanently instead of being
+    cleared — the nudge must never destroy or piggyback on human
+    input.
+
+    expected_rev causally binds every keystroke to ONE specific ended
+    turn — the pre-compact turn that requested the compaction: the
+    preflight's activity read must return exactly that revision, and
+    it is re-proven immediately before Enter regardless of lane (Sol
+    round-1 #2/#4). deadline_mono bounds keystrokes, not just entry:
+    it is rechecked before the first typed byte and before Enter, so
+    a call admitted at the window's edge cannot act after it (Sol
+    round-1 #7).
+
+    Composer verification is the marker-row contract shared with
+    run_ladder (snapshot_exact); a hard-multiline draft whose first
+    line is blank is invisible to both — a known, shared limitation
+    of the pane parser, not widened by this function.
+
+    Returns (done, reason). done=False: transient, the caller may
+    retry inside its window. done=True: terminal for this boundary
+    ("submitted", or a skipped_*/failed_*/submit_* disposition)."""
+    ok, reason, _defer_class, lane, activity_rev = ladder_preflight(
+        binding, cfg, paths, run_tmux, proc_root, wait,
+        sessions_dir=sessions_dir, boundary_ok=True,
+        activity_reader=activity_reader, now_wall=now_wall)
+    if not ok:
+        if reason in ("R2_composer_nonempty", "R2_composer_unknown"):
+            # Visible input (or an unclassifiable composer): someone —
+            # most likely the human — is ahead of us. Stand down for
+            # good; run_ladder's clearing path is deliberately not
+            # taken for a nudge.
+            return True, "skipped_%s" % reason[3:]
+        return False, reason
+    if expected_rev is not None and (
+            activity_rev is None or
+            tuple(activity_rev) != tuple(expected_rev)):
+        # The evidence decayed or belongs to a different turn — even
+        # via the strict lane, the nudge only ever continues the exact
+        # turn that requested the compaction.
+        return True, "failed_activity_changed"
+    ok, r4_facts = validate_binding(binding, cfg, paths, run_tmux, proc_root,
+                                    sessions_dir=sessions_dir)
+    if not ok:
+        return False, "R4_%s" % r4_facts
+    if lane == "boundary" and not _boundary_still_safe(
+            binding, run_tmux, activity_reader, activity_rev):
+        return False, "R4_boundary_changed"
+    if deadline_mono is not None and now_mono() >= deadline_mono:
+        return True, "skipped_deadline"
+    text = resume_nudge_text(width=r4_facts["width"])
+    rc, _, _ = _result(run_tmux(_tmux(
+        binding["socket"], ["send-keys", "-t", binding["pane_id"], "-l", text])))
+    if rc != 0:
+        return True, "failed_send"
+    snap, ok, why = None, False, None
+    for _ in range(R5_VERIFY_ATTEMPTS):
+        wait(0.4)
+        capture = capture_pane(binding, run_tmux, ansi=True)
+        snap = parse_pane(capture) if capture is not None else None
+        ok, why = validate_binding(binding, cfg, paths, run_tmux,
+                                   proc_root, sessions_dir=sessions_dir)
+        if not ok or snapshot_exact(snap, text):
+            break
+    if not ok or not snapshot_exact(snap, text):
+        # Typed bytes of a benign prompt may remain in the composer;
+        # they are visible to the human and clearable by the next
+        # compact attempt's own machinery. Never Enter without proof.
+        return True, ("failed_%s" % why) if not ok else "failed_verify"
+    # Re-prove the composer immediately before Enter (R6'-style): a
+    # keystroke landing after the R5 capture would otherwise be
+    # submitted along with the nudge.
+    capture = capture_pane(binding, run_tmux, ansi=True)
+    snap = parse_pane(capture) if capture is not None else None
+    if not snapshot_exact(snap, text):
+        return True, "failed_verify"
+    if expected_rev is not None:
+        # Both lanes: the same ended turn must still be the last word
+        # immediately before Enter.
+        if not _activity_unchanged(activity_reader, tuple(expected_rev)):
+            return True, "failed_activity_changed"
+    elif (lane == "boundary" and
+            not _activity_unchanged(activity_reader, activity_rev)):
+        return True, "failed_activity_changed"
+    if cursor is not None:
+        # R6'-parity re-observation (Sol round-2 #4): activity markers
+        # cannot see a /compact (local commands skip UserPromptSubmit),
+        # so the transcript and packet are re-proven immediately before
+        # Enter — a compaction that began or completed during the
+        # preflight/verify waits must veto the submission. An
+        # incomplete or failed rescan proves nothing and equally
+        # vetoes.
+        fresh = scan_cursor(dict(cursor), binding["transcript_path"])
+        if (fresh.get("_scan_error") or not fresh.get("caught_up") or
+                (expected_generation_k is not None and
+                 generation_key(generation(fresh)) !=
+                 expected_generation_k)):
+            return True, "failed_boundary_advanced"
+        if packet_loader is not None:
+            packet = packet_loader()
+            if packet and not boundary_confirmed_for_packet(packet, fresh):
+                return True, "failed_packet_pending"
+    if deadline_mono is not None and now_mono() >= deadline_mono:
+        return True, "skipped_deadline"
+    rc, _, _ = _result(run_tmux(_tmux(
+        binding["socket"], ["send-keys", "-t", binding["pane_id"], "Enter"])))
+    if rc != 0:
+        return True, "failed_enter"
+    wait(1.0)
+    after = capture_pane(binding, run_tmux, ansi=True)
+    if after is None:
+        return True, "submit_unverified"
+    if snapshot_exact(parse_pane(after), text):
+        return True, "submit_uncertain"
+    return True, "submitted"
 
 
 def validate_request(path, now=None):
@@ -2465,6 +2654,10 @@ class Watcher:
         self.wait = wait or (lambda seconds: time.sleep(seconds))
         self.stop_requested = False
         self.typed_critical = False
+        # In-memory only: a watcher restart drops a pending resume
+        # nudge (fail open — the session is exactly as idle as before
+        # the feature), and can never double-nudge.
+        self._pending_resume = None
         self._recovery_next = 0.0
         self._recovery_streak = 0
         self._recovery_attempt_id = None
@@ -3126,6 +3319,7 @@ class Watcher:
         save_cursor(self.paths["scan"], self.cursor)
         current_generation = generation(self.cursor)
         packet = load_layer1_packet(self.cfg, self.binding["session_id"])
+        self._maybe_resume_nudge(now, current_generation, packet)
         if self.attempt:
             previous = self.attempt.get("state")
             self.attempt = transition_attempt(
@@ -3147,6 +3341,63 @@ class Watcher:
                 # to end: refill the active-recovery budget.
                 self._active_recoveries = 0
                 self._active_exhausted_journaled = False
+                if (self.cfg.get("managed_resume_nudge") and
+                        self.attempt.get("trigger_source") == "request" and
+                        # A FRESH transition only: a watcher restart
+                        # resurrects the BOUNDARY_CONFIRMED tail and
+                        # re-enters this branch with previous already
+                        # confirmed — re-arming there could double-
+                        # nudge a boundary whose nudge was already
+                        # disposed (Sol round-1 #5).
+                        previous != "BOUNDARY_CONFIRMED"):
+                    # Manager-origin proof of THIS boundary: the
+                    # predecessor state must be the in-flight pair
+                    # (SUBMITTED/ACKED) AND the own-packet proof must
+                    # be stamped — previous==ACKED alone accepts a
+                    # foreign/native packet that replaced ours after
+                    # the ack, and a resolved latch's stale proof
+                    # would otherwise arm on a later human /compact
+                    # (Sol round-2 #3).
+                    if (previous in ("SUBMITTED", "ACKED") and
+                            self.attempt.get("own_packet_proof") is True):
+                        # The session asked for this compaction and
+                        # ended its turn expecting to continue;
+                        # /compact never re-invokes the model, so arm
+                        # one bounded resume nudge (typed on a later
+                        # tick, once the post-compaction repaint
+                        # settles). The binding revision is the one
+                        # observed when the instruction was TYPED —
+                        # the current pair must still match it, or a
+                        # turn slipped in during the compaction (Sol
+                        # round-2 #2).
+                        phase, revision = self._activity_reader()
+                        stored_submit = self.attempt.get(
+                            "activity_rev_at_submit")
+                        if (phase == "ended" and revision is not None and
+                                stored_submit is not None and
+                                list(revision) == list(stored_submit)):
+                            self._pending_resume = {
+                                "deadline_mono":
+                                    now + RESUME_NUDGE_WINDOW_S,
+                                "activity_rev": tuple(revision),
+                                "attempt_id":
+                                    self.attempt.get("attempt_id"),
+                                "generation_k": generation_key(
+                                    current_generation)}
+                        elif phase == "ended" and revision is not None:
+                            self._journal_resume_skip(
+                                "skipped_session_resumed")
+                        else:
+                            # No positive ended-turn evidence: the
+                            # nudge cannot be causally bound to the
+                            # requesting turn, so it is dropped —
+                            # never typed via the strict lane on
+                            # faith (Sol round-1 #2).
+                            self._journal_resume_skip(
+                                "skipped_no_ended_marker")
+                    else:
+                        self._journal_resume_skip(
+                            "skipped_unproven_boundary")
                 eff, trigger = self._thresholds()
                 pct = self.cursor.get("current", 0) / eff["context_window"]
                 if pct >= trigger - self.cfg["rearm_band_pct"]:
@@ -3263,6 +3514,102 @@ class Watcher:
         return read_activity(self.cfg, self.binding["session_id"],
                              self.binding["transcript_path"], self.wall())
 
+    def _resolve_resume(self, reason):
+        pending, self._pending_resume = self._pending_resume, None
+        journal_record(self.paths["journal"], "RESUME_NUDGE",
+                       {"attempt_id": pending.get("attempt_id"),
+                        "run_token": self.binding["run_token"]},
+                       reason=reason)
+
+    def _journal_resume_skip(self, reason):
+        """Forensic RESUME_NUDGE row for a boundary that never armed.
+        Best-effort: a journal surprise must not take down the tick."""
+        try:
+            journal_record(self.paths["journal"], "RESUME_NUDGE",
+                           {"attempt_id": (self.attempt or {}).get(
+                               "attempt_id"),
+                            "run_token": self.binding["run_token"]},
+                           reason=reason)
+        except Exception:
+            pass
+
+    def _maybe_resume_nudge(self, now, current_generation, packet):
+        """One bounded, benign continuation prompt after a REQUESTED
+        compaction's confirmed boundary. Terminal dispositions journal
+        a RESUME_NUDGE row (a state deliberately in neither
+        ATTEMPT_STATES nor LIFECYCLE_STATES: forensics only, invisible
+        to recovery, wedge verdicts, and status). Any surprise degrades
+        to dropping the nudge — it must never take the watcher down."""
+        if not self._pending_resume:
+            return
+        try:
+            if self.attempt and self.attempt.get("state") in (
+                    "TRIGGERED", "PREPARED", "TYPED_VERIFIED",
+                    "SUBMITTED", "ACKED"):
+                # A compact attempt owns the composer; never interleave.
+                return
+            deferred = (self.attempt is not None and
+                        self.attempt.get("state") == "DEFERRED")
+            if deferred and self.attempt.get("reason") == "foreign_packet":
+                # Durable knowledge of another compact in flight must
+                # outlive a transiently unreadable packet file (Sol
+                # round-2 N1).
+                self._resolve_resume("skipped_packet_pending")
+                return
+            if now >= self._pending_resume["deadline_mono"]:
+                # Checked BEFORE holding on other defers: an expired
+                # nudge must not stay pending (and keep fast polling)
+                # behind a long defer (Sol round-3).
+                self._resolve_resume("skipped_deadline")
+                return
+            if deferred:
+                # Any other defer just holds the nudge this tick.
+                return
+            if (generation_key(current_generation) !=
+                    self._pending_resume.get("generation_k")):
+                # A second boundary landed after arming (native, human,
+                # or foreign): this nudge belongs to a boundary that no
+                # longer exists (Sol round-1 #4).
+                self._resolve_resume("skipped_boundary_advanced")
+                return
+            if packet and not boundary_confirmed_for_packet(
+                    packet, self.cursor):
+                # Another compaction is in flight right now; a nudge
+                # would queue behind it and fire at ITS boundary.
+                self._resolve_resume("skipped_packet_pending")
+                return
+            phase, revision = self._activity_reader()
+            stored = self._pending_resume.get("activity_rev")
+            if phase == "running" or (
+                    revision is not None and stored is not None and
+                    list(revision) != list(stored)):
+                # A prompt is in flight (or a whole new turn already
+                # ran): the session resumed without us — the nudge
+                # would land mid-conversation, not at the stranded
+                # boundary it was armed for.
+                self._resolve_resume("skipped_session_resumed")
+                return
+            done, reason = type_resume_nudge(
+                self.binding, self.cfg, self.paths, self.run_tmux,
+                self.proc_root, self.wait,
+                activity_reader=self._activity_reader,
+                sessions_dir=self.sessions_dir, now_wall=self.wall,
+                expected_rev=stored,
+                deadline_mono=self._pending_resume["deadline_mono"],
+                now_mono=self.monotonic,
+                cursor=self.cursor,
+                expected_generation_k=self._pending_resume.get(
+                    "generation_k"),
+                packet_loader=lambda: load_layer1_packet(
+                    self.cfg, self.binding["session_id"]))
+            if done:
+                self._resolve_resume(reason)
+        except Exception:
+            try:
+                self._resolve_resume("failed_internal")
+            except Exception:
+                self._pending_resume = None
+
     def _activity_advanced(self):
         """A new ended turn marker makes an opportunity-deferred attempt
         due immediately — the input window just opened, and waiting out
@@ -3350,8 +3697,9 @@ class Watcher:
         Slow only when far below the trigger with nothing pending."""
         eff, trigger = self._thresholds()
         pct = self.cursor.get("current", 0) / eff["context_window"]
-        pending = (self.attempt is not None and self.attempt.get("state")
-                   in ("TRIGGERED", "DEFERRED", "SUBMITTED", "ACKED"))
+        pending = (self._pending_resume is not None or
+                   (self.attempt is not None and self.attempt.get("state")
+                    in ("TRIGGERED", "DEFERRED", "SUBMITTED", "ACKED")))
         if pct < trigger - 0.20 and not pending:
             return 60
         return self.cfg["managed_poll_s"]
@@ -3473,7 +3821,10 @@ def watcher_entry(args):
             return 1
         ok, detail = acquire_leases(paths, run_token, os.getpid(),
                                     live["starttime"],
-                                    ttl_days=cfg.get("state_ttl_days", 7))
+                                    ttl_days=cfg.get("state_ttl_days", 7),
+                                    extra={"resume_nudge": True}
+                                    if cfg.get("managed_resume_nudge")
+                                    else None)
         if not ok:
             _write_handshake(ready_fd, {"ok": False, "error": detail})
             return 1

@@ -32,6 +32,9 @@
 #       armed: the watcher clears it itself and submits
 #   s17 hard-multiline draft: whole region journaled, fully cleared,
 #       compact submits
+#   s18 resume nudge: session-requested compact -> boundary confirmed
+#       -> one continuation prompt typed, model turn starts; default-off
+#       pinned against the earlier request scenarios
 #   s16 queued /compact evidence pin (informational; watcher stopped)
 # Watchers have no time-based deadline; lifecycle ends are covered by
 # s06 (stop), s11 (claude death), and s13 (session rotation).
@@ -544,6 +547,137 @@ else
 fi
 wait_idle $SES 240 || true
 fi   # SKIP_S17
+
+# --- s18: resume nudge (managed_resume_nudge=1): a session-requested
+#     compaction's confirmed boundary is followed by ONE typed
+#     continuation prompt that provably starts a model turn (running
+#     marker revision advances). Boundary and nudge rows are
+#     correlated to the request's own attempt_id, so restart
+#     resurrection or unrelated attempts cannot satisfy the checks.
+#     Also pins the default: the earlier request compacts ran with the
+#     nudge off and must have journaled zero RESUME_NUDGE rows.
+grep -q '"state":"RESUME_NUDGE"' "$JN" \
+  && row s18_default_off fail "RESUME_NUDGE journaled while disabled" \
+  || row s18_default_off pass "no nudge rows under default config"
+# Barrier: never stop the watcher mid-attempt — an interrupted typed
+# attempt wedges CLEANUP_REQUIRED and poisons the re-adopt (run-1
+# lesson: s17's slow compact was still ACKED when s18 stopped it).
+s18_drained() { python3 - "$ROOT" "$JN" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1] + "/plugins/compact-manager/hooks")
+import managed
+tail = managed.attempt_tail(sys.argv[2])
+sys.exit(0 if not tail or tail.get("state") not in
+         ("TRIGGERED", "PREPARED", "TYPED_VERIFIED", "SUBMITTED", "ACKED")
+         else 1)
+EOF
+}
+# Drain what will drain, but PROCEED on timeout: a predecessor compact
+# stuck ACKED-forever (observed every run: an s15 /compact whose packet
+# lands but whose boundary never does) would otherwise skip s18 in
+# perpetuity. Proceeding is sound because the flow below explicitly
+# un-poisons the inherited state (stop -> resolve -> re-adopt -> manual
+# /compact latch clear -> fresh prime turn) and every assertion is
+# correlated to the NEW request's own attempt_id — a poisoned
+# predecessor can fail the scenario, never false-pass it.
+S18_GO=y
+wait_for 600 s18_drained || row s18_barrier info "prior attempt still in flight after 600s; proceeding via resolve + latch clear"
+if [ "$S18_GO" = y ]; then
+"$CMBIN" stop "$SID" >/dev/null 2>&1; sleep 2
+# A wedged or safety-latched tail from earlier scenarios blocks new
+# attempts: resolve it now (accepted once the watcher is dead), then
+# clear the operator_resolved latch with one manual /compact below.
+NEEDS_CLEAR=n
+if python3 - "$ROOT" "$JN" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1] + "/plugins/compact-manager/hooks")
+import managed
+tail = managed.recover_attempt(sys.argv[2], managed.boot_id())
+state = (tail or {}).get("state")
+sys.exit(0 if state in managed.ALERT_STATES else 1)
+EOF
+then
+  "$CMBIN" resolve "$SID" >/dev/null 2>&1 && NEEDS_CLEAR=y
+fi
+MSG="$(adopt "$PANE" COMPACT_MANAGER_MANAGED_TRIGGER_PCT=0.99 COMPACT_MANAGER_MANAGED_RESUME_NUDGE=1)"; RC=$?
+if [ $RC -eq 0 ]; then
+  wait_idle $SES 180 || true
+  if [ "$NEEDS_CLEAR" = y ]; then
+    # Wait for the JOURNALED boundary, not pane idleness: pane_idle
+    # can read idle before the compaction visibly starts, and a
+    # request written before the boundary lands is observed at the
+    # old, already-consumed generation — permanently starved under
+    # the one-request-per-generation rule (run-4 lesson).
+    LINESCLR=$(wc -l < "$JN")
+    tmux send-keys -t $SES -l "/compact"; sleep 1; tmux send-keys -t $SES Enter
+    s18_latch_cleared() { tail -n +$((LINESCLR+1)) "$JN" | grep -q '"state":"BOUNDARY_CONFIRMED"'; }
+    wait_for 360 s18_latch_cleared || row s18_latch_clear info "manual /compact boundary not confirmed in 360s"
+    wait_idle $SES 120 || true
+  fi
+  # A fresh short turn: current paired ended markers for the request's
+  # boundary lane, and a known pre-nudge running prompt_id. Both are
+  # load-bearing for the assertions below — a failed prime or a
+  # missing marker makes every later check unable to prove anything,
+  # so they FAIL the scenario instead of degrading it (run-1 audit:
+  # an empty PROMPT0 let the turn check false-pass).
+  S18_PRIMED=y
+  send_turn $SES "Reply with exactly one word: primed" 180 || S18_PRIMED=n
+  PROMPT0="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("prompt_id",""))' "$STATE/managed/activity/running-$SID.json" 2>/dev/null)"
+  if [ "$S18_PRIMED" = n ] || [ -z "$PROMPT0" ]; then
+    row s18_nudge_submitted fail "prime turn failed or no running marker (primed=$S18_PRIMED prompt0=${PROMPT0:-empty}); markers unusable"
+    S18_GO=n
+  fi
+  LINES18=$(wc -l < "$JN")
+  if [ "$S18_GO" = y ]; then
+  python3 - "$STATE" "$SID" <<'EOF'
+import json, os, sys
+state, sid = sys.argv[1], sys.argv[2]
+path = os.path.join(state, "managed", "requests", f"{sid}.json")
+tmp = path + ".tmp"
+json.dump({"request_id": "live-s18-request"}, open(tmp, "w"))
+os.replace(tmp, path)
+EOF
+  # The request's own attempt: the TRIGGERED row carrying the
+  # live-s18-request fingerprint names the attempt_id everything else
+  # must correlate to.
+  s18_attempt() { tail -n +$((LINES18+1)) "$JN" | grep '"state":"TRIGGERED"' | grep -q "live-s18-request"; }
+  A18=""
+  if wait_for 180 s18_attempt; then
+    A18="$(tail -n +$((LINES18+1)) "$JN" | grep '"state":"TRIGGERED"' | grep "live-s18-request" | tail -1 | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("attempt_id") or "")')"
+  fi
+  if [ -n "$A18" ]; then
+    s18_confirmed() { tail -n +$((LINES18+1)) "$JN" | grep '"state":"BOUNDARY_CONFIRMED"' | grep -q "\"attempt_id\":\"$A18\""; }
+    if wait_for 420 s18_confirmed; then
+      s18_nudged() { tail -n +$((LINES18+1)) "$JN" | grep '"state":"RESUME_NUDGE"' | grep "\"attempt_id\":\"$A18\"" | grep -q '"reason":"submitted"'; }
+      if wait_for 240 s18_nudged; then
+        row s18_nudge_submitted pass "attempt=$A18"
+        # Model-turn proof: the nudge's submission fires
+        # UserPromptSubmit, whose running marker carries a NEW
+        # prompt_id — scrollback text alone could false-pass.
+        s18_turn() {
+          P1="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("prompt_id",""))' "$STATE/managed/activity/running-$SID.json" 2>/dev/null)"
+          [ -n "$P1" ] && [ "$P1" != "$PROMPT0" ]
+        }
+        wait_for 90 s18_turn && row s18_turn_started pass "running marker advanced" \
+          || row s18_turn_started fail "running prompt_id never advanced past $PROMPT0"
+        N18="$(tail -n +$((LINES18+1)) "$JN" | grep -c '"state":"RESUME_NUDGE"')"
+        [ "$N18" = 1 ] && row s18_nudge_once pass \
+          || row s18_nudge_once fail "expected exactly one RESUME_NUDGE row, got $N18"
+      else
+        row s18_nudge_submitted fail "no RESUME_NUDGE/submitted for attempt $A18 within 240s: $(tail -3 "$JN" | tr '\n' ' ' | head -c 300)"
+      fi
+    else
+      row s18_nudge_submitted fail "request compact never confirmed for attempt $A18: $(tail -3 "$JN" | tr '\n' ' ' | head -c 300)"
+    fi
+  else
+    row s18_nudge_submitted fail "request never became an attempt: $(tail -3 "$JN" | tr '\n' ' ' | head -c 300)"
+  fi
+  fi   # S18_GO (prime + marker)
+  wait_idle $SES 240 || true
+else
+  row s18_nudge_submitted fail "re-adopt rc=$RC $MSG"
+fi
+fi   # S18_GO (drain barrier)
 
 # --- s16: queued /compact evidence pin (Sol: prerequisite for any
 #     future unattended queue fallback — NOT shipped behavior). Watcher

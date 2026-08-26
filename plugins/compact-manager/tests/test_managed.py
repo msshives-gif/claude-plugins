@@ -5309,3 +5309,555 @@ class SolRound4FixTests(unittest.TestCase):
             base.tick(watcher)
         self.assertIsNotNone(watcher.attempt)
         self.assertNotIn("RECOVERED", base.journal_states())
+
+
+class ResumeNudgeConfigTests(unittest.TestCase):
+    def test_default_off(self):
+        cfg = managed.load_config(base=dict(cm._DEFAULTS), environ={})
+        self.assertFalse(cfg["managed_resume_nudge"])
+
+    def test_env_enables_and_falsey_spellings_disable(self):
+        for value, expect in (("1", True), ("true", True), ("yes", True),
+                              ("on", True), ("0", False), ("off", False),
+                              ("", False), ("false", False), ("no", False)):
+            cfg = managed.load_config(
+                base=dict(cm._DEFAULTS),
+                environ={"COMPACT_MANAGER_MANAGED_RESUME_NUDGE": value})
+            self.assertEqual(cfg["managed_resume_nudge"], expect, value)
+
+    def test_malformed_values_read_as_default_off(self):
+        # Default-OFF automation knob: misspellings and non-bool types
+        # must never enable it (Sol round-1 #8).
+        for value in ("flase", "enabled", "2", [1], {"on": True}, 1, 3.5):
+            with tempfile.TemporaryDirectory() as temp:
+                path = os.path.join(temp, "config.json")
+                with open(path, "w") as fh:
+                    json.dump({"managed_resume_nudge": value}, fh)
+                cfg = managed.load_config(
+                    base=dict(cm._DEFAULTS),
+                    environ={"COMPACT_MANAGER_CONFIG": path})
+            self.assertFalse(cfg["managed_resume_nudge"], repr(value))
+
+    def test_lease_extra_survives_heartbeat(self):
+        # The watcher publishes its effective nudge setting in the
+        # lease so the advisor's promise reflects the RUNNING watcher
+        # (Sol round-1 #6); heartbeats must not strip it.
+        with tempfile.TemporaryDirectory() as temp:
+            proc = os.path.join(temp, "proc")
+            write_proc(proc, 20, 20, 2020)
+            cfg = managed.load_config(
+                base=dict(cm._DEFAULTS, state_dir=temp), environ={})
+            paths = managed.managed_paths(cfg, "session-lease", "s", "%9")
+            ok, _ = managed.acquire_leases(
+                paths, "c" * 16, 20, 2020, proc_root=proc,
+                extra={"resume_nudge": True})
+            self.assertTrue(ok)
+            lease, _ = managed.read_json_inode(paths["session_lease"])
+            self.assertIs(lease.get("resume_nudge"), True)
+            self.assertTrue(managed.heartbeat_leases(paths, "c" * 16))
+            lease, _ = managed.read_json_inode(paths["session_lease"])
+            self.assertIs(lease.get("resume_nudge"), True)
+
+    def test_json_null_falls_back_to_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "config.json")
+            with open(path, "w") as fh:
+                json.dump({"managed_resume_nudge": None}, fh)
+            cfg = managed.load_config(
+                base=dict(cm._DEFAULTS),
+                environ={"COMPACT_MANAGER_CONFIG": path})
+        self.assertFalse(cfg["managed_resume_nudge"])
+
+    def test_text_fits_or_falls_back(self):
+        full = managed.resume_nudge_text(width=200)
+        self.assertEqual(full, managed.RESUME_NUDGE_TEMPLATE)
+        short = managed.resume_nudge_text(width=40)
+        self.assertEqual(short, managed.RESUME_NUDGE_TEMPLATE_SHORT)
+        # Both templates must obey the adopt-mode shell denylist.
+        for text in (full, short):
+            self.assertFalse(
+                any(ch in text for ch in managed.INSTRUCTION_DENYLIST), text)
+
+
+class TypeResumeNudgeTests(RunLadderTests):
+    """type_resume_nudge under the same pane seams as the ladder."""
+
+    def setUp(self):
+        super().setUp()
+        self.marker_payload = {"session_id": self.sid,
+                               "prompt_id": "prompt-res1",
+                               "transcript_path": self.transcript}
+        self.nudge = managed.resume_nudge_text(width=120)
+
+    def write_pair(self):
+        managed.write_activity(self.cfg, self.marker_payload, "running")
+        managed.write_activity(self.cfg, self.marker_payload, "ended")
+
+    def nudge_call(self, tmux, **kw):
+        return managed.type_resume_nudge(
+            self.binding, self.cfg, self.paths, tmux, self.proc,
+            wait=lambda seconds: None,
+            activity_reader=lambda: managed.read_activity(
+                self.cfg, self.sid, self.transcript),
+            now_wall=lambda: time.time() + 5, **kw)
+
+    def test_boundary_lane_submits(self):
+        self.write_pair()
+        tmux = LadderTmux([BUSY_IDLE, BUSY_IDLE, BUSY_IDLE,
+                           BUSY_IDLE + self.nudge, BUSY_IDLE + self.nudge,
+                           BUSY_IDLE])
+        done, reason = self.nudge_call(tmux)
+        self.assertEqual((done, reason), (True, "submitted"))
+        self.assertEqual(len(tmux.enters()), 1)
+        self.assertTrue(any(a[-1] == self.nudge for a in tmux.sent))
+
+    def test_strict_lane_submits_without_markers(self):
+        # Function-level seam only: expected_rev=None skips the causal
+        # binding. The WATCHER never calls it this way — arming already
+        # requires positive ended-marker evidence and always passes the
+        # armed revision (pinned in ResumeNudgeWiringTests).
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.nudge,
+                           IDLE + self.nudge, IDLE])
+        done, reason = self.nudge_call(tmux)
+        self.assertEqual((done, reason), (True, "submitted"))
+
+    def test_human_draft_stands_down_without_keystrokes(self):
+        # Unlike the compact ladder, the nudge must NEVER clear (or
+        # submit on top of) visible composer input — a draft is a
+        # terminal stand-down even with clearing enabled in config.
+        self.write_pair()
+        tmux = LadderTmux([BUSY_IDLE + "half typed"])
+        done, reason = self.nudge_call(tmux)
+        self.assertEqual((done, reason), (True, "skipped_composer_nonempty"))
+        self.assertEqual(tmux.sent, [])
+
+    def test_running_turn_is_transient(self):
+        managed.write_activity(self.cfg, self.marker_payload, "running")
+        tmux = LadderTmux([IDLE])
+        done, reason = self.nudge_call(tmux)
+        self.assertEqual((done, reason), (False, "R2_activity_running"))
+        self.assertEqual(tmux.sent, [])
+
+    def test_verify_mismatch_never_enters(self):
+        self.write_pair()
+        tmux = LadderTmux([BUSY_IDLE, BUSY_IDLE, BUSY_IDLE])
+        done, reason = self.nudge_call(tmux)
+        self.assertEqual((done, reason), (True, "failed_verify"))
+        self.assertEqual(tmux.enters(), [])
+
+    def test_expected_rev_mismatch_is_terminal_before_typing(self):
+        # The causal binding: a revision other than the one armed with
+        # must never be typed against, even via the strict lane (Sol
+        # round-1 #2).
+        self.write_pair()
+        tmux = LadderTmux([IDLE, IDLE, IDLE])
+        done, reason = self.nudge_call(
+            tmux, expected_rev=("prompt-other", 1.0, "prompt-other", 2.0))
+        self.assertEqual((done, reason), (True, "failed_activity_changed"))
+        self.assertEqual(tmux.sent, [])
+
+    def test_expected_rev_bound_submission(self):
+        self.write_pair()
+        rev = managed.read_activity(self.cfg, self.sid, self.transcript)[1]
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.nudge,
+                           IDLE + self.nudge, IDLE])
+        done, reason = self.nudge_call(tmux, expected_rev=rev)
+        self.assertEqual((done, reason), (True, "submitted"))
+
+    def test_deadline_checked_before_first_byte(self):
+        # A call admitted at the window's edge must not type after
+        # expiry (Sol round-1 #7).
+        self.write_pair()
+        tmux = LadderTmux([IDLE])
+        done, reason = self.nudge_call(
+            tmux, deadline_mono=100.0, now_mono=lambda: 200.0)
+        self.assertEqual((done, reason), (True, "skipped_deadline"))
+        self.assertEqual(tmux.sent, [])
+
+    def test_deadline_checked_before_enter(self):
+        # Expiry between typing and Enter: bytes may sit in the
+        # composer, but Enter is never pressed.
+        self.write_pair()
+        clock = iter([50.0, 200.0])
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.nudge,
+                           IDLE + self.nudge, IDLE])
+        done, reason = self.nudge_call(
+            tmux, deadline_mono=100.0, now_mono=lambda: next(clock))
+        self.assertEqual((done, reason), (True, "skipped_deadline"))
+        self.assertTrue(any(a[-1] == self.nudge for a in tmux.sent))
+        self.assertEqual(tmux.enters(), [])
+
+    def test_boundary_advanced_before_enter_vetoes(self):
+        # R6'-parity: a compaction completing during the verify waits
+        # is invisible to activity markers — the fresh transcript scan
+        # must veto Enter (Sol round-2 #4).
+        self.write_pair()
+        expected_k = managed.generation_key(managed.generation(self.cursor))
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.nudge,
+                           IDLE + self.nudge, IDLE])
+        append_rows(self.transcript, [boundary_row(post=10)])
+        done, reason = managed.type_resume_nudge(
+            self.binding, self.cfg, self.paths, tmux, self.proc,
+            wait=lambda seconds: None,
+            activity_reader=lambda: managed.read_activity(
+                self.cfg, self.sid, self.transcript),
+            now_wall=lambda: time.time() + 5,
+            cursor=self.cursor, expected_generation_k=expected_k)
+        self.assertEqual((done, reason), (True, "failed_boundary_advanced"))
+        self.assertEqual(tmux.enters(), [])
+
+    def test_unconfirmed_packet_before_enter_vetoes(self):
+        # A compaction beginning during the verify waits: its packet
+        # has no confirmed boundary yet — never Enter behind it.
+        self.write_pair()
+        expected_k = managed.generation_key(managed.generation(self.cursor))
+        packet = {"seq": 3, "trigger": "manual",
+                  "base_compaction_count":
+                      self.cursor.get("boundary_count", 0),
+                  "custom_instructions": ""}
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.nudge,
+                           IDLE + self.nudge, IDLE])
+        done, reason = managed.type_resume_nudge(
+            self.binding, self.cfg, self.paths, tmux, self.proc,
+            wait=lambda seconds: None,
+            activity_reader=lambda: managed.read_activity(
+                self.cfg, self.sid, self.transcript),
+            now_wall=lambda: time.time() + 5,
+            cursor=self.cursor, expected_generation_k=expected_k,
+            packet_loader=lambda: packet)
+        self.assertEqual((done, reason), (True, "failed_packet_pending"))
+        self.assertEqual(tmux.enters(), [])
+
+    def test_run_ladder_stamps_submit_revision(self):
+        # The nudge's causal binding starts here: the revision current
+        # when the instruction was typed rides on the attempt.
+        self.write_pair()
+        rev = managed.read_activity(self.cfg, self.sid, self.transcript)[1]
+        tmux = LadderTmux([IDLE, IDLE, IDLE + self.text,
+                           IDLE + self.text, IDLE])
+        out = managed.run_ladder(
+            self.binding, self.cfg, self.paths, self.attempt, self.cursor,
+            self.paths["journal"], lambda: None, tmux, self.proc,
+            wait=lambda seconds: None, now_mono=lambda: 0.0,
+            boundary_ok=True,
+            activity_reader=lambda: managed.read_activity(
+                self.cfg, self.sid, self.transcript),
+            now_wall=lambda: time.time() + 5)
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(out.get("activity_rev_at_submit"), list(rev))
+
+
+class AdvisorPromiseTests(unittest.TestCase):
+    """The advisory's restart promise comes only from a LIVE attached
+    lease that positively reports the nudge enabled (Sol round-2 N2)."""
+
+    def setUp(self):
+        import advisor
+        self.advisor = advisor
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cfg = {"state_dir": self.temp.name}
+        self.sid = "session-adv1"
+        self.lease_path = os.path.join(
+            self.temp.name, "managed", "leases",
+            "session-%s.json" % self.sid)
+
+    def write_lease(self, **fields):
+        # A genuinely live default identity (this test process): the
+        # promise requires positive process liveness on the REAL /proc.
+        me = managed.proc_stat(os.getpid()) or {}
+        record = {"run_token": "e" * 16, "pid": os.getpid(),
+                  "proc_start": me.get("starttime", 1),
+                  "heartbeat_at": time.time()}
+        record.update(fields)
+        cm._private_makedirs(os.path.dirname(self.lease_path))
+        managed._atomic_json(self.lease_path, record)
+
+    def test_live_flagged_lease_promises(self):
+        self.write_lease(resume_nudge=True)
+        self.assertIn("Resume nudge is ON",
+                      self.advisor.resume_nudge_promise(self.cfg, self.sid))
+
+    def test_live_unflagged_lease_stays_silent(self):
+        self.write_lease()
+        self.assertEqual(
+            self.advisor.resume_nudge_promise(self.cfg, self.sid), "")
+
+    def test_non_boolean_flag_stays_silent(self):
+        self.write_lease(resume_nudge="yes")
+        self.assertEqual(
+            self.advisor.resume_nudge_promise(self.cfg, self.sid), "")
+
+    def test_missing_lease_stays_silent(self):
+        self.assertEqual(
+            self.advisor.resume_nudge_promise(self.cfg, self.sid), "")
+
+    def test_dead_lease_stays_silent(self):
+        # Stale heartbeat + a pid that is not live: not attached.
+        self.write_lease(resume_nudge=True, pid=2 ** 22 + 12345,
+                         heartbeat_at=time.time() - 3600)
+        self.assertEqual(
+            self.advisor.resume_nudge_promise(self.cfg, self.sid), "")
+
+    def test_fresh_heartbeat_dead_process_stays_silent(self):
+        # lease_attached trusts a fresh heartbeat alone; the promise
+        # must additionally require POSITIVE process liveness — a
+        # watcher can die milliseconds after a heartbeat (Sol round-3
+        # N2).
+        self.write_lease(resume_nudge=True, pid=2 ** 22 + 12345,
+                         heartbeat_at=time.time())
+        self.assertEqual(
+            self.advisor.resume_nudge_promise(self.cfg, self.sid), "")
+
+
+class ResumeNudgeWiringTests(TickWiringTests):
+    """End-to-end: request-triggered boundary arms the nudge; the next
+    tick types it; threshold boundaries and disabled config never do."""
+
+    def confirmed_watcher(self, trigger, tmux, state="SUBMITTED",
+                          proof=True, markers=True, **kw):
+        rows = [usage_row(170000), boundary_row(post=5000)]
+        self.cfg["managed_resume_nudge"] = kw.pop("nudge_cfg", True)
+        watcher = self.make_watcher(rows, tmux, **kw)
+        if markers:
+            payload = {"session_id": self.sid, "prompt_id": "prompt-req1",
+                       "transcript_path": self.transcript}
+            managed.write_activity(self.cfg, payload, "running")
+            managed.write_activity(self.cfg, payload, "ended")
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(managed.default_cursor()),
+            0, 0.0, "boot", trigger)
+        watcher.attempt["state"] = state
+        if proof:
+            # A fast completion's own-packet proof: the confirmed
+            # boundary is provably OURS, the arming precondition.
+            watcher.attempt["own_packet_proof"] = True
+        if markers:
+            # The revision observed when the request instruction was
+            # typed — arming requires the current pair to still equal
+            # it (Sol round-2 #2).
+            rev = managed.read_activity(self.cfg, self.sid,
+                                        self.transcript)[1]
+            watcher.attempt["activity_rev_at_submit"] = (
+                list(rev) if rev else None)
+        watcher.attempt["timers"]["ack_deadline_mono"] = 10 ** 9
+        return watcher
+
+    def nudge_rows(self):
+        return [r for r in managed.read_journal(self.paths["journal"])
+                if r.get("state") == "RESUME_NUDGE"]
+
+    def test_request_boundary_arms_and_types(self):
+        tmux = EchoTmux()
+        watcher = self.confirmed_watcher("request", tmux)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+        self.assertIsNotNone(watcher._pending_resume)
+        self.assertIsNone(watcher.attempt)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+        self.assertIsNone(watcher._pending_resume)
+        rows = self.nudge_rows()
+        self.assertEqual([r.get("reason") for r in rows], ["submitted"])
+        nudge = managed.resume_nudge_text(width=120)
+        self.assertTrue(any("-l" in a and a[-1] == nudge
+                            for a in tmux.sent))
+        self.assertTrue(any(a[-1] == "Enter" for a in tmux.sent))
+
+    def test_threshold_boundary_never_arms(self):
+        watcher = self.confirmed_watcher("threshold", EchoTmux())
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        watcher.tick()
+        self.assertEqual(self.nudge_rows(), [])
+
+    def test_disabled_config_never_arms(self):
+        watcher = self.confirmed_watcher("request", EchoTmux(),
+                                         nudge_cfg=False)
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+
+    def test_foreign_boundary_never_arms(self):
+        # A human or native /compact winning after the request attempt
+        # began advances the generation without manager-origin proof:
+        # nudging there would restart the model behind the human's
+        # back (Sol round-1 #3).
+        watcher = self.confirmed_watcher("request", EchoTmux(),
+                                         state="DEFERRED", proof=False)
+        watcher.attempt["reason"] = "foreign_packet"
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_unproven_boundary"])
+
+    def test_acked_without_own_proof_never_arms(self):
+        # ACKED alone is not proof of THIS boundary: a foreign/native
+        # packet can replace ours after the ack (Sol round-2 #3).
+        watcher = self.confirmed_watcher("request", EchoTmux(),
+                                         state="ACKED", proof=False)
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_unproven_boundary"])
+
+    def test_resolved_latch_stale_proof_never_arms(self):
+        # resolve_session preserves own_packet_proof; a later human
+        # /compact moving the resolved attempt LATCHED->confirmed must
+        # not arm on that stale proof (Sol round-2 #3).
+        watcher = self.confirmed_watcher("request", EchoTmux(),
+                                         state="LATCHED")
+        watcher.attempt["latch_kind"] = "SAFETY"
+        watcher.attempt["reason"] = "operator_resolved"
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_unproven_boundary"])
+
+    def test_turn_between_submit_and_boundary_never_arms(self):
+        # A turn that slipped in during the compaction: the current
+        # ended pair no longer equals the revision observed when the
+        # request instruction was typed (Sol round-2 #2).
+        watcher = self.confirmed_watcher("request", EchoTmux())
+        payload = {"session_id": self.sid, "prompt_id": "prompt-late9",
+                   "transcript_path": self.transcript}
+        managed.write_activity(self.cfg, payload, "running")
+        managed.write_activity(self.cfg, payload, "ended")
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_session_resumed"])
+
+    def test_deferred_foreign_attempt_cancels_pending(self):
+        # Durable in-flight knowledge outlives a transiently unreadable
+        # packet file (Sol round-2 N1).
+        watcher = self.make_watcher([usage_row(50)], EchoTmux())
+        watcher.tick()   # catch up the cursor
+        watcher._pending_resume = {
+            "deadline_mono": time.monotonic() + 1000,
+            "activity_rev": ("p", 1.0, "p", 2.0), "attempt_id": "att-res",
+            "generation_k": managed.generation_key(
+                managed.generation(watcher.cursor))}
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(watcher.cursor), 0, 0.0, "boot")
+        watcher.attempt.update(state="DEFERRED", reason="foreign_packet")
+        watcher.attempt["timers"]["next_attempt_at"] = 10 ** 9
+        watcher.attempt["timers"]["foreign_deadline_mono"] = 10 ** 9
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_packet_pending"])
+
+    def test_restart_resurrected_boundary_never_rearms(self):
+        # A watcher restart resurrects the BOUNDARY_CONFIRMED tail;
+        # re-entering the branch with previous already confirmed must
+        # not re-arm (double nudge — Sol round-1 #5).
+        watcher = self.confirmed_watcher("request", EchoTmux(),
+                                         state="BOUNDARY_CONFIRMED")
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+
+    def test_marker_less_boundary_drops_nudge_with_journal(self):
+        # No positive ended-turn evidence: the nudge cannot be bound
+        # to the requesting turn — dropped, never typed on faith via
+        # the strict lane (Sol round-1 #2).
+        watcher = self.confirmed_watcher("request", EchoTmux(),
+                                         markers=False)
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_no_ended_marker"])
+        watcher.tick()
+        self.assertEqual(len(self.nudge_rows()), 1)  # journaled once
+
+    def test_generation_advance_cancels_pending(self):
+        # A second boundary after arming: the armed nudge belongs to a
+        # boundary that no longer exists (Sol round-1 #4).
+        watcher = self.make_watcher([usage_row(50)], EchoTmux())
+        watcher.tick()   # catch up the cursor
+        watcher._pending_resume = {
+            "deadline_mono": time.monotonic() + 1000,
+            "activity_rev": ("p", 1.0, "p", 2.0),
+            "attempt_id": "att-res", "generation_k": "stale-generation"}
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_boundary_advanced"])
+
+    def test_deadline_expires_behind_nonforeign_defer(self):
+        # An expired nudge must not stay pending (and keep fast
+        # polling) behind a long non-foreign defer (Sol round-3).
+        watcher = self.make_watcher([usage_row(50)], EchoTmux())
+        watcher.tick()   # catch up the cursor
+        watcher._pending_resume = {"deadline_mono": 0.0,
+                                   "activity_rev": ("p", 1.0, "p", 2.0),
+                                   "attempt_id": "att-res",
+                                   "generation_k": managed.generation_key(
+                                       managed.generation(watcher.cursor))}
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(watcher.cursor), 0, 0.0, "boot")
+        watcher.attempt.update(state="DEFERRED", reason="R3_changed",
+                               defer_class="opportunity")
+        watcher.attempt["timers"]["next_attempt_at"] = 10 ** 9
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_deadline"])
+
+    def test_inflight_packet_cancels_pending(self):
+        # Another compaction in flight while armed: the nudge would
+        # queue behind it and fire at ITS boundary (Sol round-1 #4).
+        watcher = self.make_watcher([usage_row(50)], EchoTmux())
+        watcher.tick()   # catch up the cursor
+        packet_file = managed.packet_path(self.cfg, self.sid)
+        cm._private_makedirs(os.path.dirname(packet_file))
+        with open(packet_file, "w") as fh:
+            json.dump({"seq": 9, "trigger": "manual",
+                       "base_compaction_count":
+                           watcher.cursor.get("boundary_count", 0),
+                       "custom_instructions": ""}, fh)
+        watcher._pending_resume = {
+            "deadline_mono": time.monotonic() + 1000,
+            "activity_rev": ("p", 1.0, "p", 2.0),
+            "attempt_id": "att-res",
+            "generation_k": managed.generation_key(
+                managed.generation(watcher.cursor))}
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_packet_pending"])
+
+    def test_deadline_expiry_journals_and_disarms(self):
+        watcher = self.make_watcher([usage_row(50)], EchoTmux())
+        watcher.cursor["caught_up"] = True
+        watcher._pending_resume = {"deadline_mono": 0.0,
+                                   "activity_rev": None,
+                                   "attempt_id": "att-res"}
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_deadline"])
+
+    def test_new_prompt_cancels_nudge(self):
+        watcher = self.make_watcher([usage_row(50)], EchoTmux())
+        watcher.tick()   # catch up the cursor
+        managed.write_activity(
+            self.cfg, {"session_id": self.sid, "prompt_id": "prompt-new1",
+                       "transcript_path": self.transcript}, "running")
+        watcher._pending_resume = {
+            "deadline_mono": time.monotonic() + 1000,
+            "activity_rev": ("p", 1.0, "p", 2.0), "attempt_id": "att-res",
+            "generation_k": managed.generation_key(
+                managed.generation(watcher.cursor))}
+        watcher.tick()
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_session_resumed"])
+
+    def test_nudge_rows_invisible_to_recovery_and_wedge(self):
+        watcher = self.confirmed_watcher("request", EchoTmux())
+        watcher.tick()
+        watcher.tick()
+        self.assertEqual(
+            managed.wedge_verdict(self.cfg, self.sid)[0], "clear")
+        tail = managed.recover_attempt(self.paths["journal"], "boot")
+        self.assertNotEqual((tail or {}).get("state"), "RESUME_NUDGE")

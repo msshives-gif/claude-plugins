@@ -110,6 +110,25 @@ restore the old strictly-hands-off behavior. If anything is ambiguous
 `status`, and waits — pressing Enter is never authorized by anything
 less than the full byte-exact verification chain.
 
+One optional follow-through, off by default: `/compact` never
+re-invokes the model, so an autonomous session that *requests* its own
+compaction at a turn boundary ends its turn expecting to continue and
+then sits idle until a human prompts it. With `managed_resume_nudge`
+set to `true`, after a **session-requested** compaction's boundary is
+confirmed the watcher types one short continuation prompt (`continue
+[compact-manager resume nudge …]`) and presses Enter, under the same
+pane checks as `/compact` itself. Threshold-triggered compactions
+never nudge, and neither does a boundary the watcher cannot prove it
+caused (a human or native `/compact` winning the race) — restarting
+the model behind a human's back is not this feature. Every keystroke
+is causally bound to the exact turn that requested the compaction
+(positive turn-marker evidence is required; marker-less sessions never
+nudge). The nudge is bounded (one 180s window per boundary, rechecked
+before every key), stands down permanently if it finds anything in the
+input line, cancels itself if the session resumes some other way or
+another compaction intervenes, and on any failure simply leaves the
+session as idle as it would have been anyway.
+
 Honest risk note, because you must pass `--attended` to acknowledge
 it: on a pane you're actively typing in, there is an unavoidable
 millisecond-scale window where, in a worst-case race, the `/compact`
@@ -270,6 +289,7 @@ Managed-mode knobs (all clamped to safe ranges):
 | `managed_completion_timeout_s` | `300` | Command received but compaction never finished → stop and alert. |
 | `managed_pane_commands` | `["claude"]` | Only type into a pane running one of these. |
 | `managed_clear_composer` | `true` | Clear unsubmitted composer text (bounded `C-e`,`C-u`,`Backspace` rounds, journaled with an excerpt) when a compaction is due or a typed-bytes wedge is recoverable. `false` restores the strictly-hands-off contract. |
+| `managed_resume_nudge` | `false` | After a **session-requested** compaction's boundary is confirmed, type one continuation prompt so an autonomous session resumes instead of idling. Threshold compactions never nudge. Bounded, never clears input, journaled (`RESUME_NUDGE`). |
 
 ## How it works / limitations
 
