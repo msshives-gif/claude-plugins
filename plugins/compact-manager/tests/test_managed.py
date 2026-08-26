@@ -931,6 +931,25 @@ class JournalRecoveryTests(unittest.TestCase):
         self.assertEqual((out["state"], out["latch_kind"], out["reason"]),
                          ("LATCHED", "SAFETY", "unproven_boot_timer"))
 
+    def test_recovered_tail_maps_to_no_attempt(self):
+        # A durable RECOVERED record ends the wedge: a restart must
+        # start fresh, never resurrect the CLEANUP_REQUIRED beneath it.
+        self.record("CLEANUP_REQUIRED")
+        self.record("RECOVERED")
+        self.assertIsNone(managed.recover_attempt(self.path, "boot-a"))
+
+    def test_journal_tail_records_reads_only_the_tail(self):
+        # The cheap tail reader must survive a partial first line in
+        # its window and still return the newest records.
+        for _ in range(600):
+            self.record("DEFERRED")
+        self.record("CLEANUP_REQUIRED")
+        records = managed.journal_tail_records(self.path, max_bytes=8192)
+        self.assertTrue(records)
+        self.assertEqual(records[-1]["state"], "CLEANUP_REQUIRED")
+        self.assertIsNone(managed.journal_tail_records(
+            self.path + ".missing"))
+
 
 class RequestConfigInstructionTests(unittest.TestCase):
     def setUp(self):
@@ -1267,6 +1286,17 @@ class RunLadderTests(unittest.TestCase):
         self.assertEqual(out["state"], "CLEANUP_REQUIRED")
         self.assertEqual(out["reason"], "R5_composer_mismatch")
         self.assertEqual(tmux.enters(), [])
+
+    def test_r5_transient_repaint_retries_capture_then_submits(self):
+        # A background repaint racing the first verify capture must not
+        # terminalize a healthy attempt (observed live 2026-08-25) — a
+        # re-capture sees the typed line and the ladder proceeds; R6'
+        # still re-proves everything before Enter.
+        tmux = LadderTmux([IDLE, IDLE, "mid-repaint frame",
+                           IDLE + self.text, IDLE + self.text, IDLE])
+        out = self.run_ladder(tmux)
+        self.assertEqual(out["state"], "SUBMITTED")
+        self.assertEqual(len(tmux.enters()), 1)
 
     def test_r6_foreign_packet_aborts_before_enter(self):
         tmux = LadderTmux([IDLE, IDLE, IDLE + self.text, IDLE + self.text])
@@ -3495,3 +3525,720 @@ class RequestOverridesLatchTests(TickWiringTests):
         self.assertTrue(keep)
         self.assertIsNotNone(watcher.attempt)
         self.assertEqual(watcher.attempt.get("trigger_source"), "request")
+
+
+class WedgeRecoveryTests(unittest.TestCase):
+    """Self-recovery from CLEANUP_REQUIRED/R5_composer_mismatch: a
+    baseline round, then two clean read-only probes re-arm the watcher.
+    Recovery demands transcript growth since the wedge (a running
+    session provably consumed any queued tty input), a schedulable
+    leader, and a commit-time journal re-check under the txn lock; any
+    observable trace of the typed bytes blocks it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.proc = os.path.join(self.temp.name, "proc")
+        write_proc(self.proc, 10, 20, 1010)
+        write_proc(self.proc, 20, 20, 2020)
+        self.cfg = managed.load_config(
+            base=dict(cm._DEFAULTS, state_dir=self.temp.name,
+                      context_window=200_000), environ={})
+        self.sid = "session-1234"
+        self.token = "a" * 16
+        self.paths = managed.managed_paths(self.cfg, self.sid, "sock", "%1")
+        lease = {"run_token": self.token, "pid": 20, "proc_start": 2020,
+                 "heartbeat_at": time.time()}
+        managed._atomic_json(self.paths["session_lease"], lease)
+        managed._atomic_json(self.paths["pane_lease"], lease)
+        self.transcript = os.path.join(self.temp.name, "t.jsonl")
+        self.binding = {"socket": "sock", "pane_id": "%1",
+                        "pane_tty": "/dev/pts/7", "pane_root_pid": 10,
+                        "pane_root_start": 1010, "claude_pid": 20,
+                        "claude_start": 2020, "session_id": self.sid,
+                        "transcript_path": self.transcript,
+                        "tmux_session_id": "$1", "run_token": self.token,
+                        "attended": True}
+        self.now = 1000.0
+
+    def arm_activity(self, prompt_id="prompt-aaa1", stop_hook_active=None):
+        # Recovery probes demand a provably ENDED turn — the same
+        # marker-pair evidence the boundary lane trusts.
+        payload = {"session_id": self.sid, "prompt_id": prompt_id,
+                   "transcript_path": self.transcript}
+        managed.write_activity(self.cfg, payload, "running")
+        if stop_hook_active is not None:
+            payload = dict(payload, stop_hook_active=stop_hook_active)
+        managed.write_activity(self.cfg, payload, "ended")
+
+    def wedge(self, reason="R5_composer_mismatch"):
+        self.arm_activity()
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      self.transcript)
+        attempt = managed.new_attempt(
+            self.token, managed.generation(cursor), 0, 0.0, "boot")
+        attempt.update(state="CLEANUP_REQUIRED", reason=reason)
+        managed.journal_record(self.paths["journal"], "CLEANUP_REQUIRED",
+                               attempt, reason=reason)
+        return attempt
+
+    def make_watcher(self, tmux, wall=None):
+        kw = {"wall": wall} if wall is not None else {}
+        return managed.Watcher(self.binding, self.cfg, self.paths,
+                               run_tmux=tmux, proc_root=self.proc,
+                               monotonic=lambda: self.now,
+                               wait=lambda seconds: None, **kw)
+
+    def tick(self, watcher):
+        result = watcher.tick()
+        self.now += managed.RECOVERY_POLL_S + 1
+        return result
+
+    def settle(self, watcher, prompt_id="prompt-post-1"):
+        """Baseline round, quarantined snapshot round, then transcript
+        growth and a POST-snapshot pair — probes only trust a running
+        identity that changed after the quarantined snapshot."""
+        result = self.tick(watcher)             # baseline round
+        self.tick(watcher)                      # snapshot round
+        append_rows(self.transcript, [usage_row(51)])
+        self.arm_activity(prompt_id=prompt_id)
+        return result
+
+    def journal_states(self):
+        return [r["state"] for r in
+                managed.read_journal(self.paths["journal"])]
+
+    def test_r5_wedge_self_recovers_after_two_clean_probes(self):
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(self.settle(watcher),
+                         (True, "CLEANUP_REQUIRED"))  # baseline round
+        self.assertEqual(self.tick(watcher),
+                         (True, "CLEANUP_REQUIRED"))  # probe 1: clean
+        keep, reason = self.tick(watcher)             # probe 2 -> re-arm
+        self.assertEqual((keep, reason), (True, "recovered"))
+        self.assertIsNone(watcher.attempt)
+        states = self.journal_states()
+        self.assertIn("RECOVERED", states)
+        self.assertEqual(states[-1], "WATCHER_READY")
+        # The recovery is durable: a restart starts fresh.
+        self.assertIsNone(managed.recover_attempt(
+            self.paths["journal"], "boot"))
+        # And the watcher is genuinely back in service.
+        keep, reason = self.tick(watcher)
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+
+    def test_probes_are_throttled_not_per_tick(self):
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        watcher.tick()                          # baseline round
+        append_rows(self.transcript, [usage_row(51)])
+        watcher.tick()                          # same instant: no probe
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "CLEANUP_REQUIRED"))
+        self.assertIsNotNone(watcher.attempt)
+
+    def test_no_transcript_growth_blocks_recovery(self):
+        # A dead-idle session cannot prove its input queue drained:
+        # queued bytes could surface whenever it resumes. Never
+        # self-recover without growth since the wedge was first seen.
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        for _ in range(4):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+
+    def test_stopped_leader_blocks_recovery(self):
+        # A SIGSTOPed claude can hold the typed bytes unconsumed in the
+        # tty input queue while the screen still shows an empty
+        # composer; a T-state leader must fail every probe.
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.settle(watcher)
+        write_proc(self.proc, 20, 20, 2020, state="T")
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+        # Resumed leader: probes pass again.
+        write_proc(self.proc, 20, 20, 2020, state="S")
+        self.tick(watcher)
+        keep, reason = self.tick(watcher)
+        self.assertEqual((keep, reason), (True, "recovered"))
+
+    def test_nonce_in_composer_blocks_recovery(self):
+        append_rows(self.transcript, [usage_row(50)])
+        attempt = self.wedge()
+        typed = IDLE + "/compact [cm-%s]" % attempt["nonce"]
+        watcher = self.make_watcher(LadderTmux([typed]))
+        self.settle(watcher)
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+
+    def test_nonce_in_transcript_blocks_recovery(self):
+        append_rows(self.transcript, [usage_row(50)])
+        attempt = self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.tick(watcher)                      # baseline round
+        self.tick(watcher)                      # snapshot round
+        # The typed bytes surfaced as a plain message (growth and a
+        # genuine post-snapshot pair, so the other legs pass — but the
+        # disposition is visible in the transcript, not clean): stay
+        # wedged.
+        append_rows(self.transcript, [
+            {"type": "user", "message": {
+                "content": "stray /compact [cm-%s]" % attempt["nonce"]}}])
+        self.arm_activity(prompt_id="prompt-post-1")
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+
+    def test_inflight_packet_blocks_recovery(self):
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        packet_path = cm.state_paths(self.cfg, self.sid)["packet"]
+        os.makedirs(os.path.dirname(packet_path), exist_ok=True)
+        with open(packet_path, "w") as fh:
+            json.dump({"seq": 5, "trigger": "manual",
+                       "custom_instructions": "",
+                       "base_compaction_count": 0}, fh)
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.settle(watcher)
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+
+    def test_dirty_probe_resets_the_streak(self):
+        append_rows(self.transcript, [usage_row(50)])
+        attempt = self.wedge()
+        typed = IDLE + "/compact [cm-%s]" % attempt["nonce"]
+        # probes: clean, dirty, clean, clean — only the LAST TWO
+        # consecutive clean probes recover.
+        tmux = LadderTmux([IDLE, typed, IDLE, IDLE])
+        watcher = self.make_watcher(tmux)
+        self.settle(watcher)                    # baseline round
+        results = [self.tick(watcher) for _ in range(4)]
+        self.assertEqual(results[-1], (True, "recovered"))
+        self.assertEqual(results[-2], (True, "CLEANUP_REQUIRED"))
+        self.assertIsNone(watcher.attempt)
+
+    def test_commit_yields_to_concurrent_journal_writer(self):
+        # An operator resolve landing between a tick's journal read and
+        # the recovery commit must stand: the commit re-reads the tail
+        # under the txn lock and refuses to append RECOVERED over it.
+        append_rows(self.transcript, [usage_row(50)])
+        attempt = self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.settle(watcher)                    # baseline round
+        self.tick(watcher)                      # probe 1: clean
+        resolved = dict(attempt, state="LATCHED", latch_kind="SAFETY",
+                        reason="operator_resolved", nonce="", nonces=[])
+        managed.journal_record(self.paths["journal"], "LATCHED", resolved,
+                               latch_kind="SAFETY",
+                               reason="operator_resolved")
+        # Drive the commit directly (the public tick would adopt the
+        # latch at its top first — also fine, but this pins the
+        # commit-time guard itself).
+        watcher._maybe_recover(self.now, None)
+        self.assertNotIn("RECOVERED", self.journal_states())
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        # The natural flow then adopts the operator's latch.
+        keep, reason = self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "LATCHED")
+        self.assertEqual(watcher.attempt["reason"], "operator_resolved")
+
+    def test_successor_watcher_recovers_inherited_wedge(self):
+        # A wedge created by a PREVIOUS watcher (different run_token)
+        # is a property of the pane, not of the lease holder: the
+        # adopting watcher must be able to complete recovery of the
+        # inherited attempt — the commit guard keys on the attempt's
+        # identity, not the current binding token (final-audit
+        # should-fix: a binding-token guard probed forever and
+        # silently refused to commit).
+        append_rows(self.transcript, [usage_row(50)])
+        self.arm_activity()
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      self.transcript)
+        attempt = managed.new_attempt(
+            "b" * 16, managed.generation(cursor), 0, 0.0, "boot")
+        attempt.update(state="CLEANUP_REQUIRED",
+                       reason="R5_composer_mismatch")
+        managed.journal_record(self.paths["journal"], "CLEANUP_REQUIRED",
+                               attempt, reason="R5_composer_mismatch")
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.assertEqual(watcher.attempt.get("run_token"), "b" * 16)
+        self.assertNotEqual(self.binding["run_token"], "b" * 16)
+        self.settle(watcher)
+        self.tick(watcher)                      # probe 1
+        keep, reason = self.tick(watcher)       # probe 2 -> commit
+        self.assertEqual((keep, reason), (True, "recovered"))
+        self.assertIn("RECOVERED", self.journal_states())
+
+    def test_other_cleanup_reasons_stay_terminal(self):
+        append_rows(self.transcript, [usage_row(50)])
+        for reason in ("R4_send_failed", "R6_prime_foreign_packet",
+                       "recovered_prepared"):
+            with self.subTest(reason=reason):
+                try:
+                    os.unlink(self.paths["journal"])
+                except OSError:
+                    pass
+                self.wedge(reason=reason)
+                watcher = self.make_watcher(LadderTmux([IDLE]))
+                self.settle(watcher)
+                for _ in range(3):
+                    self.tick(watcher)
+                self.assertEqual(watcher.attempt["state"],
+                                 "CLEANUP_REQUIRED")
+                self.assertNotIn("RECOVERED", self.journal_states())
+
+    def test_probe_fails_closed_on_unprovable_legs(self):
+        # Each unprovable observation blocks the probe outright.
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.settle(watcher)
+        watcher.tick()                          # scan catches up
+        self.assertTrue(watcher.cursor.get("caught_up"))
+        modal = "  ❯ 1. Yes\n" + IDLE
+        garbage = "\x1b]weird\x07❯ "
+        cases = {
+            "capture_error": LadderTmux([IDLE]),
+            "modal": LadderTmux([modal]),
+            "unparseable": LadderTmux([garbage]),
+        }
+        cases["capture_error"].display_rc = 0
+        for name, tmux in cases.items():
+            with self.subTest(case=name):
+                watcher.run_tmux = tmux
+                if name == "capture_error":
+                    real = tmux.__call__
+
+                    def failing(argv, timeout=5, _real=real):
+                        argv = list(argv)
+                        c = argv[2] if argv[:1] == ["-S"] else argv[0]
+                        if c == "capture-pane":
+                            return Result("", 1)
+                        return _real(argv, timeout)
+                    watcher.run_tmux = failing
+                self.assertFalse(watcher._recovery_probe_ok(None))
+
+    def test_running_turn_blocks_recovery(self):
+        # Mid-generation, an empty composer proves nothing: stdin
+        # consumption cannot be assumed while a turn is in flight, so
+        # an unpaired running marker must fail every probe even with
+        # transcript growth (Sol round-2 blocker).
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.settle(watcher)
+        managed.write_activity(
+            self.cfg, {"session_id": self.sid, "prompt_id": "prompt-bbb2",
+                       "transcript_path": self.transcript}, "running")
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+        # The turn ends: probes pass again.
+        self.arm_activity(prompt_id="prompt-bbb2")
+        self.tick(watcher)
+        keep, reason = self.tick(watcher)
+        self.assertEqual((keep, reason), (True, "recovered"))
+
+    def test_stop_hook_active_ended_pair_blocks_recovery(self):
+        # A blocking Stop hook writes "ended" and then forces the turn
+        # to continue: such a pair reads "ended" during live
+        # generation, so recovery must reject it outright (Sol
+        # round-3 blocker).
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.tick(watcher)                      # baseline round
+        self.tick(watcher)                      # snapshot round
+        append_rows(self.transcript, [usage_row(51)])
+        # A NEW pair (identity leg passes) whose ended half carries the
+        # flag: the block is attributable to stop_hook_active alone.
+        self.arm_activity(prompt_id="prompt-bbb2", stop_hook_active=True)
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+        # A genuine (non-continuing) end clears the block.
+        self.arm_activity(prompt_id="prompt-ccc3")
+        self.tick(watcher)
+        keep, reason = self.tick(watcher)
+        self.assertEqual((keep, reason), (True, "recovered"))
+
+    def test_late_running_write_within_grace_is_not_post_wedge(self):
+        # A PRE-wedge UserPromptSubmit's hook process can write its
+        # running marker seconds after the watcher first sees the
+        # wedge: the fingerprint snapshot is quarantined past the hook
+        # allowance, so the late write lands INSIDE the snapshot and
+        # can never read as a post-wedge submission (Sol round-6
+        # blocker).
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        watcher.tick()                          # baseline; due = now+30
+        self.now += 10                          # INSIDE the quarantine
+        watcher.tick()
+        # The gate must refuse to sample while quarantined — deleting
+        # it (or zeroing the grace) fails here.
+        self.assertIsNone(watcher._recovery_activity_fp)
+        # Late delivery of the pre-wedge prompt's running marker,
+        # genuinely inside the quarantine window.
+        self.arm_activity(prompt_id="prompt-late1")
+        append_rows(self.transcript, [usage_row(51)])
+        self.now += managed.RECOVERY_SNAPSHOT_GRACE_S   # past the deadline
+        watcher.tick()                          # snapshot round
+        fp = watcher._recovery_activity_fp
+        self.assertIsInstance(fp, tuple)
+        self.assertEqual(fp[0], "prompt-late1")  # late write IS the baseline
+        for _ in range(3):
+            self.tick(watcher)                  # probes: identity unchanged
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+        # A genuinely post-snapshot pair unblocks.
+        self.arm_activity(prompt_id="prompt-new2")
+        self.tick(watcher)
+        keep, reason = self.tick(watcher)
+        self.assertEqual((keep, reason), (True, "recovered"))
+
+    def test_ended_only_rewrite_does_not_prove_new_prompt(self):
+        # A prompt submitted just BEFORE the wedge reaches its first
+        # Stop after it: only the ended half is rewritten (and a
+        # blocking Stop hook may then force continuation). Without a
+        # NEW running marker there was no post-wedge UserPromptSubmit,
+        # so the FIFO disposition proof does not apply — blocked (Sol
+        # round-5 blocker).
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()                            # pair aaa1, pre-wedge
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.tick(watcher)                      # baseline round
+        append_rows(self.transcript, [usage_row(51)])
+        managed.write_activity(
+            self.cfg, {"session_id": self.sid, "prompt_id": "prompt-aaa1",
+                       "transcript_path": self.transcript}, "ended")
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+        # A genuinely new running+ended pair unblocks.
+        self.arm_activity(prompt_id="prompt-eee5")
+        self.tick(watcher)
+        keep, reason = self.tick(watcher)
+        self.assertEqual((keep, reason), (True, "recovered"))
+
+    def test_unprovable_running_marker_is_none_not_absent(self):
+        # Only confirmed ENOENT may read as "absent" (any future pair
+        # is then post-wedge); an inspection error must stay
+        # unprovable, or a transiently unreadable stale pair would
+        # later be accepted as new (Sol round-5 blocker).
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        adir = os.path.dirname(managed.activity_paths(
+            self.cfg, self.sid)["running"])
+        self.assertIsInstance(watcher._running_fingerprint(), tuple)
+        os.chmod(adir, 0o000)
+        self.addCleanup(os.chmod, adir, 0o700)
+        self.assertIsNone(watcher._running_fingerprint())
+        os.chmod(adir, 0o700)
+        for name in os.listdir(adir):
+            if name.startswith("running-"):
+                os.unlink(os.path.join(adir, name))
+        self.assertEqual(watcher._running_fingerprint(), "absent")
+
+    def test_clock_step_cannot_launder_stale_pair(self):
+        # Wall-clock ordering is not causal: a pre-wedge pair whose
+        # written_at postdates a stepped-back watcher clock must still
+        # be rejected — pair IDENTITY, not time, is the freshness
+        # proof (Sol round-4 blocker).
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()                            # pre-wedge pair, real time
+        watcher = self.make_watcher(LadderTmux([IDLE]),
+                                    wall=lambda: time.time() - 20)
+        self.tick(watcher)                      # baseline round
+        append_rows(self.transcript, [usage_row(51)])
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+
+    def test_stale_pre_wedge_ended_pair_blocks_recovery(self):
+        # A pair left over from BEFORE the wedge (e.g. the next turn's
+        # running-marker write failed) proves nothing about a rest
+        # after our bytes were queued: probes must reject it until a
+        # fresh post-wedge pair forms (Sol round-3 blocker).
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()                            # arms a pre-wedge pair
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.tick(watcher)                      # baseline round
+        append_rows(self.transcript, [usage_row(51)])   # growth only
+        for _ in range(3):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+        # A fresh post-wedge pair unblocks.
+        self.arm_activity(prompt_id="prompt-ddd4")
+        self.tick(watcher)
+        keep, reason = self.tick(watcher)
+        self.assertEqual((keep, reason), (True, "recovered"))
+
+    def test_missing_attempt_id_never_recovers(self):
+        # A journal record without a manager-shaped attempt_id must
+        # stay wedged: aid None would equal the None-initialized
+        # first-sighting sentinel, skip the baseline round, and let
+        # pre-wedge transcript bytes count as growth (Sol round-2
+        # blocker).
+        append_rows(self.transcript, [usage_row(50)])
+        self.arm_activity()
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      self.transcript)
+        attempt = managed.new_attempt(
+            self.token, managed.generation(cursor), 0, 0.0, "boot")
+        del attempt["attempt_id"]
+        attempt.update(state="CLEANUP_REQUIRED",
+                       reason="R5_composer_mismatch")
+        managed.journal_record(self.paths["journal"], "CLEANUP_REQUIRED",
+                               attempt, reason="R5_composer_mismatch")
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.assertIsNone(watcher.attempt.get("attempt_id"))
+        self.settle(watcher)
+        for _ in range(4):
+            self.tick(watcher)
+        self.assertEqual(watcher.attempt["state"], "CLEANUP_REQUIRED")
+        self.assertNotIn("RECOVERED", self.journal_states())
+
+    def test_submission_uncertain_never_self_recovers(self):
+        append_rows(self.transcript, [usage_row(50)])
+        self.arm_activity()
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      self.transcript)
+        attempt = managed.new_attempt(
+            self.token, managed.generation(cursor), 0, 0.0, "boot")
+        attempt.update(state="SUBMISSION_UNCERTAIN",
+                       reason="enter_failed")
+        managed.journal_record(self.paths["journal"],
+                               "SUBMISSION_UNCERTAIN", attempt,
+                               reason="enter_failed")
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.settle(watcher)
+        for _ in range(3):
+            keep, reason = self.tick(watcher)
+        self.assertEqual((keep, reason), (True, "SUBMISSION_UNCERTAIN"))
+        self.assertNotIn("RECOVERED", self.journal_states())
+
+    def test_recovered_record_alone_clears_the_attempt(self):
+        # The durable RECOVERED append is the commit point: a failure
+        # in the follow-up status-marker write must not leave the
+        # in-memory attempt wedged against a recovered journal (that
+        # would be a stuck watcher under a false all-clear).
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.settle(watcher)
+        self.tick(watcher)                       # probe 1: clean
+        real = managed.journal_record
+
+        def failing(path, state, attempt, **kw):
+            if state == "WATCHER_READY":
+                raise OSError("disk full")
+            return real(path, state, attempt, **kw)
+        managed.journal_record = failing
+        try:
+            keep, reason = self.tick(watcher)    # probe 2 -> commit
+        finally:
+            managed.journal_record = real
+        self.assertEqual((keep, reason), (True, "recovered"))
+        self.assertIsNone(watcher.attempt)
+        self.assertEqual(self.journal_states()[-1], "RECOVERED")
+
+    def test_rotation_rebaselines_growth(self):
+        # A transcript rotation mid-wedge restarts offsets; the growth
+        # baseline must follow (re-baseline, fresh growth required) or
+        # auto-recovery would stall until the new file outgrew the old
+        # one.
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.settle(watcher)
+        self.tick(watcher)                       # probe 1: clean
+        watcher._recovery_baseline_epoch = 99    # simulate rotation
+        self.tick(watcher)                       # re-baseline round
+        self.assertIsNotNone(watcher.attempt)
+        append_rows(self.transcript, [usage_row(52)])
+        self.tick(watcher)                       # probe 1 (new epoch)
+        keep, reason = self.tick(watcher)        # probe 2 -> re-arm
+        self.assertEqual((keep, reason), (True, "recovered"))
+
+    def test_uncaught_cursor_blocks_probe(self):
+        append_rows(self.transcript, [usage_row(50)])
+        self.wedge()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.settle(watcher)
+        watcher.tick()
+        self.assertTrue(watcher.cursor.get("caught_up"))
+        watcher.cursor["caught_up"] = False
+        self.assertFalse(watcher._recovery_probe_ok(None))
+        watcher.cursor["caught_up"] = True
+        self.assertTrue(watcher._recovery_probe_ok(None))
+
+
+class WedgeVerdictTests(unittest.TestCase):
+    """wedge_verdict: the three-valued journal verdict the hooks
+    surface — no claim must never read as an all-clear."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cfg = managed.load_config(
+            base=dict(cm._DEFAULTS, state_dir=self.temp.name), environ={})
+        self.sid = "session-1234"
+        self.paths = managed.managed_paths(self.cfg, self.sid)
+
+    def record(self, state, reason=None, latch_kind=None):
+        managed.journal_record(
+            self.paths["journal"], state,
+            {"attempt_id": "att1", "run_token": "tok",
+             "latch_kind": latch_kind,
+             "timers": {"boot_id": managed.boot_id()}},
+            reason=reason, latch_kind=latch_kind)
+
+    def test_missing_journal_is_unknown(self):
+        self.assertEqual(managed.wedge_verdict(self.cfg, self.sid),
+                         ("unknown", None))
+
+    def test_cleanup_required_surfaces(self):
+        self.record("CLEANUP_REQUIRED", reason="R5_composer_mismatch")
+        verdict, info = managed.wedge_verdict(self.cfg, self.sid)
+        self.assertEqual(verdict, "wedged")
+        self.assertEqual(info["state"], "CLEANUP_REQUIRED")
+        self.assertEqual(info["reason"], "R5_composer_mismatch")
+        self.assertIn("att1", info["fingerprint"])
+
+    def test_healthy_and_recovered_tails_are_clear(self):
+        self.record("DEFERRED", reason="R2_activity_running")
+        self.assertEqual(managed.wedge_verdict(self.cfg, self.sid)[0],
+                         "clear")
+        self.record("CLEANUP_REQUIRED", reason="R5_composer_mismatch")
+        self.assertEqual(managed.wedge_verdict(self.cfg, self.sid)[0],
+                         "wedged")
+        self.record("RECOVERED", reason="composer_clean")
+        self.assertEqual(managed.wedge_verdict(self.cfg, self.sid)[0],
+                         "clear")
+
+    def test_threshold_latch_is_clear_but_safety_is_wedged(self):
+        self.record("LATCHED", reason="still_above_rearm_band",
+                    latch_kind="THRESHOLD")
+        self.assertEqual(managed.wedge_verdict(self.cfg, self.sid)[0],
+                         "clear")
+        self.record("LATCHED", reason="operator_resolved",
+                    latch_kind="SAFETY")
+        verdict, info = managed.wedge_verdict(self.cfg, self.sid)
+        self.assertEqual((verdict, info["state"], info["reason"]),
+                         ("wedged", "LATCHED", "operator_resolved"))
+
+    def test_crashed_prepared_tail_surfaces_conservatively(self):
+        # The raw tail says PREPARED; the surfaced verdict must be the
+        # recovery mapping's CLEANUP_REQUIRED (the hazard the operator
+        # would actually resolve).
+        self.record("PREPARED")
+        verdict, info = managed.wedge_verdict(self.cfg, self.sid)
+        self.assertEqual((verdict, info["state"]),
+                         ("wedged", "CLEANUP_REQUIRED"))
+
+    def test_lifecycle_flooded_tail_is_unknown_not_clear(self):
+        # A wedge pushed beyond the 64KB tail window by lifecycle spam
+        # (restart loops) must report "no claim", never an all-clear —
+        # the original silent-loss incident would otherwise repeat with
+        # a fabricated cancellation on top.
+        self.record("CLEANUP_REQUIRED", reason="R5_composer_mismatch")
+        filler = {"run_token": "tok", "timers": {}}
+        for _ in range(400):
+            managed.journal_record(self.paths["journal"], "WATCHER_READY",
+                                   filler, pad="x" * 200)
+        self.assertGreater(os.path.getsize(self.paths["journal"]), 65536)
+        self.assertEqual(managed.wedge_verdict(self.cfg, self.sid),
+                         ("unknown", None))
+
+    def test_tail_read_is_byte_capped_despite_giant_line(self):
+        # A multi-MB torn/oversized line must not defeat the byte cap:
+        # the reader takes exactly the tail window and parses whatever
+        # complete records it holds.
+        os.makedirs(os.path.dirname(self.paths["journal"]), exist_ok=True)
+        with open(self.paths["journal"], "wb") as fh:
+            fh.write(b"x" * 5_000_000 + b"\n")
+        self.record("CLEANUP_REQUIRED", reason="R5_composer_mismatch")
+        records = managed.journal_tail_records(self.paths["journal"])
+        self.assertEqual(records[-1]["state"], "CLEANUP_REQUIRED")
+        # Giant TORN line at the tail: whatever the window holds is
+        # unparseable -> no claim, not a crash and not an all-clear.
+        with open(self.paths["journal"], "ab") as fh:
+            fh.write(b"y" * 5_000_000)
+        self.assertEqual(managed.wedge_verdict(self.cfg, self.sid),
+                         ("unknown", None))
+
+
+class TranscriptContainsTests(unittest.TestCase):
+    """transcript_contains gates recovery: its chunk-overlap scan and
+    its unprovable->None contract each get direct pins (Opus audit:
+    an off-by-one here would silently turn a split nonce into
+    provably-absent -> false recovery)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = os.path.join(self.temp.name, "t.jsonl")
+
+    def write(self, data):
+        with open(self.path, "wb") as fh:
+            fh.write(data)
+
+    def test_needle_straddling_chunk_boundary_is_found(self):
+        needle = "cm-" + "f" * 16
+        chunk = 1 << 20
+        for split in (1, len(needle) // 2, len(needle) - 1):
+            with self.subTest(split=split):
+                data = b"x" * (chunk - split) + needle.encode() + b"y" * 64
+                self.write(data)
+                self.assertIs(managed.transcript_contains(
+                    self.path, 0, [needle]), True)
+
+    def test_absent_needle_is_false_and_present_is_true(self):
+        self.write(b"a" * 4096)
+        self.assertIs(managed.transcript_contains(
+            self.path, 0, ["cm-" + "0" * 16]), False)
+        self.write(b"a" * 4096 + b"cm-" + b"0" * 16)
+        self.assertIs(managed.transcript_contains(
+            self.path, 0, ["cm-" + "0" * 16]), True)
+
+    def test_unprovable_spans_are_none_never_absent(self):
+        needle = "cm-" + "0" * 16
+        self.assertIsNone(managed.transcript_contains(
+            self.path + ".missing", 0, [needle]))
+        self.write(b"a" * 128)
+        self.assertIsNone(managed.transcript_contains(
+            self.path, 0, [needle], cap=64))       # span exceeds cap
+        self.assertIsNone(managed.transcript_contains(
+            self.path, 999, [needle]))             # start beyond EOF
+        self.assertIsNone(managed.transcript_contains(
+            self.path, -1, [needle]))              # bogus start
+        self.assertIsNone(managed.transcript_contains(
+            self.path, 0, []))                     # no needles
+
+    def test_start_offset_excludes_earlier_bytes(self):
+        needle = "cm-" + "0" * 16
+        self.write(needle.encode() + b"z" * 64)
+        self.assertIs(managed.transcript_contains(
+            self.path, len(needle), [needle]), False)

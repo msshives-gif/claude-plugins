@@ -132,6 +132,93 @@ def run(payload, cfg):
                             "yourself." % (pct, 100.0 * trig))
         except Exception:
             pass
+        # The other managed-mode blind spot: a live watcher HOLDS the
+        # session but its attempt sits in a terminal alert state
+        # (CLEANUP_REQUIRED, SUBMISSION_UNCERTAIN, a SAFETY latch) —
+        # the only native signal was a transient tmux flash nobody may
+        # have seen, while auto-compaction was silently suspended
+        # (observed live 2026-08-25: 14h of lost coverage). Surface
+        # each distinct wedge once, at any usage level, and say when it
+        # POSITIVELY clears; an "unknown" verdict keeps the stored
+        # fingerprint and stays silent — no claim is not an all-clear.
+        # Fails silent on any surprise, per hook discipline.
+        try:
+            if cfg["mode"] == "managed":
+                import managed as mg
+                verdict, info = mg.wedge_verdict(cfg, session_id)
+                prev = st.get("wedge_warned_fp") or ""
+                if verdict == "clear":
+                    if prev:
+                        st["wedge_warned_fp"] = ""
+                        parts.append(
+                            "compact-manager: the watcher wedge "
+                            "previously reported for this session has "
+                            "cleared — automatic compaction is armed "
+                            "again.")
+                elif verdict == "wedged" and prev != info["fingerprint"]:
+                    st["wedge_warned_fp"] = info["fingerprint"]
+                    cli = os.path.normpath(os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "..", "bin", "compact-manager"))
+                    sid_arg = (session_id
+                               if mg._SESSION_ID.fullmatch(session_id)
+                               else "<session-id>")
+                    lease, _inode = mg.read_json_inode(os.path.join(
+                        cfg["state_dir"], "managed", "leases",
+                        "session-%s.json"
+                        % cm.path_component(session_id)))
+                    held = lease is not None and mg.lease_attached(lease)
+                    if info.get("reason") == "operator_resolved" and held:
+                        parts.append(
+                            "compact-manager: this session's watcher "
+                            "is safety-latched after an operator "
+                            "resolve — it re-arms at the next "
+                            "compaction. Tell the user to run /compact "
+                            "once at a natural boundary; automatic "
+                            "compaction resumes after it.")
+                    elif info.get("reason") == "operator_resolved":
+                        # Resolved, but NO live watcher: "resumes
+                        # automatically" would be false — nothing is
+                        # watching (Sol round-2). Re-attach first.
+                        parts.append(
+                            "compact-manager: a previous watcher's "
+                            "wedge was resolved, but NO live watcher "
+                            "holds this session. Tell the user to "
+                            "re-attach one (/compact-manager:attach, "
+                            "or /compact-manager-attach on script "
+                            "installs) and then run /compact once at "
+                            "a natural boundary — the latch clears at "
+                            "the next compaction.")
+                    elif held:
+                        parts.append(
+                            "compact-manager: this session's watcher "
+                            "is WEDGED: %s (%s) — automatic compaction "
+                            "is SUSPENDED and nothing will type "
+                            "/compact for you. Tell the user now so "
+                            "THEY can run: \"%s\" resolve %s and then "
+                            "/compact once at a natural boundary to "
+                            "re-arm. Do not run these yourself."
+                            % (info["state"],
+                               cm.sanitize(str(info.get("reason")), 60),
+                               cli, sid_arg))
+                    else:
+                        # No live watcher holds the session; the wedge
+                        # is a leftover hazard a FRESH watcher would
+                        # inherit through journal recovery. Distinct
+                        # wording so this cannot contradict the
+                        # attach warning above (Opus audit).
+                        parts.append(
+                            "compact-manager: a previous watcher left "
+                            "this session wedged: %s (%s). Tell the "
+                            "user to run: \"%s\" resolve %s BEFORE "
+                            "re-attaching — a fresh watcher inherits "
+                            "the wedge until it is resolved. Do not "
+                            "run these yourself."
+                            % (info["state"],
+                               cm.sanitize(str(info.get("reason")), 60),
+                               cli, sid_arg))
+        except Exception:
+            pass
         cm.save_state(cfg, paths, st)
         if parts:
             cm.ledger_append(cfg, {"event": "inject",

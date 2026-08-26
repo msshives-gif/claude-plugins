@@ -892,6 +892,172 @@ class HookShellTests(unittest.TestCase):
         ctx = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("NO live watcher", ctx)
 
+    def wedge_journal(self, sid, reason="R5_composer_mismatch",
+                      state="CLEANUP_REQUIRED", latch_kind=None,
+                      attempt_id="att1"):
+        d = os.path.join(self.dir.name, "managed", "watchers")
+        os.makedirs(d, exist_ok=True)
+        rec = {"schema": 1, "ts": 1.0, "state": state,
+               "attempt_id": attempt_id, "run_token": "tok",
+               "nonce": "", "nonces": [], "generation": None,
+               "retry_n": 0, "packet_seq_at_prepare": 0,
+               "attempt_packet_seq_floor": 0, "latch_kind": latch_kind,
+               "latch_tokens": None, "trigger_source": "threshold",
+               "lane": None, "defer_class": None,
+               "activity_rev_at_defer": None, "starvation_alerted": False,
+               "own_packet_proof": False, "timers": {}, "reason": reason}
+        with open(os.path.join(d, sid + ".journal.jsonl"), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    def test_advisor_warns_wedged_watcher_once_and_clears(self):
+        # A watcher parked in a terminal alert state is silently lost
+        # coverage: the advisor surfaces each distinct wedge once, at
+        # ANY usage level, and says when it clears.
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 20_000, 0, 500)])  # far below trigger
+        payload = {"hook_event_name": "PostToolUse", "session_id": "sG-wedge-01",
+                   "transcript_path": t, "tool_name": "Bash"}
+        lease_dir = os.path.join(self.dir.name, "managed", "leases")
+        os.makedirs(lease_dir, exist_ok=True)
+        with open(os.path.join(lease_dir, "session-sG-wedge-01.json"),
+                  "w") as fh:
+            json.dump({"run_token": "t", "pid": 12345, "proc_start": 1,
+                       "heartbeat_at": time.time()}, fh)
+        self.wedge_journal("sG-wedge-01")
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("WEDGED", ctx)
+        self.assertIn("resolve sG-wedge-01", ctx)
+        self.assertIn("R5_composer_mismatch", ctx)
+        # Same wedge: silent.
+        self.assertEqual(self.run_hook("advisor.py", payload,
+                                       mode="managed"), {})
+        # Recovery record lands: one all-clear, then silence.
+        self.wedge_journal("sG-wedge-01", state="RECOVERED",
+                           reason="composer_clean")
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        self.assertIn("cleared",
+                      out["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.run_hook("advisor.py", payload,
+                                       mode="managed"), {})
+        # A NEW wedge (different attempt) warns again.
+        self.wedge_journal("sG-wedge-01", attempt_id="att2")
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        self.assertIn("WEDGED",
+                      out["hookSpecificOutput"]["additionalContext"])
+        # Lifecycle spam pushes the wedge beyond the tail window: "no
+        # claim" must stay SILENT — neither a repeat warning nor a
+        # fabricated all-clear (the fingerprint survives).
+        jpath = os.path.join(self.dir.name, "managed", "watchers",
+                             "sG-wedge-01.journal.jsonl")
+        filler = json.dumps({"schema": 1, "ts": 1.0,
+                             "state": "WATCHER_READY",
+                             "run_token": "tok", "pad": "x" * 200})
+        with open(jpath, "a") as fh:
+            for _ in range(400):
+                fh.write(filler + "\n")
+        self.assertEqual(self.run_hook("advisor.py", payload,
+                                       mode="managed"), {})
+        # A durable RECOVERED record then positively clears it.
+        self.wedge_journal("sG-wedge-01", state="RECOVERED",
+                           reason="composer_clean", attempt_id="att2")
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        self.assertIn("cleared",
+                      out["hookSpecificOutput"]["additionalContext"])
+        # advisory mode: never checks.
+        self.wedge_journal("sZ")
+        payload_z = dict(payload, session_id="sZ")
+        self.assertEqual(self.run_hook("advisor.py", payload_z), {})
+
+    def test_advisor_operator_resolved_latch_says_rearm(self):
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 20_000, 0, 500)])
+        payload = {"hook_event_name": "PostToolUse", "session_id": "sR-wedge-01",
+                   "transcript_path": t, "tool_name": "Bash"}
+        self.wedge_journal("sR-wedge-01", state="LATCHED",
+                           reason="operator_resolved", latch_kind="SAFETY")
+        # No live watcher: "automatic compaction resumes" would be a
+        # lie — the guidance must be to RE-ATTACH first (Sol audit).
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("NO live watcher", ctx)
+        self.assertIn("re-attach", ctx)
+        self.assertIn("/compact", ctx)
+        self.assertNotIn("resumes", ctx)
+        self.assertNotIn("WEDGED", ctx)
+        # With a live watcher holding the session: safety-latched,
+        # /compact re-arms it.
+        lease_dir = os.path.join(self.dir.name, "managed", "leases")
+        os.makedirs(lease_dir, exist_ok=True)
+        with open(os.path.join(lease_dir, "session-sR-wedge-01.json"),
+                  "w") as fh:
+            json.dump({"run_token": "t", "pid": 12345, "proc_start": 1,
+                       "heartbeat_at": time.time()}, fh)
+        self.wedge_journal("sR-wedge-01", state="LATCHED",
+                           reason="operator_resolved",
+                           latch_kind="SAFETY", attempt_id="att2")
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("safety-latched", ctx)
+        self.assertIn("/compact", ctx)
+        self.assertNotIn("WEDGED", ctx)
+        # A THRESHOLD latch is hysteresis, not a hazard: silent.
+        self.wedge_journal("sR-wedge-01", state="LATCHED",
+                           reason="still_above_rearm_band",
+                           latch_kind="THRESHOLD", attempt_id="att3")
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        ctx = (out.get("hookSpecificOutput") or {}).get(
+            "additionalContext", "")
+        self.assertNotIn("WEDGED", ctx)
+        self.assertNotIn("safety-latched", ctx)
+
+    def test_advisor_dead_watcher_wedge_says_resolve_before_reattach(self):
+        # A watcher that retired/died while wedged leaves the hazard in
+        # its journal; with no live lease the guidance must be "resolve
+        # BEFORE re-attaching", never "your watcher is wedged" — that
+        # would contradict the attach warning (Opus audit).
+        t = os.path.join(self.dir.name, "sess.jsonl")
+        append_jsonl(t, [usage_row(10, 20_000, 0, 500)])
+        payload = {"hook_event_name": "PostToolUse",
+                   "session_id": "sD-wedge-01",
+                   "transcript_path": t, "tool_name": "Bash"}
+        self.wedge_journal("sD-wedge-01")
+        out = self.run_hook("advisor.py", payload, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("previous watcher", ctx)
+        self.assertIn("resolve sD-wedge-01", ctx)
+        self.assertIn("BEFORE re-attaching", ctx)
+        self.assertNotIn("WEDGED:", ctx)
+
+    def test_session_start_reports_wedged_watcher(self):
+        base = {"hook_event_name": "SessionStart",
+                "session_id": "sW-wedge-01", "source": "startup"}
+        lease_dir = os.path.join(self.dir.name, "managed", "leases")
+        os.makedirs(lease_dir, exist_ok=True)
+        with open(os.path.join(lease_dir, "session-sW-wedge-01.json"),
+                  "w") as fh:
+            json.dump({"run_token": "t", "pid": 12345, "proc_start": 1,
+                       "heartbeat_at": time.time()}, fh)
+        self.wedge_journal("sW-wedge-01")
+        out = self.run_hook("session_start.py", base, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("WEDGED", ctx)
+        self.assertIn("resolve sW-wedge-01", ctx)
+        # operator_resolved reads as pending re-arm, not a hazard.
+        self.wedge_journal("sW-wedge-01", state="LATCHED",
+                           reason="operator_resolved", latch_kind="SAFETY")
+        out = self.run_hook("session_start.py", base, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("safety-latched", ctx)
+        self.assertNotIn("WEDGED", ctx)
+        # Recovered: plain attached line again.
+        self.wedge_journal("sW-wedge-01", state="RECOVERED",
+                           reason="composer_clean")
+        out = self.run_hook("session_start.py", base, mode="managed")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("attached", ctx)
+        self.assertNotIn("WEDGED", ctx)
+
     def test_advisor_unwatched_honors_override_trigger(self):
         # Nondefault trigger + window via the override file: 100k of a
         # 150k window is 66.7% — over the 60% override trigger, under
@@ -936,7 +1102,7 @@ class HookShellTests(unittest.TestCase):
         # touched the flag (Sol audit round-3).
         t = os.path.join(self.dir.name, "sess.jsonl")
         append_jsonl(t, [usage_row(10, 170_000, 0, 500)])
-        payload = {"hook_event_name": "PostToolUse", "session_id": "sR",
+        payload = {"hook_event_name": "PostToolUse", "session_id": "sR-wedge-01",
                    "transcript_path": t, "tool_name": "Bash"}
         out = self.run_hook("advisor.py", payload, mode="managed")
         self.assertIn("NO live watcher",

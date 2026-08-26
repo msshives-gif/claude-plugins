@@ -63,9 +63,40 @@ def _watcher_status(cfg, session_id):
     cli = os.path.normpath(
         os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "..", "bin", "compact-manager"))
+    # An id the CLI's own validator would reject is not baked into a
+    # copy-pasteable command line (same rule as the override hint).
+    sid_arg = (session_id if managed._SESSION_ID.fullmatch(session_id)
+               else "<session-id>")
     if managed.lease_attached(lease):
-        text = ("compact-manager: managed mode, watcher attached to this "
-                "session (pid %s)." % lease.get("pid"))
+        # "unknown" degrades to the plain attached line: SessionStart
+        # is a status readout, and a no-claim tail must not fabricate
+        # either a wedge or an all-clear.
+        wedge = None
+        try:
+            verdict, wedge = managed.wedge_verdict(cfg, session_id)
+            if verdict != "wedged":
+                wedge = None
+        except Exception:
+            wedge = None
+        if wedge is not None and wedge.get("reason") == "operator_resolved":
+            text = ("compact-manager: managed mode, watcher attached "
+                    "(pid %s) but safety-latched after an operator "
+                    "resolve — it re-arms at the next compaction. Tell "
+                    "the user to run /compact once at a natural "
+                    "boundary." % lease.get("pid"))
+        elif wedge is not None:
+            text = ("compact-manager: managed mode, watcher attached "
+                    "(pid %s) but WEDGED: %s (%s) — automatic "
+                    "compaction is SUSPENDED and nothing will type "
+                    "/compact for you. Tell the user now so THEY can "
+                    "run: \"%s\" resolve %s and then /compact once at "
+                    "a natural boundary to re-arm."
+                    % (lease.get("pid"), wedge["state"],
+                       cm.sanitize(str(wedge.get("reason")), 60),
+                       cli, sid_arg))
+        else:
+            text = ("compact-manager: managed mode, watcher attached to "
+                    "this session (pid %s)." % lease.get("pid"))
     else:
         text = ("compact-manager: mode is managed but NO watcher holds "
                 "this session — nothing will type /compact for you. "
@@ -76,14 +107,10 @@ def _watcher_status(cfg, session_id):
     # Advertise the per-session threshold mechanism with the exact
     # command (this hook knows the real session id) so the model never
     # has to discover it — but only ever uses it when the human asks.
-    # An id the CLI's own validator would reject is not baked into a
-    # copy-pasteable command line.
-    sid = (session_id if managed._SESSION_ID.fullmatch(session_id)
-           else "<session-id>")
     text += (" If the user asks to change this session's compaction "
              "thresholds, run: \"%s\" override %s trigger=NN%% "
              "(keys: trigger/soft/hard/window, any subset; --clear "
-             "resets)." % (cli, sid))
+             "resets)." % (cli, sid_arg))
     cm.ledger_append(cfg, {"event": "inject", "hook": "session_start",
                            "kind": "watcher_status"})
     _emit(cfg, text)

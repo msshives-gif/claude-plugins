@@ -371,6 +371,9 @@ _STATE_DEFAULTS = {"schema": SCHEMA_VERSION, "inode": None, "size": 0,
                    # One warning per crossing of trigger while
                    # unwatched (managed mode); re-armed below trigger.
                    "unwatched_warned": False,
+                   # Fingerprint of the wedged-watcher state already
+                   # surfaced in-session (managed mode); "" = none.
+                   "wedge_warned_fp": "",
                    # Effective thresholds stamped by the advisor (its
                    # env-honoring, per-model-merged view); 0 = unstamped.
                    "eff_window": 0, "eff_soft_pct": 0.0,
@@ -396,7 +399,7 @@ def load_state(paths):
                           and not isinstance(v, bool)) else None
         elif k == "advisory_level":
             st[k] = v if v in ("none", "soft", "hard") else "none"
-        elif k == "model":
+        elif k in ("model", "wedge_warned_fp"):
             st[k] = v if isinstance(v, str) else ""
         elif k in ("discard_to_newline", "unwatched_warned"):
             st[k] = v if isinstance(v, bool) else False

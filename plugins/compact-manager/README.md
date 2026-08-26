@@ -189,7 +189,15 @@ In managed mode, session start/resume also injects one status line
 saying whether a watcher demonstrably holds this session (fresh lease
 heartbeat, or its pid verified alive — ambiguity reads as NOT
 attached, inverting the lease-reclaim default), with the attach
-command if not. A watcher whose pane rotates its session id under it
+command if not. A held-but-wedged watcher (a terminal alert state in
+its journal: cleanup required, uncertain submission, a safety latch)
+is reported as such with the `resolve` command instead of the plain
+attached line, and the advisor repeats that warning in-session once
+per distinct wedge — plus an all-clear when the journal positively
+clears. A wedge from a composer-verification race also self-heals:
+the watcher re-arms itself after repeated read-only probes prove the
+typed bytes are gone from the composer, pane, and transcript while
+the session demonstrably kept running. A watcher whose pane rotates its session id under it
 (`/clear`, in-app `/resume` — same claude process, new id) retires
 with `reason=session_rotated` rather than watching the dead id's
 frozen transcript; re-attach to cover the new session. Without it, "mode is managed but nobody adopted this

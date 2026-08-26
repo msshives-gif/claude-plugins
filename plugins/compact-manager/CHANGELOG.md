@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+- Watcher: R5 typed-text verification now re-captures the pane up to
+  three times (read-only) before declaring `composer_mismatch` — a
+  transient repaint racing the single capture terminalized a healthy
+  attempt (observed live 2026-08-25: 14h of silently suspended
+  auto-compaction). R6' still re-proves everything before Enter.
+- Watcher: self-recovery from `CLEANUP_REQUIRED/R5_composer_mismatch`
+  — the one cleanup reason whose hazard (our typed bytes) is fully
+  observable. Read-only probes every 60s require: composer empty, no
+  modal, no attempt nonce anywhere in the pane, transcript caught up
+  and provably nonce-free from the attempt's boundary offset, no
+  in-flight packet, a schedulable (R/S) leader — a SIGSTOPed claude
+  can hold the bytes unconsumed in the tty input queue (Sol
+  blocker) — a provably ENDED turn (the boundary lane's marker-pair
+  evidence: mid-generation an empty composer proves nothing about
+  queued stdin) whose ended marker does not carry stop_hook_active
+  (a blocking Stop hook writes "ended" then forces generation to
+  continue) and whose RUNNING half is a NEW identity relative to the
+  snapshot taken at the wedge's first sighting — identity is causal
+  where wall-clock ordering is not (a clock step would launder a
+  stale pair), and only a UserPromptSubmit rewrites the running half
+  (the ended half alone is rewritten by every Stop and proves
+  nothing), so a new running identity means a prompt was submitted
+  post-wedge, whose FIFO tty ordering proves our earlier bytes were
+  consumed first — and transcript growth since the wedge (Sol
+  blockers, rounds 2-6; a dead-idle session never self-recovers;
+  only confirmed ENOENT counts as an absent marker, every other
+  inspection error is unprovable and blocks). The snapshot itself is
+  quarantined 30s past the first sighting so a pre-wedge prompt's
+  delayed hook write lands inside it, never after it. The recovery
+  commit is keyed on the attempt's identity, not the current binding
+  token, so a successor watcher that adopted the pane after the
+  wedging watcher died can complete the inherited recovery (final
+  audit). A journal record without a manager-shaped
+  attempt_id never recovers (identity guards the growth baseline).
+  Two consecutive clean probes commit a durable `RECOVERED` journal
+  record — under the txn lock with a tail re-read, so an operator
+  resolve landing mid-probe always stands (Sol blocker), and the
+  RECOVERED append alone is the commit point (a failed follow-up
+  status write cannot strand a wedged watcher under a recovered
+  journal — Opus finding). Restarts start fresh instead of
+  resurrecting the wedge. All other cleanup reasons keep
+  operator-resolve-only semantics; SUBMISSION_UNCERTAIN still clears
+  only on positive boundary proof or an operator resolve, never on
+  probes.
+- Wedged watchers are now surfaced INSIDE the session, not just as a
+  one-shot tmux flash: the advisor injects one warning per distinct
+  wedge (any usage level, with the exact `resolve` command and the
+  re-arm step) plus an all-clear when the journal POSITIVELY clears;
+  SessionStart reports a wedged or resolve-latched watcher instead of
+  the plain "attached" line. The journal verdict is three-valued
+  (wedged / clear / unknown) with a hard 64KB tail-read byte cap —
+  "no claim" stays silent and never cancels a delivered warning (Sol:
+  a lifecycle-flooded tail window must not fabricate an all-clear,
+  and an oversized torn record must not defeat the read bound).
+
 - Unwatched-session visibility (the gap that let a live session sit
   two days over its trigger unmanaged): the overview flags a managed,
   provably live session at/over trigger with no attached watcher

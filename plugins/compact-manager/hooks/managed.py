@@ -34,10 +34,30 @@ SCAN_MAX_BYTES = 16_000_000
 BACKOFF_INITIAL_S = 30.0
 BACKOFF_MAX_S = 300.0
 RETRY_LIMIT = 1
+# R5 re-captures before declaring composer_mismatch: a background
+# repaint racing the single 0.4s-later capture wedged a healthy session
+# terminally (observed live 2026-08-25). Captures only —
+# no keystrokes — so retrying is free of submission risk; R6' re-proves
+# everything before Enter regardless.
+R5_VERIFY_ATTEMPTS = 3
+# Self-recovery from CLEANUP_REQUIRED/R5_composer_mismatch: read-only
+# probes of every place the typed bytes could be (composer, pane,
+# transcript, packet). Two clean probes this far apart re-arm the
+# watcher; any dirty probe resets the streak.
+RECOVERY_POLL_S = 60.0
+RECOVERY_PROBES = 2
+RECOVERY_SCAN_MAX_BYTES = 64_000_000
+# The running-marker snapshot is quarantined this long (monotonic)
+# after the wedge's first sighting: a PRE-wedge UserPromptSubmit's
+# hook process may write its running marker seconds later (hook
+# execution allowance plus queuing), and a snapshot taken too early
+# would read that late write as a post-wedge submission (Sol round-6).
+# Generous multiple of the hooks' 5s timeout.
+RECOVERY_SNAPSHOT_GRACE_S = 30.0
 ATTEMPT_STATES = {
     "READY", "TRIGGERED", "PREPARED", "TYPED_VERIFIED", "SUBMITTED",
     "ACKED", "BOUNDARY_CONFIRMED", "DEFERRED", "LATCHED",
-    "SUBMISSION_UNCERTAIN", "CLEANUP_REQUIRED",
+    "SUBMISSION_UNCERTAIN", "CLEANUP_REQUIRED", "RECOVERED",
 }
 ALERT_STATES = {"LATCHED", "SUBMISSION_UNCERTAIN", "CLEANUP_REQUIRED"}
 LIFECYCLE_STATES = {"WATCHER_READY", "ALERT_DELIVERY", "WATCHER_RETIRED",
@@ -1153,6 +1173,78 @@ def attempt_tail(path):
     return None
 
 
+def journal_tail_records(path, max_bytes=65536):
+    """Records parsed from the journal's last max_bytes only — a HARD
+    byte cap, cheap enough for a per-tool-call hook against a journal
+    that can be tens of MB even when a record line is oversized or
+    torn (an unbounded readline after the seek would read a whole
+    giant line — Sol finding). A partial first line inside the window
+    is dropped; None on any read surprise, so callers make no claim
+    rather than a wrong one."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                data = fh.read(max_bytes)
+                # Drop the partial first line inside the window.
+                cut = data.find(b"\n")
+                data = data[cut + 1:] if cut >= 0 else b""
+            else:
+                data = fh.read(max_bytes)
+    except OSError:
+        return None
+    segments = data.split(b"\n")
+    # _journal_records requires the b"\n" terminator, so a trailing
+    # torn fragment (last segment, no newline) is dropped naturally.
+    lines = [seg + b"\n" for seg in segments[:-1]]
+    return _journal_records(lines)
+
+
+def wedge_verdict(cfg, session_id):
+    """The session's watcher-journal verdict for surfacing INSIDE the
+    session, three-valued because "no claim" must never read as an
+    all-clear (Sol finding — a lifecycle-flooded tail window would
+    otherwise silently cancel a real wedge warning):
+
+    ("wedged", info)  — the conservative recovery mapping of the tail
+                        attempt record is an operator-attention state
+                        (CLEANUP_REQUIRED, SUBMISSION_UNCERTAIN, or a
+                        SAFETY latch; THRESHOLD latches are anti-churn
+                        hysteresis, not hazards). info carries
+                        fingerprint/state/reason/ts.
+    ("clear", None)   — a tail attempt record exists and is positively
+                        NOT an attention state (RECOVERED included).
+    ("unknown", None) — no journal, unreadable, or no attempt record
+                        inside the tail window: no claim either way.
+    """
+    paths = managed_paths(cfg, session_id)
+    records = journal_tail_records(paths["journal"])
+    if not records:
+        return "unknown", None
+    raw_tail = None
+    for record in reversed(records):
+        if record.get("state") in ATTEMPT_STATES:
+            raw_tail = record
+            break
+    if raw_tail is None:
+        return "unknown", None
+    tail = recover_attempt_records(records, boot_id())
+    if tail is None:
+        # An attempt record exists but maps to no attempt: that is the
+        # durable RECOVERED disposition — positively clear.
+        return "clear", None
+    state = tail.get("state")
+    if state not in ALERT_STATES or (
+            state == "LATCHED" and tail.get("latch_kind") == "THRESHOLD"):
+        return "clear", None
+    return "wedged", {
+        "fingerprint": "%s:%s:%s" % (tail.get("attempt_id"), state,
+                                     tail.get("reason")),
+        "state": state, "reason": tail.get("reason"),
+        "ts": tail.get("ts")}
+
+
 def boot_id(proc_root="/proc"):
     try:
         with open(os.path.join(proc_root, "sys/kernel/random/boot_id")) as fh:
@@ -1192,6 +1284,12 @@ def recover_attempt_records(records, current_boot_id):
     if tail is None:
         return None
     state = tail.get("state")
+    if state == "RECOVERED":
+        # A durable self-recovery record: the wedge's hazard was proven
+        # gone (composer, pane, and transcript all clean), so a restart
+        # must start fresh, not resurrect the CLEANUP_REQUIRED row
+        # underneath it.
+        return None
     recovered = dict(tail)
     recovered["attempt_packet_seq_floor"] = tail.get(
         "attempt_packet_seq_floor", tail.get("packet_seq_at_prepare", 0))
@@ -1713,11 +1811,18 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
         journal_record(journal_path, "CLEANUP_REQUIRED", attempt,
                        reason=attempt["reason"])
         return attempt
-    wait(0.4)
-    capture = capture_pane(binding, run_tmux, ansi=True)
-    snap = parse_pane(capture) if capture is not None else None
-    ok, reason = validate_binding(binding, cfg, paths, run_tmux, proc_root,
-                                  sessions_dir=sessions_dir)
+    # Verify with re-capture: a transient repaint (spinner frame, task
+    # list redraw) racing one capture must not terminalize a healthy
+    # attempt. Captures are read-only; a binding loss aborts at once.
+    snap, ok, reason = None, False, "composer_mismatch"
+    for _ in range(R5_VERIFY_ATTEMPTS):
+        wait(0.4)
+        capture = capture_pane(binding, run_tmux, ansi=True)
+        snap = parse_pane(capture) if capture is not None else None
+        ok, reason = validate_binding(binding, cfg, paths, run_tmux,
+                                      proc_root, sessions_dir=sessions_dir)
+        if not ok or snapshot_exact(snap, text):
+            break
     if not ok or not snapshot_exact(snap, text):
         detail = reason if not ok else "composer_mismatch"
         attempt.update(state="CLEANUP_REQUIRED", reason="R5_%s" % detail)
@@ -2036,6 +2141,36 @@ def notify(binding, cfg, paths, attempt, run_tmux=default_run_tmux):
                    delivered=delivered)
 
 
+def transcript_contains(path, start, needles,
+                        cap=RECOVERY_SCAN_MAX_BYTES):
+    """True if any needle appears in the transcript's bytes from
+    `start`; False when provably absent; None when the span is
+    unreadable or too large to examine (unprovable — callers must
+    treat None as blocking, never as absent)."""
+    try:
+        raw_needles = [n.encode("utf-8") for n in needles if n]
+        if not raw_needles:
+            return None
+        size = os.path.getsize(path)
+        if not isinstance(start, int) or isinstance(start, bool) or \
+                start < 0 or start > size or size - start > cap:
+            return None
+        overlap = max(len(n) for n in raw_needles)
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            prev_tail = b""
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    return False
+                block = prev_tail + chunk
+                if any(n in block for n in raw_needles):
+                    return True
+                prev_tail = block[-overlap:]
+    except Exception:
+        return None
+
+
 class Watcher:
     def __init__(self, binding, cfg, paths, run_tmux=default_run_tmux,
                  proc_root="/proc", monotonic=time.monotonic,
@@ -2047,6 +2182,13 @@ class Watcher:
         self.wait = wait or (lambda seconds: time.sleep(seconds))
         self.stop_requested = False
         self.typed_critical = False
+        self._recovery_next = 0.0
+        self._recovery_streak = 0
+        self._recovery_attempt_id = None
+        self._recovery_baseline = 0
+        self._recovery_baseline_epoch = None
+        self._recovery_activity_fp = None
+        self._recovery_fp_due = 0.0
         self.next_heartbeat = monotonic() + HEARTBEAT_S
         self.started = monotonic()
         self.cursor = load_cursor(paths["scan"])
@@ -2098,6 +2240,248 @@ class Watcher:
                 self.attempt.get("latch_kind") == "THRESHOLD"):
             return
         notify(self.binding, self.cfg, self.paths, self.attempt, self.run_tmux)
+
+    def _recovery_probe_ok(self, packet):
+        """One read-only observation that the R5 hazard — our typed
+        bytes — is provably gone from every place they could land:
+        composer empty (no modal, parseable), no attempt nonce visible
+        anywhere in the pane, a caught-up transcript containing no
+        attempt nonce, and no in-flight packet. The leader must be
+        actively schedulable (R/S): a stopped or unreadable claude can
+        hold our bytes unconsumed in the tty input queue while the
+        screen still shows the old empty composer (Sol blocker). Any
+        unprovable leg fails the probe."""
+        leader = proc_stat(self.binding["claude_pid"], self.proc_root)
+        if leader is None or leader.get("state") not in ("R", "S"):
+            return False
+        # The turn must be provably ENDED (same activity evidence the
+        # boundary lane trusts before typing): mid-generation, stdin
+        # consumption and composer rendering cannot be assumed, so an
+        # empty composer during a turn proves nothing about queued
+        # bytes (Sol round-2). At rest, the TUI has drained its input,
+        # and an empty composer plus a nonce-free transcript is real
+        # disposition evidence. Absent/unknown markers fail closed.
+        # Recovery demands hardenings the boundary lane tolerates
+        # living without (its worst case is a defer or a cleanup
+        # hazard; recovery EXITS containment — Sol rounds 3-4):
+        # - the ended marker must not carry stop_hook_active: a
+        #   co-installed blocking Stop hook writes "ended" and then
+        #   forces generation to continue, so such a pair can read
+        #   "ended" during live generation (the flag is only true on
+        #   RE-invocations, so this alone is not sufficient — hence
+        #   the identity requirement below);
+        # - the pair's RUNNING half must be a NEW identity relative to
+        #   the snapshot taken at the wedge's first sighting: identity
+        #   is causal where wall-clock ordering is not (a clock step
+        #   would launder a stale pair), and only a UserPromptSubmit
+        #   rewrites the running half — the ended half alone is
+        #   rewritten by every Stop, including a pre-wedge prompt's
+        #   first blocked Stop, and proves nothing (Sol round-5). A
+        #   new running identity means a prompt was SUBMITTED after
+        #   the wedge — and the tty queue is FIFO, so our earlier
+        #   bytes were necessarily consumed before that prompt's
+        #   keystrokes: any survivors are then in the composer, the
+        #   transcript, or the packet, where the legs below catch
+        #   them. Pairing ("ended") then proves that post-wedge turn
+        #   also finished.
+        try:
+            if self._activity_reader()[0] != "ended":
+                return False
+            ended = _read_activity_file(
+                activity_paths(self.cfg,
+                               self.binding["session_id"])["ended"],
+                self.binding["session_id"], self.wall())
+            if ended is None or ended.get("stop_hook_active"):
+                return False
+            fp0 = self._recovery_activity_fp
+            if fp0 is None:
+                return False
+            fp_now = self._running_fingerprint()
+            if not isinstance(fp_now, tuple):
+                return False
+            if fp0 != "absent" and fp_now == fp0:
+                return False
+        except Exception:
+            return False
+        needles = ["cm-%s" % n for n in self.attempt.get("nonces", [])
+                   if isinstance(n, str) and n]
+        if not needles:
+            return False
+        capture = capture_pane(self.binding, self.run_tmux, ansi=True)
+        if capture is None:
+            return False
+        snap = parse_pane(capture)
+        if snap["modal"] or snap["composer"] != "empty":
+            return False
+        if any(n in (snap.get("plain") or "") for n in needles):
+            return False
+        if not self.cursor.get("caught_up") or \
+                self.cursor.get("_scan_error"):
+            return False
+        if packet_classification(self.attempt, packet,
+                                 cursor=self.cursor) != "NONE":
+            return False
+        gen = self.attempt.get("generation") or {}
+        cur = generation(self.cursor)
+        start = (gen.get("last_boundary_offset")
+                 if isinstance(gen, dict) and
+                 gen.get("file_epoch") == cur.get("file_epoch") else 0)
+        if not isinstance(start, int) or isinstance(start, bool) or \
+                start < 0:
+            # A pre-first-boundary generation stores None: scan from
+            # the top rather than fail the probe forever.
+            start = 0
+        return transcript_contains(
+            self.binding["transcript_path"], start, needles) is False
+
+    def _running_fingerprint(self):
+        """Identity of the current RUNNING marker — the half only a
+        UserPromptSubmit rewrites, so a changed running identity proves
+        a prompt was SUBMITTED after the snapshot (the ended half alone
+        is rewritten by every Stop and proves nothing — Sol round-5).
+        "absent" only on confirmed ENOENT (any future pair is then
+        post-wedge); None when existence or content cannot be validated
+        (unprovable — snapshot and probes both refuse it); else
+        (prompt_id, written_at)."""
+        path = activity_paths(self.cfg,
+                              self.binding["session_id"])["running"]
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return None
+        record = _read_activity_file(path, self.binding["session_id"],
+                                     self.wall())
+        if record is None:
+            return None
+        return (record.get("prompt_id"), record.get("written_at"))
+
+    def _maybe_recover(self, now, packet):
+        """Self-recovery from CLEANUP_REQUIRED/R5_composer_mismatch —
+        the one cleanup reason whose hazard is fully observable. Two
+        clean probes RECOVERY_POLL_S apart re-arm the watcher; the
+        RECOVERED record is durable, so a restart starts fresh instead
+        of resurrecting the wedge. Every other cleanup reason keeps
+        the terminal semantics (operator resolve only). Probes never
+        send a key.
+
+        Two guards beyond the probe itself (both Sol blockers):
+        - The transcript must have GROWN since the wedge was first
+          seen: growth proves the session's event loop ran, and a
+          running claude consumes queued tty input into the composer —
+          so an empty composer plus a nonce-free transcript after
+          growth rules out bytes still hidden in the input queue. A
+          dead-idle session therefore never self-recovers.
+        - The commit is serialized under the txn lock and re-reads the
+          journal tail: an operator resolve that landed mid-probe
+          stands, never masked by a later RECOVERED append."""
+        if not self.attempt or \
+                self.attempt.get("state") != "CLEANUP_REQUIRED" or \
+                self.attempt.get("reason") != "R5_composer_mismatch":
+            return
+        aid = self.attempt.get("attempt_id")
+        if not isinstance(aid, str) or not aid:
+            # A journal record missing its attempt identity would slide
+            # past the None-initialized first-sighting sentinel with a
+            # zero baseline — pre-wedge transcript bytes would count as
+            # growth, and the commit re-check would accept None==None
+            # (Sol round-2 blocker). Invalid identity stays wedged.
+            return
+        epoch = generation(self.cursor).get("file_epoch")
+        if self._recovery_attempt_id != aid or \
+                self._recovery_baseline_epoch != epoch:
+            # First sighting of this wedge — or the transcript rotated
+            # under it (offsets restart, so the old baseline would
+            # stall growth detection): baseline the current offset;
+            # probes begin next interval. The running-marker snapshot
+            # (rest evidence must be a DIFFERENT identity than the
+            # wedge saw) is pinned to the first sighting only — a
+            # rotation does not move the wedge — and QUARANTINED
+            # RECOVERY_SNAPSHOT_GRACE_S so a pre-wedge prompt's
+            # delayed hook write lands inside it, never after it.
+            if self._recovery_attempt_id != aid:
+                self._recovery_activity_fp = None
+                self._recovery_fp_due = now + RECOVERY_SNAPSHOT_GRACE_S
+            self._recovery_attempt_id = aid
+            self._recovery_baseline = self.cursor.get("offset", 0)
+            self._recovery_baseline_epoch = epoch
+            self._recovery_streak = 0
+            self._recovery_next = now + RECOVERY_POLL_S
+            return
+        if self._recovery_activity_fp is None:
+            # No authoritative snapshot yet: wait out the quarantine,
+            # then take it — and keep retrying while it is unprovable
+            # (a running marker that exists but does not validate, or
+            # an inspection error that is not confirmed absence).
+            # Probes never run without a snapshot: they could accept a
+            # stale pre-wedge pair.
+            if now < self._recovery_fp_due:
+                return
+            self._recovery_activity_fp = self._running_fingerprint()
+            return
+        if now < self._recovery_next:
+            return
+        self._recovery_next = now + RECOVERY_POLL_S
+        try:
+            grown = self.cursor.get("offset", 0) > self._recovery_baseline
+            ok = grown and self._recovery_probe_ok(packet)
+        except Exception:
+            ok = False
+        if not ok:
+            self._recovery_streak = 0
+            return
+        self._recovery_streak += 1
+        if self._recovery_streak < RECOVERY_PROBES:
+            return
+        self._recovery_streak = 0
+        try:
+            with txn_lock(self.paths["txn"]):
+                tail = attempt_tail(self.paths["journal"])
+                # Keyed on the ATTEMPT's identity, not the current
+                # binding's run_token: an unproven-bytes wedge is a
+                # property of the pane, and a successor watcher that
+                # adopted after the creator died must be able to
+                # complete recovery of the inherited attempt (final
+                # audit: a binding-token guard silently refused
+                # forever on exactly the crash/reclaim path where
+                # unattended recovery matters most).
+                if not (tail and tail.get("attempt_id") == aid and
+                        tail.get("state") == "CLEANUP_REQUIRED" and
+                        tail.get("reason") == "R5_composer_mismatch" and
+                        tail.get("run_token") ==
+                        self.attempt.get("run_token")):
+                    # The journal moved under us (operator resolve,
+                    # another writer): their word stands.
+                    return
+                journal_record(self.paths["journal"], "RECOVERED",
+                               self.attempt, reason="composer_clean")
+        except Exception:
+            return
+        # The durable RECOVERED record is the authority: the in-memory
+        # attempt clears the moment it lands, so a failure in the
+        # status-marker or ledger writes below can never leave a live
+        # watcher stuck wedged while the journal (and the advisor's
+        # all-clear) say recovered (Opus delta finding).
+        self.attempt = None
+        self._recovery_attempt_id = None
+        self._recovery_baseline = 0
+        self._recovery_baseline_epoch = None
+        self._recovery_activity_fp = None
+        self._recovery_fp_due = 0.0
+        self.backoff = BACKOFF_INITIAL_S
+        try:
+            journal_record(self.paths["journal"], "WATCHER_READY",
+                           {"run_token": self.binding["run_token"],
+                            "generation": generation(self.cursor)},
+                           reason="recovered")
+            cm.ledger_append(self.cfg, {
+                "event": "managed_recovered",
+                "session_id": self.binding["session_id"],
+                "run_token": self.binding["run_token"],
+                "reason": "composer_clean"})
+        except Exception:
+            pass
 
     def _transient(self, reason):
         """Validation failures that mean WAIT, not retire: job-control
@@ -2248,7 +2632,10 @@ class Watcher:
                 self.alert_if_needed(previous)
             if self.attempt.get("state") in (
                     "CLEANUP_REQUIRED", "SUBMISSION_UNCERTAIN"):
-                return True, self.attempt["state"]
+                self._maybe_recover(now, packet)
+                if self.attempt is not None:
+                    return True, self.attempt["state"]
+                return True, "recovered"
             if self.attempt.get("state") == "BOUNDARY_CONFIRMED":
                 self.backoff = BACKOFF_INITIAL_S
                 eff, trigger = self._thresholds()
