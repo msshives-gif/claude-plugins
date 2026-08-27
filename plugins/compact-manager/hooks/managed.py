@@ -126,7 +126,7 @@ INSTRUCTION_DENYLIST = ";&|><()\"'$`\n\r"
 # too narrow to render the full line unwrapped (a soft-wrapped composer
 # can never pass the typed-text verification).
 RESUME_NUDGE_TEMPLATE = ("continue [compact-manager resume nudge after "
-                         "the compaction this session requested]")
+                         "the watcher-fired compaction]")
 RESUME_NUDGE_TEMPLATE_SHORT = "continue [cm-resume]"
 # One bounded window per confirmed boundary: transient pane conditions
 # retry inside it; expiry stands down for good (never a latch — a
@@ -1916,6 +1916,38 @@ def _activity_unchanged(activity_reader, activity_rev):
     return check[0] == "ended" and check[1] == activity_rev
 
 
+def _nudge_binding_matches(phase, revision, expected_rev):
+    """The resume nudge's causal binding: same RUNNING-half identity
+    (prompt_id + its written_at), phase still ended. A genuine new
+    prompt always rewrites the running half via UserPromptSubmit; the
+    /compact turn's own Stop re-fire rewrites only the ended half's
+    timestamp and must not stand the nudge down (observed live:
+    fbeb0bf1, ended rewritten 4s after the watcher's Enter, same
+    prompt_id — every real compact skipped as "session_resumed").
+    The blocking-Stop-hook continuation (model resumes with NO
+    UserPromptSubmit) is the known exception; the stop_hook_active
+    marker gate (_nudge_ended_marker_safe) covers its re-invocations,
+    and the first blocked Stop remains a documented limitation."""
+    return (phase == "ended" and revision is not None and
+            expected_rev is not None and
+            list(revision)[:2] == list(expected_rev)[:2])
+
+
+def _nudge_ended_marker_safe(cfg, session_id, now_wall=time.time):
+    """The ended marker must not carry stop_hook_active: a blocking
+    Stop hook forces the turn to CONTINUE after the ended write, so
+    the pair reads "ended" during live generation — the same gate the
+    active-clearing path applies (Sol nudge-round-1 #2). Unreadable
+    evidence refuses."""
+    try:
+        ended = _read_activity_file(
+            activity_paths(cfg, session_id)["ended"], session_id,
+            now_wall())
+        return ended is not None and not ended.get("stop_hook_active")
+    except Exception:
+        return False
+
+
 def _boundary_still_safe(binding, run_tmux, activity_reader, activity_rev):
     """Pre-R4 revalidation: same ended turn AND a still-input-safe,
     still-empty composer at the moment before the first typed byte.
@@ -2319,10 +2351,12 @@ def type_resume_nudge(binding, cfg, paths, run_tmux=default_run_tmux,
     input.
 
     expected_rev causally binds every keystroke to ONE specific ended
-    turn — the pre-compact turn that requested the compaction: the
-    preflight's activity read must return exactly that revision, and
-    it is re-proven immediately before Enter regardless of lane (Sol
-    round-1 #2/#4). deadline_mono bounds keystrokes, not just entry:
+    turn — the pre-compact turn the nudge was armed against: the
+    preflight's activity read must carry the same RUNNING-half
+    identity (prompt_id + written_at; the ended half's timestamp
+    churns on the /compact turn's own Stop re-fire), re-proven
+    immediately before Enter regardless of lane (Sol round-1 #2/#4).
+    deadline_mono bounds keystrokes, not just entry:
     it is rechecked before the first typed byte and before Enter, so
     a call admitted at the window's edge cannot act after it (Sol
     round-1 #7).
@@ -2349,10 +2383,12 @@ def type_resume_nudge(binding, cfg, paths, run_tmux=default_run_tmux,
         return False, reason
     if expected_rev is not None and (
             activity_rev is None or
-            tuple(activity_rev) != tuple(expected_rev)):
-        # The evidence decayed or belongs to a different turn — even
-        # via the strict lane, the nudge only ever continues the exact
-        # turn that requested the compaction.
+            list(activity_rev)[:2] != list(expected_rev)[:2]):
+        # The evidence decayed or belongs to a different turn (new
+        # RUNNING half; the ended half's timestamp churns on the
+        # /compact turn's own Stop re-fire) — even via the strict
+        # lane, the nudge only ever continues the exact stranded
+        # boundary it was armed for.
         return True, "failed_activity_changed"
     ok, r4_facts = validate_binding(binding, cfg, paths, run_tmux, proc_root,
                                     sessions_dir=sessions_dir)
@@ -2390,10 +2426,17 @@ def type_resume_nudge(binding, cfg, paths, run_tmux=default_run_tmux,
     if not snapshot_exact(snap, text):
         return True, "failed_verify"
     if expected_rev is not None:
-        # Both lanes: the same ended turn must still be the last word
-        # immediately before Enter.
-        if not _activity_unchanged(activity_reader, tuple(expected_rev)):
+        # Both lanes: the same turn (running-half identity) must still
+        # be the last word immediately before Enter.
+        phase_now, rev_now = activity_reader()
+        if not _nudge_binding_matches(phase_now, rev_now, expected_rev):
             return True, "failed_activity_changed"
+        if not _nudge_ended_marker_safe(cfg, binding["session_id"],
+                                        now_wall):
+            # A blocking Stop hook forced the turn to continue after
+            # its ended write: "ended" is a lie mid-generation (Sol
+            # nudge-round-1 #2).
+            return True, "failed_stop_hook_active"
     elif (lane == "boundary" and
             not _activity_unchanged(activity_reader, activity_rev)):
         return True, "failed_activity_changed"
@@ -3482,7 +3525,6 @@ class Watcher:
                 self._active_recoveries = 0
                 self._active_exhausted_journaled = False
                 if (self.cfg.get("managed_resume_nudge") and
-                        self.attempt.get("trigger_source") == "request" and
                         # A FRESH transition only: a watcher restart
                         # resurrects the BOUNDARY_CONFIRMED tail and
                         # re-enters this branch with previous already
@@ -3497,25 +3539,42 @@ class Watcher:
                     # foreign/native packet that replaced ours after
                     # the ack, and a resolved latch's stale proof
                     # would otherwise arm on a later human /compact
-                    # (Sol round-2 #3).
+                    # (Sol round-2 #3). EVERY manager-fired compact
+                    # nudges, threshold triggers included — /compact
+                    # never re-invokes the model, so a compaction the
+                    # watcher typed strands an autonomous session no
+                    # matter who asked for it (Matt, 2026-08-26).
                     if (previous in ("SUBMITTED", "ACKED") and
                             self.attempt.get("own_packet_proof") is True):
-                        # The session asked for this compaction and
-                        # ended its turn expecting to continue;
-                        # /compact never re-invokes the model, so arm
-                        # one bounded resume nudge (typed on a later
-                        # tick, once the post-compaction repaint
-                        # settles). The binding revision is the one
-                        # observed when the instruction was TYPED —
-                        # the current pair must still match it, or a
-                        # turn slipped in during the compaction (Sol
-                        # round-2 #2).
+                        # Causal binding is the RUNNING-half identity
+                        # (prompt_id + its written_at): a genuinely
+                        # new turn always rewrites it via
+                        # UserPromptSubmit, while the /compact turn's
+                        # own Stop re-fire rewrites only the ended
+                        # half's timestamp — exact-tuple equality here
+                        # stood the nudge down on every real compact
+                        # (observed live: fbeb0bf1 19:32, ended
+                        # rewritten 4s after Enter, same prompt_id).
                         phase, revision = self._activity_reader()
                         stored_submit = self.attempt.get(
                             "activity_rev_at_submit")
                         if (phase == "ended" and revision is not None and
                                 stored_submit is not None and
-                                list(revision) == list(stored_submit)):
+                                list(revision)[:2] ==
+                                list(stored_submit)[:2] and
+                                not _nudge_ended_marker_safe(
+                                    self.cfg,
+                                    self.binding["session_id"],
+                                    self.wall)):
+                            # "ended" can be a lie mid-generation when
+                            # a blocking Stop hook forced the turn to
+                            # continue (Sol nudge-round-1 #2).
+                            self._journal_resume_skip(
+                                "skipped_stop_hook_active")
+                        elif (phase == "ended" and revision is not None and
+                                stored_submit is not None and
+                                list(revision)[:2] ==
+                                list(stored_submit)[:2]):
                             self._pending_resume = {
                                 "deadline_mono":
                                     now + RESUME_NUDGE_WINDOW_S,
@@ -3524,15 +3583,27 @@ class Watcher:
                                     self.attempt.get("attempt_id"),
                                 "generation_k": generation_key(
                                     current_generation)}
+                        elif (phase == "ended" and revision is not None and
+                                stored_submit is None):
+                            # The compact was typed without readable
+                            # marker evidence: an ended pair first
+                            # observed AFTER the boundary cannot be
+                            # proven to predate it — a genuine turn
+                            # completing between the boundary and this
+                            # poll would be adopted and nudged over
+                            # (Sol nudge-round-1 #1). Causality beats
+                            # coverage.
+                            self._journal_resume_skip(
+                                "skipped_no_submit_binding")
                         elif phase == "ended" and revision is not None:
                             self._journal_resume_skip(
                                 "skipped_session_resumed")
                         else:
                             # No positive ended-turn evidence: the
-                            # nudge cannot be causally bound to the
-                            # requesting turn, so it is dropped —
-                            # never typed via the strict lane on
-                            # faith (Sol round-1 #2).
+                            # nudge cannot be causally bound to any
+                            # turn, so it is dropped — never typed via
+                            # the strict lane on faith (Sol round-1
+                            # #2).
                             self._journal_resume_skip(
                                 "skipped_no_ended_marker")
                     else:
@@ -3673,8 +3744,11 @@ class Watcher:
             pass
 
     def _maybe_resume_nudge(self, now, current_generation, packet):
-        """One bounded, benign continuation prompt after a REQUESTED
-        compaction's confirmed boundary. Terminal dispositions journal
+        """One bounded, benign continuation prompt after a
+        MANAGER-FIRED compaction's confirmed boundary (any trigger:
+        /compact never re-invokes the model, so a compaction the
+        watcher typed strands an autonomous session no matter who
+        asked for it). Terminal dispositions journal
         a RESUME_NUDGE row (a state deliberately in neither
         ATTEMPT_STATES nor LIFECYCLE_STATES: forensics only, invisible
         to recovery, wedge verdicts, and status). Any surprise degrades
@@ -3721,11 +3795,11 @@ class Watcher:
             stored = self._pending_resume.get("activity_rev")
             if phase == "running" or (
                     revision is not None and stored is not None and
-                    list(revision) != list(stored)):
+                    list(revision)[:2] != list(stored)[:2]):
                 # A prompt is in flight (or a whole new turn already
-                # ran): the session resumed without us — the nudge
-                # would land mid-conversation, not at the stranded
-                # boundary it was armed for.
+                # ran — its running half differs): the session resumed
+                # without us — the nudge would land mid-conversation,
+                # not at the stranded boundary it was armed for.
                 self._resolve_resume("skipped_session_resumed")
                 return
             done, reason = type_resume_nudge(

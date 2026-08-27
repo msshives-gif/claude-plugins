@@ -6010,8 +6010,9 @@ class AdvisorPromiseTests(unittest.TestCase):
 
 
 class ResumeNudgeWiringTests(TickWiringTests):
-    """End-to-end: request-triggered boundary arms the nudge; the next
-    tick types it; threshold boundaries and disabled config never do."""
+    """End-to-end: any manager-fired boundary (request or threshold
+    trigger) arms the nudge; the next tick types it; foreign
+    boundaries and disabled config never do."""
 
     def confirmed_watcher(self, trigger, tmux, state="SUBMITTED",
                           proof=True, markers=True, **kw):
@@ -6063,12 +6064,121 @@ class ResumeNudgeWiringTests(TickWiringTests):
                             for a in tmux.sent))
         self.assertTrue(any(a[-1] == "Enter" for a in tmux.sent))
 
-    def test_threshold_boundary_never_arms(self):
-        watcher = self.confirmed_watcher("threshold", EchoTmux())
+    def test_threshold_boundary_arms_and_types(self):
+        # EVERY manager-fired compact nudges, threshold triggers
+        # included — /compact never re-invokes the model, so a
+        # compaction the watcher typed strands an autonomous session
+        # no matter who asked for it (Matt, 2026-08-26).
+        tmux = EchoTmux()
+        watcher = self.confirmed_watcher("threshold", tmux)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+        self.assertIsNotNone(watcher._pending_resume)
+        watcher.tick()
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["submitted"])
+
+    def test_compact_turn_stop_refire_still_arms(self):
+        # The fbeb0bf1 19:32 regression: Claude Code re-fires the Stop
+        # hook for the /compact turn itself, rewriting the ended
+        # marker's written_at with the SAME prompt_id ~4s after the
+        # watcher's Enter. That is not a new turn — the running half
+        # never moves (local commands skip UserPromptSubmit) — and
+        # must not stand the nudge down as "session_resumed".
+        tmux = EchoTmux()
+        watcher = self.confirmed_watcher("request", tmux)
+        payload = {"session_id": self.sid, "prompt_id": "prompt-req1",
+                   "transcript_path": self.transcript}
+        managed.write_activity(self.cfg, payload, "ended")  # re-fire
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+        self.assertIsNotNone(watcher._pending_resume)
+        watcher.tick()
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["submitted"])
+
+    def test_threshold_latch_and_nudge_coexist(self):
+        # A boundary that leaves pct still above the re-arm band arms
+        # BOTH the anti-churn THRESHOLD latch and the nudge: the
+        # session must resume (and grow context toward re-arm) while
+        # the latch holds re-firing. The nudge types on the next tick
+        # even though the attempt sits LATCHED.
+        rows = [usage_row(170000), boundary_row(post=170000)]
+        self.cfg["managed_resume_nudge"] = True
+        tmux = EchoTmux()
+        watcher = self.make_watcher(rows, tmux)
+        payload = {"session_id": self.sid, "prompt_id": "prompt-req1",
+                   "transcript_path": self.transcript}
+        managed.write_activity(self.cfg, payload, "running")
+        managed.write_activity(self.cfg, payload, "ended")
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(managed.default_cursor()),
+            0, 0.0, "boot", "threshold")
+        watcher.attempt["state"] = "SUBMITTED"
+        watcher.attempt["own_packet_proof"] = True
+        rev = managed.read_activity(self.cfg, self.sid, self.transcript)[1]
+        watcher.attempt["activity_rev_at_submit"] = list(rev)
+        watcher.attempt["timers"]["ack_deadline_mono"] = 10 ** 9
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertEqual((watcher.attempt["state"],
+                          watcher.attempt["latch_kind"]),
+                         ("LATCHED", "THRESHOLD"))
+        self.assertIsNotNone(watcher._pending_resume)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["submitted"])
+
+    def test_unbound_submit_declines(self):
+        # A compact typed while markers were unreadable carries
+        # activity_rev_at_submit=None. An ended pair first observed
+        # AFTER the boundary cannot be proven to predate it — a
+        # genuine turn completing between the boundary and this poll
+        # would be adopted and nudged over (Sol nudge-round-1 #1):
+        # decline instead of binding forward.
+        tmux = EchoTmux()
+        watcher = self.confirmed_watcher("threshold", tmux)
+        watcher.attempt["activity_rev_at_submit"] = None
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_no_submit_binding"])
+
+    def test_stop_hook_active_marker_never_arms(self):
+        # A blocking Stop hook forces the turn to continue after its
+        # ended write: "ended" is a lie mid-generation. The affirmative
+        # stop_hook_active diagnostic on the marker refuses arming
+        # (Sol nudge-round-1 #2), same gate as active clearing.
+        watcher = self.confirmed_watcher("request", EchoTmux())
+        payload = {"session_id": self.sid, "prompt_id": "prompt-req1",
+                   "transcript_path": self.transcript,
+                   "stop_hook_active": True}
+        managed.write_activity(self.cfg, payload, "ended")
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+        self.assertIsNone(watcher._pending_resume)
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["skipped_stop_hook_active"])
+
+    def test_stop_hook_active_after_arming_stands_down_before_enter(self):
+        # The flag can appear between arming and the typing tick; the
+        # pre-Enter re-proof must stand down.
+        tmux = EchoTmux()
+        watcher = self.confirmed_watcher("request", tmux)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "below_threshold"))
+        self.assertIsNotNone(watcher._pending_resume)
+        payload = {"session_id": self.sid, "prompt_id": "prompt-req1",
+                   "transcript_path": self.transcript,
+                   "stop_hook_active": True}
+        managed.write_activity(self.cfg, payload, "ended")
         watcher.tick()
         self.assertIsNone(watcher._pending_resume)
-        watcher.tick()
-        self.assertEqual(self.nudge_rows(), [])
+        self.assertEqual([r.get("reason") for r in self.nudge_rows()],
+                         ["failed_stop_hook_active"])
+        self.assertFalse(any(a[-1] == "Enter" for a in tmux.sent))
 
     def test_disabled_config_never_arms(self):
         watcher = self.confirmed_watcher("request", EchoTmux(),

@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Resume nudge: every **manager-fired** compaction now nudges, not
+  just session-requested ones — /compact never re-invokes the model,
+  so a compaction the watcher typed strands an autonomous session no
+  matter who asked for it (Matt, 2026-08-26). Foreign/native
+  boundaries and unproven boundaries still never nudge, and the
+  default stays off.
+- Resume nudge fix: the causal binding now compares the RUNNING-half
+  marker identity (prompt_id + written_at) instead of the full
+  revision tuple. Claude Code re-fires the Stop hook for the /compact
+  turn itself, rewriting the ended marker's timestamp with the same
+  prompt_id seconds after the watcher's Enter; exact-tuple equality
+  read that as "a turn slipped in" and stood the nudge down on every
+  real compact (observed live: fbeb0bf1 19:32, `RESUME_NUDGE
+  skipped_session_resumed`, session idle 3.5h). Every genuine new
+  PROMPT rewrites the running half via UserPromptSubmit, so the
+  narrowed binding still stands down for real resumptions; the one
+  promptless continuation — a blocking Stop hook forcing the turn
+  onward — is gated separately: an ended marker carrying
+  `stop_hook_active` refuses arming and vetoes Enter (the same gate
+  active clearing uses), with the first blocked Stop invocation a
+  documented limitation the flag cannot see. A compact submitted
+  while markers were unreadable (`activity_rev_at_submit` None)
+  declines the nudge (`skipped_no_submit_binding`) — an ended pair
+  first observed after the boundary cannot be proven to predate it.
+
 - Watcher fix: an `ACKED` attempt whose compaction never lands now
   latches `missing_boundary` when the completion timeout expires even
   while a packet lingers on disk. Previously the packet-classification
