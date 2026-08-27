@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+- Watcher fix: an `ACKED` attempt whose compaction never lands now
+  latches `missing_boundary` when the completion timeout expires even
+  while a packet lingers on disk. Previously the packet-classification
+  early returns (OWN, and FOREIGN when a native compaction replaced
+  our packet — Sol round-1) re-entered `ACKED` on every tick before
+  the timer branch could run, so the attempt sat `ACKED` forever with
+  no alert (the known issue noted in the resume-nudge release). A
+  lingering own packet can no longer resurrect a `LATCHED` attempt to
+  `ACKED` either — a recovered cross-boot latch would compare a stale
+  monotonic deadline and silently un-latch (Sol round-1). The latch
+  keeps the nonce identity, so a boundary that lands late still
+  confirms with the fired-compact proof intact — and a late own
+  packet observed while latched still stamps and journals the
+  fired-compact proof (metadata-only journal row; no state change,
+  no alert), so `cm_compact_count` keeps the fired compact across
+  restarts (Sol round-2). The proof-only append serializes under the
+  txn lock with a tail re-check: a concurrent operator resolution
+  stays authoritative and the proof is merged into a fresh
+  operator_resolved row rather than either side losing to lock
+  order; transient failures keep the proof pending for retry; and
+  startup recovery journals a proof gained by its packet inspection
+  even when the recovered state is unchanged (Sol rounds 3-4).
+- Watcher: leaving an alert state journals its transition row under
+  the txn lock, serialized with `resolve` — an unlocked append could
+  interleave with a concurrent operator resolve and leave a stale
+  wedge tail describing a latch the runtime no longer holds (status
+  reporting a wedge while the live watcher runs free; Sol round-6).
+  This covers the THRESHOLD-latch re-arm appends too (Sol round-7).
+  Fail-open: a wedged lock falls back to the unlocked append rather
+  than losing the row.
+- `resolve`: a PREPARED/TYPED_VERIFIED raw tail whose run token holds
+  a LIVE session lease is refused ("stop the watcher first") — those
+  alerts are crash-recovery projections of a possibly-live ladder,
+  which would type and submit straight through the resolution (Sol
+  round-7); a dead lease keeps the crash tail resolvable. Both the
+  projected and raw views now come from ONE journal snapshot, so a
+  ladder advancing between two reads cannot slip past the guard (Sol
+  round-8).
+- Tests: the resume-nudge config tests now pin `COMPACT_MANAGER_CONFIG`
+  to a nonexistent path — they read the machine's real
+  `~/.claude/compact-manager.json` before, so enabling the nudge
+  locally failed `test_default_off`. The live suite (`tools/
+  live-managed/run.sh`) had the same hole and now exports a
+  nonexistent `COMPACT_MANAGER_CONFIG` (observed live: s18_default_off
+  failed spuriously on a machine with the nudge enabled).
+
 - Watcher: resume nudge (`managed_resume_nudge`, default off). After a
   **session-requested** compaction's boundary is confirmed, the
   watcher types one continuation prompt and presses Enter — `/compact`

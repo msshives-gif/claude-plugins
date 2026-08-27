@@ -47,6 +47,10 @@ OUT="$D/live-results.jsonl"
 CMBIN="$ROOT/plugins/compact-manager/bin/compact-manager"
 SES=cml2
 export COMPACT_MANAGER_STATE_DIR="$STATE"
+# Hermetic: without this the watchers under test read the REAL
+# ~/.claude/compact-manager.json, and a machine that enables e.g.
+# managed_resume_nudge there fails s18_default_off spuriously.
+export COMPACT_MANAGER_CONFIG=/nonexistent/cm-live-test.json
 export COMPACT_MANAGER_MODE=managed
 export COMPACT_MANAGER_CONTEXT_WINDOW=100000
 export COMPACT_MANAGER_SOFT_PCT=0.10

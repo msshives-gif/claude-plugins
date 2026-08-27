@@ -1269,11 +1269,15 @@ def cm_compact_count(cfg, session_id):
         return None
 
 
-def attempt_tail(path):
-    for record in reversed(read_journal(path)):
+def attempt_tail_records(records):
+    for record in reversed(records):
         if record.get("state") in ATTEMPT_STATES:
             return record
     return None
+
+
+def attempt_tail(path):
+    return attempt_tail_records(read_journal(path))
 
 
 def journal_tail_records(path, max_bytes=65536):
@@ -1376,6 +1380,20 @@ def _stamp_recovered_proof(recovered, cfg, session_id):
             recovered["own_packet_proof"] = True
     except Exception:
         pass
+
+
+def recovery_needs_journal(recovered, raw_tail):
+    """Whether startup must journal the recovered attempt before
+    readiness: a synthesized state change, or fired-compact proof the
+    startup packet inspection discovered that the raw tail lacks — an
+    in-memory-only stamp dies with the packet, and the fresh Watcher
+    re-reads the unstamped journal (Sol round-3)."""
+    if recovered is None or raw_tail is None:
+        return False
+    if recovered.get("state") != raw_tail.get("state"):
+        return True
+    return (recovered.get("own_packet_proof") is True and
+            raw_tail.get("own_packet_proof") is not True)
 
 
 def recover_attempt_records(records, current_boot_id):
@@ -1491,15 +1509,42 @@ def transition_attempt(attempt, event, now_mono, cfg, packet=None,
         return out
     classification = packet_classification(out, packet, cursor)
     if classification == "OWN" and state != "CLEANUP_REQUIRED":
+        if state == "LATCHED":
+            # A latch is an operator-visible terminal: the lingering
+            # packet must not resurrect it to a live ACKED wait (a
+            # recovered cross-boot latch would then compare a stale
+            # monotonic deadline and sit ACKED, invisibly un-latched;
+            # Sol round-1 #2). Resurrection buys nothing — a boundary
+            # that lands late still confirms through the generation
+            # branch above. The proof itself must not be lost, though:
+            # a missing_ack latch whose own packet appears late has
+            # proven its compact fired (Sol round-2 — cm_compacts
+            # would otherwise undercount forever).
+            out["own_packet_proof"] = True
+            return out
         out["state"] = "ACKED"
         out["timers"].setdefault(
             "completion_deadline_mono", now_mono + cfg["managed_completion_timeout_s"])
+        # The deadline must fire even while the packet persists: this
+        # early return skips the timer branch below, and an own packet
+        # whose compaction never lands would otherwise hold the attempt
+        # ACKED forever with no alert.
+        if now_mono >= out["timers"]["completion_deadline_mono"]:
+            out["state"], out["latch_kind"] = "LATCHED", "SAFETY"
+            out["reason"] = "missing_boundary"
         return out
     if classification == "FOREIGN":
         if state == "ACKED":
             # Our disposition is already proven.  Layer 1 may have replaced
             # our packet with the native compaction that will advance the
-            # boundary; continue the bounded completion wait.
+            # boundary; continue the bounded completion wait — but the
+            # deadline must fire even while the foreign packet persists,
+            # or a replacing compaction that also never lands holds the
+            # attempt ACKED forever (Sol round-1 #1).
+            if now_mono >= out["timers"].get(
+                    "completion_deadline_mono", float("inf")):
+                out["state"], out["latch_kind"] = "LATCHED", "SAFETY"
+                out["reason"] = "missing_boundary"
             return out
         if state in ("TRIGGERED", "DEFERRED"):
             out["state"] = "DEFERRED"
@@ -2658,6 +2703,10 @@ class Watcher:
         # nudge (fail open — the session is exactly as idle as before
         # the feature), and can never double-nudge.
         self._pending_resume = None
+        # Fired-compact proof observed but not yet durable (transient
+        # lock/journal failure): retried each tick until it lands or a
+        # different attempt supersedes ours (Sol round-4).
+        self._proof_pending = False
         self._recovery_next = 0.0
         self._recovery_streak = 0
         self._recovery_attempt_id = None
@@ -2759,6 +2808,77 @@ class Watcher:
                 self.attempt.get("latch_kind") == "THRESHOLD"):
             return
         notify(self.binding, self.cfg, self.paths, self.attempt, self.run_tmux)
+
+    def _journal_state_change(self, previous, **extra):
+        """Journal a tick transition. Leaving an alert state is
+        arbitrated under the txn lock (Sol round-6): an unlocked
+        append can interleave with resolve_session's locked
+        read-check-append — resolve reads the latch, the tick appends
+        its new state, resolve appends operator_resolved — leaving a
+        stale wedge tail describing a latch the runtime no longer
+        holds (status reports a wedge while the live watcher runs
+        free). Serialized, either resolve sees the new non-alert tail
+        and refuses ("nothing resolvable"), or its resolution row
+        lands first and the state row follows it — tail and runtime
+        stay consistent in both orders. Every alert-state exit in the
+        tick must route through here, the THRESHOLD-latch re-arms
+        included (Sol round-7). Fail-open on lock failure: a
+        possibly-racing row beats a silently missing state row."""
+        if previous in ALERT_STATES:
+            try:
+                with txn_lock(self.paths["txn"]):
+                    journal_record(self.paths["journal"],
+                                   self.attempt["state"], self.attempt,
+                                   **extra)
+                return
+            except Exception:
+                pass
+        journal_record(self.paths["journal"], self.attempt["state"],
+                       self.attempt, **extra)
+
+    def _journal_proof_only(self):
+        """Durably persist fired-compact proof gained with NO state
+        change (a held latch's late own packet). Serialized under the
+        txn lock with a tail re-check (Sol round-3): if an operator
+        resolution for THIS attempt won the lock first, the proof is
+        merged into a fresh operator_resolved row — the resolution
+        stays authoritative (state, reason, dropped nonces) but the
+        historical fired-compact proof must not depend on lock order
+        (Sol round-4). Returns True when the proof is durable or a
+        different attempt superseded ours (stop retrying); False on a
+        transient lock/journal failure so the caller keeps it
+        pending."""
+        try:
+            with txn_lock(self.paths["txn"]):
+                tail = attempt_tail(self.paths["journal"])
+                if not (tail and
+                        tail.get("attempt_id") ==
+                        self.attempt.get("attempt_id") and
+                        tail.get("run_token") ==
+                        self.attempt.get("run_token")):
+                    return True
+                # Idempotence after an UNCERTAIN write (fsync failed
+                # but the row landed): a tail already carrying the
+                # proof needs no second append (Sol round-5).
+                if tail.get("own_packet_proof") is True:
+                    return True
+                if (tail.get("state") == self.attempt.get("state") and
+                        tail.get("reason") == self.attempt.get("reason")):
+                    journal_record(self.paths["journal"],
+                                   self.attempt["state"], self.attempt,
+                                   reason=self.attempt.get("reason"))
+                    return True
+                if (tail.get("state") == "LATCHED" and
+                        tail.get("reason") == "operator_resolved"):
+                    journal_record(self.paths["journal"], "LATCHED",
+                                   dict(tail, own_packet_proof=True),
+                                   reason="operator_resolved")
+                    return True
+                # Some other row superseded ours; retrying with a stale
+                # in-memory view cannot improve on it.
+                return True
+        except Exception:
+            return False
 
     def _recovery_probe_ok(self, packet):
         """One read-only observation that the R5 hazard — our typed
@@ -3276,6 +3396,13 @@ class Watcher:
                 latest["attempt_packet_seq_floor"] = latest.get(
                     "attempt_packet_seq_floor",
                     latest.get("packet_seq_at_prepare", 0))
+                # The resolution row can predate a proof observed in
+                # memory (the resolve won the lock before the proof
+                # append): the proof is a fact about THIS attempt and
+                # must survive the adoption so the pending persistence
+                # can still merge it durably (Sol round-4).
+                if self.attempt.get("own_packet_proof") is True:
+                    latest["own_packet_proof"] = True
                 self.attempt = latest
         ok, reason = validate_binding(self.binding, self.cfg, self.paths,
                                       self.run_tmux, self.proc_root,
@@ -3322,13 +3449,26 @@ class Watcher:
         self._maybe_resume_nudge(now, current_generation, packet)
         if self.attempt:
             previous = self.attempt.get("state")
+            previous_proof = self.attempt.get("own_packet_proof") is True
             self.attempt = transition_attempt(
                 self.attempt, "timer", now, self.cfg, packet,
                 current_generation, cursor=self.cursor)
+            # A late own packet can stamp fired-compact proof WITHOUT a
+            # state change (a LATCHED attempt stays latched): the proof
+            # must still reach the journal or cm_compact_count loses
+            # the fired compact across restarts (Sol round-2).
+            proof_gained = (self.attempt.get("own_packet_proof") is True
+                            and not previous_proof)
             if self.attempt.get("state") != previous:
-                journal_record(self.paths["journal"], self.attempt["state"],
-                               self.attempt, reason=self.attempt.get("reason"))
+                # The state-change row carries own_packet_proof, so any
+                # pending proof rides along durably here.
+                self._journal_state_change(previous,
+                                           reason=self.attempt.get("reason"))
                 self.alert_if_needed(previous)
+                self._proof_pending = False
+            elif (self.attempt.get("own_packet_proof") is True and
+                  (proof_gained or self._proof_pending)):
+                self._proof_pending = not self._journal_proof_only()
             if self.attempt.get("state") in (
                     "CLEANUP_REQUIRED", "SUBMISSION_UNCERTAIN"):
                 self._maybe_recover(now, packet)
@@ -3435,9 +3575,8 @@ class Watcher:
                         self.attempt = transition_attempt(
                             self.attempt, "pct_rearmed", now, self.cfg,
                             generation_value=current_generation)
-                        journal_record(self.paths["journal"], "READY",
-                                       self.attempt,
-                                       reason="request_overrides_latch")
+                        self._journal_state_change(
+                            "LATCHED", reason="request_overrides_latch")
                         self.attempt = None
                         return True, "latched"
                     eff, trigger = self._thresholds()
@@ -3456,7 +3595,7 @@ class Watcher:
                         self.attempt = transition_attempt(
                             self.attempt, "pct_rearmed", now, self.cfg,
                             generation_value=current_generation)
-                        journal_record(self.paths["journal"], "READY", self.attempt)
+                        self._journal_state_change("LATCHED")
                         self.attempt = None
                 return True, "latched"
             elif self.attempt.get("state") in ("SUBMITTED", "ACKED", "DEFERRED"):
@@ -3840,8 +3979,7 @@ def watcher_entry(args):
         # tail keeps claiming the less conservative state to status,
         # resolve, and any later recovery.
         raw_tail = attempt_tail(paths["journal"])
-        if (recovered is not None and raw_tail is not None and
-                recovered.get("state") != raw_tail.get("state")):
+        if recovery_needs_journal(recovered, raw_tail):
             journal_record(paths["journal"], recovered["state"], recovered,
                            reason=recovered.get("reason"))
         ready_attempt = {"run_token": run_token,
@@ -4081,14 +4219,20 @@ def resolve_session(cfg, sid):
         # the raw tail: a crashed watcher's PREPARED/TYPED_VERIFIED tail
         # IS the hazard the operator is resolving.
         current_boot = boot_id()
-        tail = recover_attempt(paths["journal"], current_boot)
+        # ONE journal snapshot for both views: with separate reads, a
+        # live ladder advancing between them (PREPARED at the first
+        # read, SUBMITTED at the second) defeats the raw-state guard
+        # below and resolves over an in-flight submission (Sol
+        # round-8).
+        records = read_journal(paths["journal"])
+        tail = recover_attempt_records(records, current_boot)
         if tail is None or tail.get("state") not in ALERT_STATES:
             return False, "nothing resolvable"
         token = tail.get("run_token")
         lease, _ = read_json_inode(paths["session_lease"])
         if lease is None:
             return False, "session lease is unreadable"
-        raw = attempt_tail(paths["journal"])
+        raw = attempt_tail_records(records)
         if (current_boot == "unknown" and raw is not None and
                 raw.get("state") != tail.get("state") and
                 lease and lease_is_live(lease)):
@@ -4096,6 +4240,17 @@ def resolve_session(cfg, sid):
             # boot identity while a watcher may be live and mid-attempt;
             # resolving over it could clear a real in-flight submission.
             return False, "boot identity unproven; stop the watcher first"
+        if (raw is not None and
+                raw.get("state") in ("PREPARED", "TYPED_VERIFIED") and
+                lease and lease_is_live(lease) and
+                lease.get("run_token") == token):
+            # The alert here is a crash-recovery PROJECTION of a
+            # possibly-live ladder, not a journaled alert: this token's
+            # live watcher can be mid-ladder in exactly this state and
+            # would type and submit straight through the resolution
+            # (Sol round-7). A dead lease keeps the crash tail
+            # resolvable via the branch below.
+            return False, "watcher is live and mid-attempt; stop the watcher first"
         lease_dir = os.path.dirname(paths["session_lease"])
         matching_panes = []
         try:

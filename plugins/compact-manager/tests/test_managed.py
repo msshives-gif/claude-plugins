@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -743,6 +744,107 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(out["latch_kind"], "SAFETY")
         self.assertEqual(out["reason"], "missing_boundary")
 
+    def test_acked_lingering_own_packet_still_latches_on_deadline(self):
+        # The OWN classification's early return must not bypass the
+        # completion timeout: an ACKED attempt whose own packet lingers
+        # (compaction never lands) previously stayed ACKED forever —
+        # the timer branch that latches missing_boundary was
+        # unreachable while the packet persisted.
+        self.attempt.update(timers={
+            "completion_deadline_mono": 110, "boot_id": "boot-a"})
+        own = {"seq": 1, "custom_instructions":
+               "[cm-%s] ok" % self.attempt["nonce"]}
+        out = self.step("ACKED", "timer", now=110, packet=own)
+        self.assertEqual((out["state"], out["latch_kind"], out["reason"]),
+                         ("LATCHED", "SAFETY", "missing_boundary"))
+
+    def test_acked_lingering_own_packet_before_deadline_stays_acked(self):
+        self.attempt.update(timers={
+            "completion_deadline_mono": 110, "boot_id": "boot-a"})
+        own = {"seq": 1, "custom_instructions":
+               "[cm-%s] ok" % self.attempt["nonce"]}
+        out = self.step("ACKED", "timer", now=109, packet=own)
+        self.assertEqual(out["state"], "ACKED")
+
+    def test_lingering_own_packet_does_not_resurrect_boundary_latch(self):
+        # Ticks after the missing_boundary latch re-see the same
+        # lingering packet; the attempt must settle LATCHED, not
+        # oscillate back to a live ACKED wait.
+        self.attempt.update(timers={
+            "completion_deadline_mono": 110, "boot_id": "boot-a"})
+        own = {"seq": 1, "custom_instructions":
+               "[cm-%s] ok" % self.attempt["nonce"]}
+        latched = self.step("ACKED", "timer", now=110, packet=own)
+        self.assertEqual(latched["state"], "LATCHED")
+        again = managed.transition_attempt(latched, "timer", 200, self.cfg,
+                                           own, self.gen)
+        self.assertEqual((again["state"], again["latch_kind"],
+                          again["reason"]),
+                         ("LATCHED", "SAFETY", "missing_boundary"))
+
+    def test_own_packet_does_not_resurrect_latch_across_boots(self):
+        # A recovered cross-boot latch carries the OLD boot's monotonic
+        # deadline; if the lingering own packet could pull it back to
+        # ACKED, the new boot's small monotonic clock would sit below
+        # that stale deadline and the latch would silently un-latch
+        # into a live-looking ACKED wait (Sol round-1 #2). The latch
+        # must hold regardless of clock arithmetic.
+        self.attempt.update(
+            state="LATCHED", latch_kind="SAFETY", reason="missing_boundary",
+            timers={"completion_deadline_mono": 100000, "boot_id": "boot-a"})
+        own = {"seq": 1, "custom_instructions":
+               "[cm-%s] ok" % self.attempt["nonce"]}
+        out = managed.transition_attempt(self.attempt, "timer", 10, self.cfg,
+                                         own, self.gen)
+        self.assertEqual((out["state"], out["latch_kind"], out["reason"]),
+                         ("LATCHED", "SAFETY", "missing_boundary"))
+        # The held latch must still keep the fired-compact proof the
+        # packet carries (Sol round-2).
+        self.assertIs(out.get("own_packet_proof"), True)
+
+    def test_missing_ack_latch_keeps_late_own_proof(self):
+        # Both submissions missed the ack deadline and the attempt
+        # safety-latched; the own packet then appears late. The latch
+        # holds (no resurrection to ACKED) but the packet proves the
+        # compact fired — the proof must be stamped (Sol round-2).
+        self.attempt.update(state="LATCHED", latch_kind="SAFETY",
+                            reason="missing_ack",
+                            timers={"boot_id": "boot-a"})
+        own = {"seq": 1, "custom_instructions":
+               "[cm-%s] ok" % self.attempt["nonce"]}
+        out = managed.transition_attempt(self.attempt, "timer", 200,
+                                         self.cfg, own, self.gen)
+        self.assertEqual((out["state"], out["reason"]),
+                         ("LATCHED", "missing_ack"))
+        self.assertIs(out.get("own_packet_proof"), True)
+
+    def test_acked_foreign_overwrite_still_latches_on_deadline(self):
+        # A native/human compaction can replace our packet after the
+        # ack; if IT also never lands, the FOREIGN branch's ACKED early
+        # return must not bypass the completion deadline any more than
+        # the OWN branch's does (Sol round-1 #1).
+        self.attempt.update(timers={
+            "completion_deadline_mono": 110, "boot_id": "boot-a"})
+        packet = {"seq": 99, "trigger": "auto", "custom_instructions": ""}
+        out = self.step("ACKED", "timer", now=110, packet=packet)
+        self.assertEqual((out["state"], out["latch_kind"], out["reason"]),
+                         ("LATCHED", "SAFETY", "missing_boundary"))
+
+    def test_late_boundary_after_missing_boundary_latch_confirms(self):
+        # The latch keeps the nonce identity on purpose: a compaction
+        # that lands after the deadline still confirms with the
+        # fired-compact proof intact.
+        self.attempt.update(timers={
+            "completion_deadline_mono": 110, "boot_id": "boot-a"})
+        own = {"seq": 1, "custom_instructions":
+               "[cm-%s] ok" % self.attempt["nonce"]}
+        latched = self.step("ACKED", "timer", now=110, packet=own)
+        self.assertEqual(latched["state"], "LATCHED")
+        out = managed.transition_attempt(latched, "timer", 200, self.cfg,
+                                         own, dict(self.gen, file_epoch=2))
+        self.assertEqual(out["state"], "BOUNDARY_CONFIRMED")
+        self.assertIs(out.get("own_packet_proof"), True)
+
     def test_acked_ignores_overwriting_foreign_packet(self):
         self.attempt.update(state="ACKED", timers={
             "completion_deadline_mono": 200, "boot_id": "boot-a"})
@@ -876,6 +978,31 @@ class JournalRecoveryTests(unittest.TestCase):
         with open(self.path, "ab") as fh:
             fh.write(b'{"schema":1,"state":"ACKED"')
         self.assertEqual(managed.attempt_tail(self.path)["state"], "SUBMITTED")
+
+    def test_recovery_needs_journal_on_state_or_proof_gain(self):
+        # Startup persistence rule: journal the recovered attempt on a
+        # synthesized state change OR on fired-compact proof the
+        # startup packet inspection discovered — an in-memory-only
+        # stamp dies with the packet and the fresh Watcher re-reads
+        # the unstamped journal (Sol round-3).
+        self.assertFalse(managed.recovery_needs_journal(
+            None, {"state": "ACKED"}))
+        self.assertFalse(managed.recovery_needs_journal(
+            {"state": "ACKED"}, None))
+        self.assertTrue(managed.recovery_needs_journal(
+            {"state": "CLEANUP_REQUIRED"}, {"state": "PREPARED"}))
+        self.assertTrue(managed.recovery_needs_journal(
+            {"state": "LATCHED", "own_packet_proof": True},
+            {"state": "LATCHED"}))
+        self.assertFalse(managed.recovery_needs_journal(
+            {"state": "LATCHED", "own_packet_proof": True},
+            {"state": "LATCHED", "own_packet_proof": True}))
+        self.assertFalse(managed.recovery_needs_journal(
+            {"state": "LATCHED"}, {"state": "LATCHED"}))
+        # A hostile journal value must not launder into a proof append.
+        self.assertFalse(managed.recovery_needs_journal(
+            {"state": "LATCHED", "own_packet_proof": "true"},
+            {"state": "LATCHED"}))
 
     def test_recovery_mapping_for_every_tail(self):
         expected = {
@@ -1115,6 +1242,58 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(mine[0]["state"], "CLEANUP_REQUIRED")
         ok, message = managed.resolve_session(self.cfg, self.sid)
         self.assertTrue(ok, message)
+
+    def test_live_mid_ladder_projection_is_not_resolvable(self):
+        # PREPARED/TYPED_VERIFIED raw tails are crash-recovery
+        # PROJECTIONS to alert states, not journaled alerts: this
+        # token's live watcher can be mid-ladder in exactly that state
+        # and would type and submit straight through a resolution
+        # (Sol round-7). Refuse while the lease is live; the crash
+        # path (dead lease) stays resolvable.
+        live = managed.proc_stat(os.getpid())
+        for raw_state in ("PREPARED", "TYPED_VERIFIED"):
+            with self.subTest(raw_state=raw_state):
+                managed.journal_record(
+                    self.paths["journal"], raw_state,
+                    dict(self.attempt, state=raw_state))
+                self.leases(os.getpid(), live["starttime"], time.time())
+                ok, message = managed.resolve_session(self.cfg, self.sid)
+                self.assertFalse(ok)
+                self.assertIn("stop the watcher first", message)
+                # Same tail, dead lease: the crash-cleanup authority
+                # still resolves it.
+                self.leases(99999999, 1, time.time() - 1000)
+                ok, message = managed.resolve_session(self.cfg, self.sid)
+                self.assertTrue(ok, message)
+
+    def test_resolve_judges_raw_and_projected_state_from_one_snapshot(self):
+        # Sol round-8: with SEPARATE journal reads, a live ladder
+        # advancing between them (PREPARED at the projection read,
+        # SUBMITTED at the raw-guard read) defeated the mid-ladder
+        # refusal and resolved over an in-flight submission. Simulate
+        # the ladder append landing immediately after the (single)
+        # snapshot read: the refusal must hold.
+        managed.journal_record(self.paths["journal"], "PREPARED",
+                               dict(self.attempt, state="PREPARED"))
+        live = managed.proc_stat(os.getpid())
+        self.leases(os.getpid(), live["starttime"], time.time())
+        real_read = managed.read_journal
+        raced = []
+
+        def racing_read(path):
+            records = real_read(path)
+            if not raced:
+                raced.append(True)
+                managed.journal_record(
+                    self.paths["journal"], "SUBMITTED",
+                    dict(self.attempt, state="SUBMITTED"))
+            return records
+
+        with unittest.mock.patch.object(managed, "read_journal",
+                                        side_effect=racing_read):
+            ok, message = managed.resolve_session(self.cfg, self.sid)
+        self.assertFalse(ok)
+        self.assertIn("stop the watcher first", message)
 
     def test_live_resolve_requires_same_token_on_both_leases(self):
         live = managed.proc_stat(os.getpid())
@@ -1738,6 +1917,218 @@ class TickWiringTests(unittest.TestCase):
         confirmed = [r for r in records
                      if r["state"] == "BOUNDARY_CONFIRMED"][-1]
         self.assertIs(confirmed["own_packet_proof"], True)
+        self.assertEqual(managed.cm_compact_count(self.cfg, self.sid), 1)
+
+    def test_late_own_packet_proof_journals_from_latch(self):
+        # Sol round-2 major: a missing_ack latch whose own packet
+        # appears late has proven its compact fired. The latch must
+        # hold (no resurrection to ACKED), but the proof must reach
+        # the journal on that metadata-only tick — no state change —
+        # or cm_compact_count loses the fired compact forever, even
+        # across restart.
+        watcher = self.make_watcher([usage_row(170000)], LadderTmux([IDLE]))
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      self.transcript)
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(cursor), 0, 0.0, "boot")
+        nonce = watcher.attempt["nonce"]
+        watcher.attempt.update(state="LATCHED", latch_kind="SAFETY",
+                               reason="missing_ack")
+        # A real latch always has its journal row (the transition that
+        # created it was journaled); the proof-only append re-checks
+        # the tail against it.
+        managed.journal_record(self.paths["journal"], "LATCHED",
+                               watcher.attempt, reason="missing_ack")
+        packet_file = managed.packet_path(self.cfg, self.sid)
+        cm._private_makedirs(os.path.dirname(packet_file))
+        with open(packet_file, "w") as fh:
+            json.dump({"seq": 1, "custom_instructions": "[cm-%s]" % nonce,
+                       "base_compaction_count": 0}, fh)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertEqual(watcher.attempt["state"], "LATCHED")
+        self.assertIs(watcher.attempt.get("own_packet_proof"), True)
+        records = list(managed.read_journal(self.paths["journal"]))
+        self.assertEqual(records[-1]["state"], "LATCHED")
+        self.assertEqual(records[-1]["reason"], "missing_ack")
+        self.assertIs(records[-1]["own_packet_proof"], True)
+        self.assertEqual(managed.cm_compact_count(self.cfg, self.sid), 1)
+        # Once stamped, later ticks with the same packet append nothing.
+        count = len(records)
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertEqual(
+            len(list(managed.read_journal(self.paths["journal"]))), count)
+
+    def _latched_proof_watcher(self):
+        watcher = self.make_watcher([usage_row(170000)], LadderTmux([IDLE]))
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      self.transcript)
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(cursor), 0, 0.0, "boot")
+        watcher.attempt.update(state="LATCHED", latch_kind="SAFETY",
+                               reason="missing_ack", own_packet_proof=True)
+        managed.journal_record(self.paths["journal"], "LATCHED",
+                               dict(watcher.attempt, own_packet_proof=False),
+                               reason="missing_ack")
+        return watcher
+
+    def test_proof_only_append_merges_into_operator_resolution(self):
+        # An operator resolution that wins the lock before the proof
+        # append must stay authoritative (state, reason, dropped
+        # nonces) — but the historical fired-compact proof must not
+        # depend on lock order (Sol round-4): the proof is merged into
+        # a fresh operator_resolved row instead of being discarded.
+        watcher = self._latched_proof_watcher()
+        resolved = dict(watcher.attempt, reason="operator_resolved",
+                        nonce="", nonces=[], own_packet_proof=False)
+        managed.journal_record(self.paths["journal"], "LATCHED", resolved,
+                               reason="operator_resolved")
+        self.assertTrue(watcher._journal_proof_only())
+        tail = list(managed.read_journal(self.paths["journal"]))[-1]
+        self.assertEqual(tail["reason"], "operator_resolved")
+        self.assertEqual(tail["nonces"], [])
+        self.assertIs(tail["own_packet_proof"], True)
+        self.assertEqual(managed.cm_compact_count(self.cfg, self.sid), 1)
+        # A tail belonging to a DIFFERENT attempt supersedes ours: no
+        # append, and the caller stops retrying.
+        other = dict(resolved, attempt_id="other-attempt")
+        managed.journal_record(self.paths["journal"], "LATCHED", other,
+                               reason="operator_resolved")
+        before = len(list(managed.read_journal(self.paths["journal"])))
+        self.assertTrue(watcher._journal_proof_only())
+        self.assertEqual(
+            len(list(managed.read_journal(self.paths["journal"]))), before)
+
+    def test_proof_persistence_retries_after_transient_failure(self):
+        # A transient lock failure must not silently drop the proof:
+        # the append reports not-durable, the tick keeps it pending,
+        # and a later call lands it (Sol round-4).
+        watcher = self._latched_proof_watcher()
+        with managed.txn_lock(self.paths["txn"]):
+            self.assertFalse(watcher._journal_proof_only())
+        records = list(managed.read_journal(self.paths["journal"]))
+        self.assertIs(records[-1].get("own_packet_proof"), False)
+        # Lock released: the pending retry path in tick() persists it.
+        watcher._proof_pending = True
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertFalse(watcher._proof_pending)
+        tail = list(managed.read_journal(self.paths["journal"]))[-1]
+        self.assertEqual(tail["reason"], "missing_ack")
+        self.assertIs(tail["own_packet_proof"], True)
+
+    def test_threshold_rearm_journals_under_txn_lock(self):
+        # Sol round-7: the LATCHED->READY re-arm appends also exit an
+        # alert state (resolve accepts every LATCHED tail) and must
+        # serialize with resolve's read-check-append like any other
+        # alert exit.
+        rows = [usage_row(170000), boundary_row(post=150000)]
+        watcher = self.make_watcher(rows, EchoTmux())
+        watcher.attempt = managed.new_attempt(
+            self.token, managed.generation(managed.default_cursor()),
+            0, 0.0, "boot")
+        watcher.attempt["state"] = "SUBMITTED"
+        watcher.attempt["timers"]["ack_deadline_mono"] = 10 ** 9
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        append_rows(self.transcript, [usage_row(180000)])
+        events = []
+        real_append = managed.journal_record
+
+        def probing_append(*args, **kw):
+            try:
+                with managed.txn_lock(self.paths["txn"], timeout=0.01):
+                    locked = False
+            except cm.LockTimeout:
+                locked = True
+            events.append((args[1], locked))
+            return real_append(*args, **kw)
+
+        with unittest.mock.patch.object(managed, "journal_record",
+                                        side_effect=probing_append):
+            keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertIsNone(watcher.attempt)
+        self.assertIn(("READY", True), events)
+
+    def test_leaving_alert_state_journals_under_txn_lock(self):
+        # Sol round-6: the append that leaves an alert state is
+        # serialized with resolve_session's locked read-check-append,
+        # so a resolve cannot interleave between the tick's transition
+        # and its journal row (the stale-wedge-tail split). Pin the
+        # serialization by observing the lock is HELD during the
+        # append: a probe thread that grabs the txn lock the moment
+        # the journal grows must fail while the append is in flight.
+        watcher = self._latched_proof_watcher()
+        watcher.attempt.update(state="BOUNDARY_CONFIRMED")
+        locked_during_append = []
+        real_append = managed.journal_record
+
+        def probing_append(*args, **kw):
+            try:
+                with managed.txn_lock(self.paths["txn"], timeout=0.01):
+                    locked_during_append.append(False)
+            except cm.LockTimeout:
+                locked_during_append.append(True)
+            return real_append(*args, **kw)
+
+        with unittest.mock.patch.object(managed, "journal_record",
+                                        side_effect=probing_append):
+            watcher._journal_state_change("LATCHED")
+        self.assertEqual(locked_during_append, [True])
+        tail = list(managed.read_journal(self.paths["journal"]))[-1]
+        self.assertEqual(tail["state"], "BOUNDARY_CONFIRMED")
+        # Non-alert previous states journal without the lock.
+        watcher.attempt.update(state="ACKED")
+        locked_during_append.clear()
+        with unittest.mock.patch.object(managed, "journal_record",
+                                        side_effect=probing_append):
+            watcher._journal_state_change("SUBMITTED")
+        self.assertEqual(locked_during_append, [False])
+
+    def test_leaving_alert_state_fails_open_when_lock_held(self):
+        # A wedged txn lock must not swallow the state row: the append
+        # falls back to unlocked rather than going missing.
+        watcher = self._latched_proof_watcher()
+        watcher.attempt.update(state="BOUNDARY_CONFIRMED")
+        with managed.txn_lock(self.paths["txn"]):
+            watcher._journal_state_change("LATCHED")
+        tail = list(managed.read_journal(self.paths["journal"]))[-1]
+        self.assertEqual(tail["state"], "BOUNDARY_CONFIRMED")
+
+    def test_proof_only_append_is_idempotent_after_uncertain_write(self):
+        # An fsync failure can report not-durable AFTER the row landed:
+        # a retry that sees a proof-bearing tail must append nothing
+        # (Sol round-5) — otherwise persistent post-write failures add
+        # a row every tick.
+        watcher = self._latched_proof_watcher()
+        managed.journal_record(self.paths["journal"], "LATCHED",
+                               watcher.attempt, reason="missing_ack")
+        before = len(list(managed.read_journal(self.paths["journal"])))
+        self.assertTrue(watcher._journal_proof_only())
+        self.assertEqual(
+            len(list(managed.read_journal(self.paths["journal"]))), before)
+
+    def test_adoption_of_resolution_carries_unpersisted_proof(self):
+        # Sol round-4 end-to-end: resolve wins the lock, the proof
+        # append fails transiently, and the next tick adopts the
+        # proofless resolution row. The in-memory proof must survive
+        # the adoption so the pending persistence merges it durably.
+        watcher = self._latched_proof_watcher()
+        resolved = dict(watcher.attempt, reason="operator_resolved",
+                        nonce="", nonces=[], own_packet_proof=False)
+        managed.journal_record(self.paths["journal"], "LATCHED", resolved,
+                               reason="operator_resolved")
+        watcher._proof_pending = True
+        keep, reason = watcher.tick()
+        self.assertEqual((keep, reason), (True, "latched"))
+        self.assertEqual(watcher.attempt["reason"], "operator_resolved")
+        self.assertIs(watcher.attempt.get("own_packet_proof"), True)
+        self.assertFalse(watcher._proof_pending)
+        tail = list(managed.read_journal(self.paths["journal"]))[-1]
+        self.assertEqual(tail["reason"], "operator_resolved")
+        self.assertIs(tail["own_packet_proof"], True)
         self.assertEqual(managed.cm_compact_count(self.cfg, self.sid), 1)
 
     def test_notify_escapes_tmux_format_expansion(self):
@@ -5313,7 +5704,13 @@ class SolRound4FixTests(unittest.TestCase):
 
 class ResumeNudgeConfigTests(unittest.TestCase):
     def test_default_off(self):
-        cfg = managed.load_config(base=dict(cm._DEFAULTS), environ={})
+        # An empty environ still falls back to the REAL
+        # ~/.claude/compact-manager.json; pin the config path to a
+        # nonexistent file so a machine that enables the nudge does not
+        # fail this test.
+        cfg = managed.load_config(
+            base=dict(cm._DEFAULTS),
+            environ={"COMPACT_MANAGER_CONFIG": "/nonexistent/cm-test.json"})
         self.assertFalse(cfg["managed_resume_nudge"])
 
     def test_env_enables_and_falsey_spellings_disable(self):
@@ -5322,7 +5719,9 @@ class ResumeNudgeConfigTests(unittest.TestCase):
                               ("", False), ("false", False), ("no", False)):
             cfg = managed.load_config(
                 base=dict(cm._DEFAULTS),
-                environ={"COMPACT_MANAGER_MANAGED_RESUME_NUDGE": value})
+                environ={
+                    "COMPACT_MANAGER_CONFIG": "/nonexistent/cm-test.json",
+                    "COMPACT_MANAGER_MANAGED_RESUME_NUDGE": value})
             self.assertEqual(cfg["managed_resume_nudge"], expect, value)
 
     def test_malformed_values_read_as_default_off(self):
