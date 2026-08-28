@@ -1803,6 +1803,27 @@ def snapshot_exact(snapshot, text):
             snapshot["text"] == "❯ " + text)
 
 
+def _mismatch_extras(snap, text):
+    """What the failing R5/R6' verify actually observed, journaled with
+    the CLEANUP row. A composer-mismatch wedge was undiagnosable after
+    the fact without it (observed live 2026-08-27, fbeb0bf1: recovery
+    found the exact instruction in the composer a minute after R5
+    declared mismatch three times). Texts are capped raw, NOT
+    sanitize()d — the mismatch may be a single NBSP-vs-space or
+    trailing-padding difference that whitespace collapsing would
+    erase; parse_pane already ANSI-stripped them to one line."""
+    extras = {"expected_text": ("❯ " + text)[:CLEAR_EXCERPT_CHARS]}
+    if snap is None:
+        extras["observed_capture_failed"] = True
+    else:
+        observed = snap.get("text")
+        extras["observed_text"] = (None if observed is None
+                                   else observed[:CLEAR_EXCERPT_CHARS])
+        extras["observed_composer"] = snap.get("composer")
+        extras["observed_modal"] = bool(snap.get("modal"))
+    return extras
+
+
 def _projection(snapshot, dims):
     """Safety-critical regions only: harmless background repaint
     (spinners, elapsed counters, footer chrome) must not veto the
@@ -2246,9 +2267,11 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
             break
     if not ok or not snapshot_exact(snap, text):
         detail = reason if not ok else "composer_mismatch"
+        extras = (_mismatch_extras(snap, text)
+                  if detail == "composer_mismatch" else {})
         attempt.update(state="CLEANUP_REQUIRED", reason="R5_%s" % detail)
         journal_record(journal_path, "CLEANUP_REQUIRED", attempt,
-                       reason=attempt["reason"])
+                       reason=attempt["reason"], **extras)
         return attempt
     attempt = transition_attempt(attempt, "typed_verified", now_mono(), cfg)
     journal_record(journal_path, "TYPED_VERIFIED", attempt)
@@ -2305,9 +2328,11 @@ def run_ladder(binding, cfg, paths, attempt, cursor, journal_path,
             detail = "activity_changed"
         else:
             detail = "boundary_advanced"
+        extras = (_mismatch_extras(snap, text)
+                  if detail == "composer_mismatch" else {})
         attempt.update(state="CLEANUP_REQUIRED", reason="R6_prime_%s" % detail)
         journal_record(journal_path, "CLEANUP_REQUIRED", attempt,
-                       reason=attempt["reason"])
+                       reason=attempt["reason"], **extras)
         return attempt
     rc, _, _ = _result(run_tmux(_tmux(
         binding["socket"], ["send-keys", "-t", binding["pane_id"], "Enter"])))
@@ -2815,6 +2840,17 @@ class Watcher:
                 request_id = observation.get("request_id")
                 if isinstance(gen, dict) and isinstance(request_id, str):
                     self.request_history[request_id] = generation_key(gen)
+            # Mirror of _commit_recovery's request re-arm, replayed in
+            # journal order so a restart reaches the same set: a clean
+            # active clear (composer_cleared, never own-proved) proved
+            # nothing was submitted, so its attempt's generation is
+            # un-consumed and a pending request there fires again.
+            if (record.get("state") == "RECOVERED" and
+                    record.get("reason") == "composer_cleared" and
+                    record.get("own_packet_proof") is not True and
+                    isinstance(record.get("generation"), dict)):
+                self.consumed_request_generations.discard(
+                    generation_key(record["generation"]))
             if not isinstance(fingerprint, dict):
                 continue
             gen = fingerprint.get("generation")
@@ -3178,6 +3214,25 @@ class Watcher:
         """Serialize the RECOVERED append under the txn lock and re-arm
         the watcher. True only when the record landed."""
         aid = self.attempt.get("attempt_id")
+        # A clean ACTIVE clear proves the full hazard accounting: the
+        # watcher observed its own instruction in the composer,
+        # destroyed it, and no packet ever fired — nothing was
+        # submitted. A pending request consumed by that attempt is
+        # therefore still unsatisfied, and dropping it wedged the
+        # session's own compact ask until the 70% threshold (observed
+        # live 2026-08-27, fbeb0bf1): un-consume the generation so the
+        # request re-fires. Retype churn stays bounded by
+        # ACTIVE_RECOVERY_LIMIT — each retry needs a fresh active
+        # recovery. The passive lane (composer_clean) never re-arms
+        # the request: it proves the bytes vanished, not by whose
+        # hand, so retyping there could duplicate a human's disposal.
+        rearm_key = None
+        if (recovered_reason == "composer_cleared" and
+                self.attempt.get("own_packet_proof") is not True and
+                isinstance(self.attempt.get("generation"), dict)):
+            key = generation_key(self.attempt["generation"])
+            if key in self.consumed_request_generations:
+                rearm_key = key
         try:
             with txn_lock(self.paths["txn"]):
                 tail = attempt_tail(self.paths["journal"])
@@ -3197,10 +3252,15 @@ class Watcher:
                     # The journal moved under us (operator resolve,
                     # another writer): their word stands.
                     return False
+                extras = {"reason": recovered_reason}
+                if rearm_key is not None:
+                    extras["request_rearmed"] = True
                 journal_record(self.paths["journal"], "RECOVERED",
-                               self.attempt, reason=recovered_reason)
+                               self.attempt, **extras)
         except Exception:
             return False
+        if rearm_key is not None:
+            self.consumed_request_generations.discard(rearm_key)
         # The durable RECOVERED record is the authority: the in-memory
         # attempt clears the moment it lands, so a failure in the
         # status-marker or ledger writes below can never leave a live

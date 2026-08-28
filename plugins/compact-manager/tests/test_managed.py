@@ -1466,6 +1466,21 @@ class RunLadderTests(unittest.TestCase):
         self.assertEqual(out["reason"], "R5_composer_mismatch")
         self.assertEqual(tmux.enters(), [])
 
+    def test_r5_mismatch_journals_observed_capture(self):
+        # The CLEANUP row must carry what the verify actually saw —
+        # a mismatch was undiagnosable post-hoc without it (observed
+        # live 2026-08-27, fbeb0bf1).
+        tmux = LadderTmux([IDLE, IDLE, IDLE + "x" + self.text])
+        self.run_ladder(tmux)
+        rows = [r for r in managed.read_journal(self.paths["journal"])
+                if r["state"] == "CLEANUP_REQUIRED"]
+        row = rows[-1]
+        self.assertEqual(row["reason"], "R5_composer_mismatch")
+        self.assertEqual(row["expected_text"], IDLE + self.text)
+        self.assertEqual(row["observed_text"], IDLE + "x" + self.text)
+        self.assertEqual(row["observed_composer"], "nonempty")
+        self.assertIs(row["observed_modal"], False)
+
     def test_r5_transient_repaint_retries_capture_then_submits(self):
         # A background repaint racing the first verify capture must not
         # terminalize a healthy attempt (observed live 2026-08-25) — a
@@ -3993,6 +4008,25 @@ class WedgeRecoveryTests(unittest.TestCase):
                                attempt, reason=reason)
         return attempt
 
+    def wedge_with_request(self, request_id="req-1"):
+        """A request-triggered attempt that consumed its generation on
+        TRIGGERED, then wedged on R5."""
+        self.arm_activity()
+        cursor = managed.initial_scan(managed.default_cursor(),
+                                      self.transcript)
+        gen = managed.generation(cursor)
+        attempt = managed.new_attempt(self.token, gen, 0, 0.0, "boot",
+                                      "request")
+        managed.journal_record(
+            self.paths["journal"], "TRIGGERED", attempt,
+            request_fingerprint=managed.request_fingerprint(
+                gen, request_id))
+        attempt.update(state="CLEANUP_REQUIRED",
+                       reason="R5_composer_mismatch")
+        managed.journal_record(self.paths["journal"], "CLEANUP_REQUIRED",
+                               attempt, reason=attempt["reason"])
+        return attempt, managed.generation_key(gen)
+
     def make_watcher(self, tmux, wall=None):
         kw = {"wall": wall} if wall is not None else {}
         return managed.Watcher(self.binding, self.cfg, self.paths,
@@ -4040,6 +4074,23 @@ class WedgeRecoveryTests(unittest.TestCase):
         # And the watcher is genuinely back in service.
         keep, reason = self.tick(watcher)
         self.assertEqual((keep, reason), (True, "below_threshold"))
+
+    def test_passive_recovery_keeps_request_consumed(self):
+        # composer_clean proves the typed bytes vanished, not by whose
+        # hand: retyping could duplicate a human's disposal of them, so
+        # the passive lane never re-arms a consumed request.
+        append_rows(self.transcript, [usage_row(50)])
+        attempt, key = self.wedge_with_request()
+        watcher = self.make_watcher(LadderTmux([IDLE]))
+        self.assertIn(key, watcher.consumed_request_generations)
+        self.settle(watcher)                    # baseline + snapshot
+        self.tick(watcher)                      # probe 1: clean
+        keep, reason = self.tick(watcher)       # probe 2 -> re-arm
+        self.assertEqual((keep, reason), (True, "recovered"))
+        self.assertIn(key, watcher.consumed_request_generations)
+        recovered = [r for r in managed.read_journal(self.paths["journal"])
+                     if r["state"] == "RECOVERED"]
+        self.assertNotIn("request_rearmed", recovered[-1])
 
     def test_probes_are_throttled_not_per_tick(self):
         append_rows(self.transcript, [usage_row(50)])
@@ -4870,6 +4921,33 @@ class ActiveClearRecoveryTests(WedgeRecoveryTests):
             self.paths["journal"], "boot"))
         keep, reason = self.tick(watcher)
         self.assertEqual((keep, reason), (True, "below_threshold"))
+
+    def test_active_recovery_rearms_consumed_request(self):
+        # A clean active clear proves nothing was submitted, so the
+        # request the attempt consumed is still unsatisfied: un-consume
+        # its generation and let it fire again (observed live
+        # 2026-08-27: a dropped request wedged the session's compact
+        # ask until the threshold trigger).
+        append_rows(self.transcript, [usage_row(50)])
+        attempt, key = self.wedge_with_request()
+        tmux = self.wedged_tmux(attempt)
+        watcher = self.make_settled_watcher(attempt, tmux)
+        self.assertIn(key, watcher.consumed_request_generations)
+        keep, reason = self.tick(watcher)       # active round
+        self.assertEqual((keep, reason), (True, "recovered"))
+        self.assertNotIn(key, watcher.consumed_request_generations)
+        recovered = [r for r in managed.read_journal(self.paths["journal"])
+                     if r["state"] == "RECOVERED"]
+        self.assertIs(recovered[-1].get("request_rearmed"), True)
+        # Replay durability: a restarted watcher reaches the same set.
+        fresh = self.make_watcher(tmux)
+        self.assertNotIn(key, fresh.consumed_request_generations)
+        self.assertEqual(fresh.request_history.get("req-1"), key)
+        # And the re-armed request actually re-fires: the next tick
+        # triggers a fresh attempt, which this time submits.
+        keep, reason = self.tick(watcher)
+        self.assertEqual((keep, reason), (True, "SUBMITTED"))
+        self.assertEqual(len(tmux.enters()), 1)
 
     def test_r4_and_r6_composer_reasons_recover_actively(self):
         for reason in ("R4_send_failed", "R6_prime_composer_mismatch"):

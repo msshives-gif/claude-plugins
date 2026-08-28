@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Watcher fix: a session-requested compact whose attempt wedged on a
+  composer mismatch and then self-recovered via a clean ACTIVE clear
+  (`RECOVERED`/`composer_cleared`, never own-proved) re-arms the
+  request instead of dropping it. Consuming the request generation on
+  `TRIGGERED` was permanent, so one transient R5 failure silenced the
+  session's compact ask until the threshold trigger (observed live
+  2026-08-27, fbeb0bf1: request at ~50% ctx dropped after recovery).
+  The `RECOVERED` row carries `request_rearmed: true`, journal replay
+  reaches the same set after a restart, and retype churn stays
+  bounded by `ACTIVE_RECOVERY_LIMIT`. The passive lane
+  (`composer_clean`) still never re-arms: it proves the typed bytes
+  vanished, not by whose hand.
+- Diagnosability: `CLEANUP_REQUIRED` rows for `R5_composer_mismatch`
+  and `R6_prime_composer_mismatch` now journal what the failing
+  verify actually observed (`expected_text`, `observed_text`,
+  `observed_composer`, `observed_modal`, or
+  `observed_capture_failed`) — the live 2026-08-27 mismatch was
+  undiagnosable post-hoc without it. Texts are capped raw, not
+  whitespace-collapsed, so NBSP-vs-space differences survive.
+
 - Resume nudge: every **manager-fired** compaction now nudges, not
   just session-requested ones — /compact never re-invokes the model,
   so a compaction the watcher typed strands an autonomous session no
