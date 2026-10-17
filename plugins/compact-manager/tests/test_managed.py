@@ -6448,3 +6448,38 @@ class ResumeNudgeWiringTests(TickWiringTests):
             managed.wedge_verdict(self.cfg, self.sid)[0], "clear")
         tail = managed.recover_attempt(self.paths["journal"], "boot")
         self.assertNotEqual((tail or {}).get("state"), "RESUME_NUDGE")
+
+
+class TxnLockPortabilityTests(unittest.TestCase):
+    """txn_lock must import and work without fcntl (Windows): a second
+    process contending for the same lock file gets LockTimeout, and the
+    lock releases on exit so a later holder succeeds."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = os.path.join(self.tmp, "locks", "txn.lock")
+
+    def _contend(self, timeout):
+        code = (
+            "import sys; sys.path.insert(0, sys.argv[1]); import managed\n"
+            "try:\n"
+            "    with managed.txn_lock(sys.argv[2], timeout=float(sys.argv[3])):\n"
+            "        print('acquired')\n"
+            "except managed.cm.LockTimeout:\n"
+            "    print('timeout')\n")
+        out = subprocess.run([sys.executable, "-c", code, HOOKS, self.path,
+                              str(timeout)], capture_output=True, text=True,
+                             timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.strip()
+
+    def test_second_process_times_out_then_acquires_after_release(self):
+        with managed.txn_lock(self.path, timeout=1.0):
+            self.assertEqual(self._contend(0.3), "timeout")
+        self.assertEqual(self._contend(0.3), "acquired")
+
+    def test_reentry_after_exit_in_same_process(self):
+        for _ in range(3):
+            with managed.txn_lock(self.path, timeout=1.0):
+                pass

@@ -8,7 +8,12 @@ Layer-1 state is imported read-only; managed mode owns only managed/.
 import argparse
 import contextlib
 import errno
-import fcntl
+try:
+    import fcntl  # POSIX advisory locks
+    msvcrt = None
+except ImportError:  # Windows: no fcntl; use the CRT byte-range lock instead
+    fcntl = None
+    import msvcrt
 import hashlib
 import json
 import math
@@ -334,24 +339,51 @@ def _atomic_json(path, value):
         pass
 
 
+def _try_lock_nb(fd):
+    """Non-blocking exclusive lock on fd. True if acquired, False if held
+    elsewhere. flock on POSIX; on Windows a 1-byte CRT lock at offset 0
+    (locking past EOF is allowed, so the lock file may stay empty)."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError as e:  # EACCES/EDEADLK: another process holds it
+        if e.errno in (errno.EACCES, errno.EDEADLK, getattr(errno, "EDEADLOCK", errno.EDEADLK)):
+            return False
+        raise
+
+
+def _unlock(fd):
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
 @contextlib.contextmanager
 def txn_lock(path, timeout=2.0, monotonic=time.monotonic):
     cm._private_makedirs(os.path.dirname(path))
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     deadline = monotonic() + timeout
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if monotonic() >= deadline:
-                    raise cm.LockTimeout(path)
-                time.sleep(0.02)
+        while not _try_lock_nb(fd):
+            if monotonic() >= deadline:
+                raise cm.LockTimeout(path)
+            time.sleep(0.02)
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _unlock(fd)
         finally:
             os.close(fd)
 
